@@ -25,9 +25,9 @@
 //   wn_rifle_retrowave mag: backups/20261102_rifle_reload_renders/work/jthumb/pose_mag_retrowave.json e0852519b65487d83e77f07f9b96405d
 //   wn_rifle_rust mag: backups/20261102_rifle_reload_renders/work/jthumb/pose_mag_rust.json e16d9fca21b55d3d5bce434b222e0171
 //   wn_rifle_d mag: backups/20261102_rifle_reload_renders/work/jthumb/pose_mag_d.json 325f7071df9f463b68f068069fec3583
-//   wn_pistol_harraneagle mag: D:/AI PROJECTS/DYING LIGHT VR/backups/20261109_deagle_reload_renders/work/pose_mag_JAYo.json fff43e4c6e23a16ee96d5e6aba84adc3
-//   wn_shisha_gun mag: D:/AI PROJECTS/DYING LIGHT VR/backups/20261109_shisha_reload_renders/work/pose_can_JAYo.json be2afbc94544582cb51374b760955be6
-//   wn_grenadelauncher_a mag: D:/AI PROJECTS/DYING LIGHT VR/backups/20261109_gl_chainsaw_reload_renders/work/pose_drum_JAYo.json 57aab20a7737a314c40e0602c1dc209e
+//   wn_pistol_harraneagle mag: backups/20261109_deagle_reload_renders/work/pose_mag_JAYo.json fff43e4c6e23a16ee96d5e6aba84adc3
+//   wn_shisha_gun mag: backups/20261109_shisha_reload_renders/work/pose_can_JAYo.json be2afbc94544582cb51374b760955be6
+//   wn_grenadelauncher_a mag: backups/20261109_gl_chainsaw_reload_renders/work/pose_drum_JAYo.json 57aab20a7737a314c40e0602c1dc209e
 //   wn_rifle_a rack: backups/20261102_rifle_reload_renders/work/cand_g/pose_GB.json 628ca62f8ce65a61d9212162b253d72d
 //   wn_rifle_b rack: backups/20261102_rifle_reload_renders/work/cand_g/pose_GB.json 628ca62f8ce65a61d9212162b253d72d
 //   wn_rifle_b_reddot rack: backups/20261102_rifle_reload_renders/work/hturn/pose_handle_b_reddot.json 4c226251a8fc93e6643028524dadc5ee
@@ -40,8 +40,8 @@
 //   wn_pistol_b pull: backups/20261101_pistol_rack_renders/work/q18/pose_E1F.json 5122e8303a7931c94aa0dd1455cd097b
 //   wn_pistol_d pull: backups/20261101_pistol_rack_renders/work/q20/D/pose_E1F_D.json d162d429ba1f0b7329d0b08cc4280658
 //   wn_pistol_scifi pull: backups/20261101_pistol_rack_renders/work/q20/S/pose_E1F_S.json b132596b930dd8b94430e3658e422e40
-//   wn_pistol_harraneagle pull: D:/AI PROJECTS/DYING LIGHT VR/backups/20261109_deagle_reload_renders/work/pose_pull_JAYo.json 3eafd46f823bd7c57f86822baad23644
-//   wn_shisha_gun pull: D:/AI PROJECTS/DYING LIGHT VR/backups/20261109_shisha_reload_renders/work/pose_can_JAYo.json be2afbc94544582cb51374b760955be6
+//   wn_pistol_harraneagle pull: backups/20261109_deagle_reload_renders/work/pose_pull_JAYo.json 3eafd46f823bd7c57f86822baad23644
+//   wn_shisha_gun pull: backups/20261109_shisha_reload_renders/work/pose_can_JAYo.json be2afbc94544582cb51374b760955be6
 //   submachinegun: m_fpp_submachine_reload clip
 //   submachinegun_alt: m_fpp_submachine_alt_reload clip
 //   wn_crossbow_f rack: backups/20261103_crossbow_reload_renders/blend/pose_rack_jay.json df1c0dfc53d5448f8a2b1ed89674873d
@@ -779,7 +779,7 @@ const HandRow kMagRows[] = {
         { "l_finger42", { +0.965343f, -0.000050f, +0.260984f, +0.000052f, +1.000000f, -0.000001f, -0.260984f, +0.000015f, +0.965343f }, { +0.498057f, -0.000050f, +0.867144f, +0.000038f, +1.000000f, +0.000036f, -0.867144f, +0.000015f, +0.498057f } },   // 45.00 deg from rest
         { "l_finger43", { +0.982814f, +0.000009f, +0.184597f, -0.000011f, +1.000000f, +0.000011f, -0.184597f, -0.000013f, +0.982814f }, { +0.935828f, +0.000009f, +0.352457f, -0.000013f, +1.000000f, +0.000008f, -0.352457f, -0.000013f, +0.935828f } },   // 10.00 deg from rest
       } },
-    { "wn_pistol_harraneagle",   // approved hold D:\AI PROJECTS\DYING LIGHT VR\backups\20261109_deagle_reload_renders\work\pose_mag_JAYo.json
+    { "wn_pistol_harraneagle",   // approved hold backups\20261109_deagle_reload_renders\work\pose_mag_JAYo.json
       { +0.404867f, -0.000000f, -0.914376f, -0.000001f, -1.000000f, -0.000000f, -0.914376f, +0.000001f, -0.404867f },
       { -0.041905f, -0.017418f, +0.020448f },
       {
@@ -800,7 +800,7 @@ const HandRow kMagRows[] = {
         { "l_finger42", { +0.965343f, -0.000050f, +0.260984f, +0.000052f, +1.000000f, -0.000001f, -0.260984f, +0.000015f, +0.965343f }, { +0.084920f, -0.000054f, +0.996388f, +0.000058f, +1.000000f, +0.000049f, -0.996388f, +0.000053f, +0.084920f } },   // 70.00 deg from rest
         { "l_finger43", { +0.982814f, +0.000009f, +0.184597f, -0.000011f, +1.000000f, +0.000011f, -0.184597f, -0.000013f, +0.982814f }, { +0.162679f, +0.000004f, +0.986679f, +0.000025f, +1.000000f, -0.000008f, -0.986679f, +0.000026f, +0.162679f } },   // 70.00 deg from rest
       } },
-    { "wn_shisha_gun",   // approved hold D:\AI PROJECTS\DYING LIGHT VR\backups\20261109_shisha_reload_renders\work\pose_can_JAYo.json
+    { "wn_shisha_gun",   // approved hold backups\20261109_shisha_reload_renders\work\pose_can_JAYo.json
       { -0.257812f, +0.960102f, +0.108337f, -0.028288f, +0.104578f, -0.994114f, -0.965781f, -0.259359f, +0.000198f },
       { +0.197598f, -0.050117f, +0.068497f },
       {
@@ -821,7 +821,7 @@ const HandRow kMagRows[] = {
         { "l_finger42", { +0.965343f, -0.000050f, +0.260984f, +0.000052f, +1.000000f, -0.000001f, -0.260984f, +0.000015f, +0.965343f }, { +0.373900f, -0.162990f, +0.913035f, +0.063613f, +0.986626f, +0.150077f, -0.925285f, +0.001967f, +0.379268f } },   // 53.36 deg from rest
         { "l_finger43", { +0.982814f, +0.000009f, +0.184597f, -0.000011f, +1.000000f, +0.000011f, -0.184597f, -0.000013f, +0.982814f }, { +0.996030f, -0.029567f, +0.083968f, +0.046636f, +0.976747f, -0.209261f, -0.075828f, +0.212346f, +0.974248f } },   // 13.75 deg from rest
       } },
-    { "wn_grenadelauncher_a",   // approved hold D:\AI PROJECTS\DYING LIGHT VR\backups\20261109_gl_chainsaw_reload_renders\work\pose_drum_JAYo.json
+    { "wn_grenadelauncher_a",   // approved hold backups\20261109_gl_chainsaw_reload_renders\work\pose_drum_JAYo.json
       { +0.406474f, -0.724908f, +0.556135f, +0.812773f, +0.008850f, -0.582513f, +0.417347f, +0.688788f, +0.592783f },
       { +0.329295f, -0.112432f, +0.144742f },
       {
@@ -929,7 +929,7 @@ const HandRow kPullRows[] = {
         { "l_finger42", { +0.965343f, -0.000050f, +0.260984f, +0.000052f, +1.000000f, -0.000001f, -0.260984f, +0.000015f, +0.965343f }, { -0.424649f, -0.000050f, +0.905358f, -0.000008f, +1.000000f, +0.000052f, -0.905358f, +0.000015f, -0.424649f } },   // 100.00 deg from rest
         { "l_finger43", { +0.982814f, +0.000009f, +0.184597f, -0.000011f, +1.000000f, +0.000011f, -0.184597f, -0.000013f, +0.982814f }, { +0.214093f, +0.000009f, +0.976813f, -0.000014f, +1.000000f, -0.000006f, -0.976813f, -0.000013f, +0.214094f } },   // 67.00 deg from rest
       } },
-    { "wn_pistol_harraneagle",   // approved pull-out D:\AI PROJECTS\DYING LIGHT VR\backups\20261109_deagle_reload_renders\work\pose_pull_JAYo.json
+    { "wn_pistol_harraneagle",   // approved pull-out backups\20261109_deagle_reload_renders\work\pose_pull_JAYo.json
       { +0.484767f, -0.827408f, -0.283542f, -0.741650f, -0.560700f, +0.368199f, -0.463633f, +0.031799f, -0.885457f },
       { -0.034206f, +0.070149f, -0.022202f },
       {
@@ -950,7 +950,7 @@ const HandRow kPullRows[] = {
         { "l_finger42", { +0.965343f, -0.000050f, +0.260984f, +0.000052f, +1.000000f, -0.000001f, -0.260984f, +0.000015f, +0.965343f }, { -0.424650f, -0.000050f, +0.905358f, -0.000007f, +1.000000f, +0.000051f, -0.905358f, +0.000015f, -0.424650f } },   // 100.00 deg from rest
         { "l_finger43", { +0.982814f, +0.000009f, +0.184597f, -0.000011f, +1.000000f, +0.000011f, -0.184597f, -0.000013f, +0.982814f }, { +0.214095f, +0.000010f, +0.976813f, -0.000014f, +1.000000f, -0.000007f, -0.976813f, -0.000012f, +0.214095f } },   // 67.00 deg from rest
       } },
-    { "wn_shisha_gun",   // approved pull-out D:\AI PROJECTS\DYING LIGHT VR\backups\20261109_shisha_reload_renders\work\pose_can_JAYo.json
+    { "wn_shisha_gun",   // approved pull-out backups\20261109_shisha_reload_renders\work\pose_can_JAYo.json
       { -0.257812f, +0.960102f, +0.108337f, -0.028288f, +0.104578f, -0.994114f, -0.965781f, -0.259359f, +0.000198f },
       { +0.197598f, -0.050117f, +0.068497f },
       {
