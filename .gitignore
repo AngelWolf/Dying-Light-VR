@@ -1,0 +1,11 @@
+# build output
+build*/
+vcpkg_installed/
+*.user
+.vs/
+
+# not redistributed: the Oculus PC SDK headers (see third_party/OVR/README.md)
+third_party/OVR/Include/
+
+# the launcher's art is not part of the public source (the launcher builds with a plain look without it)
+launcher_art/

@@ -1,0 +1,1319 @@
+// Loot by hand - docs/superpowers/specs/2026-10-23-loot-by-hand-design.md, plan docs/superpowers/plans/2026-10-23-loot-by-hand.md
+// Task 3. The decision is looting_logic.h (unit-tested, src/src/tests/looting_logic_test.cpp).
+//
+// HOW (RESEARCH-NATIVE-LOOTING-2026-10-23 §5, INV-614 / INV-615, OUR gamedll 97046bba):
+//   - The game gathers usable triggers AROUND THE PLAYER and the HUD picks one by look in GetNearbyTriggers (+B9BBB0), at most every
+//     0.1 s and only while no trigger runs; the pick lands in PlayerDI+5272/+5280 through sub_180BED850. The X press reads that pick
+//     and the TriggerController copies it at Start, then advances the held search while the action reads held.
+//   - NearbyHook calls the original, publishes the bodies it gathered - standalone BodyContainers and, since loot_hand_run2, dead AIs
+//     carrying a search container (INV-616: a fresh corpse is the AI) - every call while loot_by_hand=1, and - only
+//     while a hand is settling / searching - stores the body nearest that hand with the game's own setter. Otherwise the game's
+//     pick passes through untouched.
+//   - LootPoll (scePad poll) feeds looting::HandMachine per hand; LootPadByte ORs Square while a hand searches.
+//
+// THREADS. LootPoll / LootPadByte run on the scePad poll (a game thread in the update phase, INV-138). NearbyHook runs on the HUD
+// trigger widgets' update (HudTrigger +5B9BA0 / Hud3dTrigger +50B410) - presumed the game thread, NOT traced. The two share only
+// atomics and two seqlocked arrays (no lock either side could wait on).
+#include "looting.h"
+
+#include "aimhook.h"        // AimMirrorYaw - the gun's yaw-sign convention (the throwables' mapping)
+#include "bodygrab.h"       // body grab: the machine's DRAG / END events start and stop it (plan 2026-10-23-body-grab Task 3)
+#include "bodygrab_logic.h" // YawQuat / QuatMul - the hand's world rotation for the severed-limb rotation hold
+#include "boneblend.h"      // InstallSingleGameDetour - the shared verify / suspend / commit path
+#include "calibscreen.h"    // CalibScreenActive - a blocked input for body grab
+#include "camhook.h"        // CamHookGetOpenXrToGameYaw, CamHookGetRenderedViewMatrix
+#include "controllers.h"
+#include "headpose.h"       // GetHeadPose, NeckPivotReportedPos
+#include "camogesture.h"    // CamoGesturePadPoll - the camouflage wipe, beside body grab's hand publish
+#include "looting_logic.h"
+#include "overlay.h"        // OverlayVisible - a blocked input for body grab
+
+#include <windows.h>
+
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+
+#include "../common/log.h"
+
+#define LOG(...) ::dlvr::LogTo("dlvr_ovr2xr.log", __VA_ARGS__)
+#include "periodic_log.h"   // LOG_PERIODIC - diag_periodic_logs (the 5 s totals line only)
+
+// The Epic (EGL) build: every fixed gamedll rva below is on tools/egl_allowlist.tsv (family 8, translated exactly by
+// tools/egl_rva_table.py); resolved ONCE in TryInstall. The detour address is handed over as the Steam rva - InstallSingleGameDetour
+// translates it itself (buildrva::Abs), so it must not be translated twice. The DEV tree has no buildrva.h: Steam rvas only.
+#if __has_include("../common/buildrva.h")
+#include "../common/buildrva.h"
+#define DLVR_LOOT_GD_RVA(rva) ::dlvr::buildrva::Gd(rva)
+#else
+#define DLVR_LOOT_GD_RVA(rva) (rva)
+#endif
+
+namespace dlvr {
+
+// [DEP: loot_by_hand] required-for=looting a body by grip and hold (LootByHand) - spec 2026-10-23-loot-by-hand-design.
+//      tree=INERT at 0: LootPoll / LootPadByte return at their first test, nothing is installed, no game memory is read.
+//      HEADSET: needs both GRIP poses + squeeze, the head pose, the rendered view matrix and the OpenXR->game yaw (camhook),
+//      and the GetNearbyTriggers detour (+B9BBB0, Steam gamedll 97046bba; the Epic build's rvas from buildrva_table.h family 8;
+//      any other gamedll REFUSES by its bytes). Compiled default 1 since 2026-10-24 (3) (Jay: "They should be switched on" ->
+//      "Yes." - for the tester package; verified loot_hand_run3b). Was 0 / held until the native interactions ship together.
+bool  LootByHand = true;
+// [DEP: loot_reach_m] required-for=how close the hand must be to a body's world box (LootReachM). tree=INERT at loot_by_hand=0.
+float LootReachM = 0.25f;
+// [DEP: loot_still_speed] required-for=the "hold still" rule (LootStillSpeed), m/s in tracking space over a ~100 ms window
+//      (looting::SpeedWindow, D-269). tree=INERT at loot_by_hand=0. Compiled 0.75 = Jay's disk, the value loot_hand_run3b was
+//      verified on (Tier D, 2026-10-24 (3); was 0.30).
+float LootStillSpeed = 0.75f;
+// [DEP: loot_settle_s] required-for=the still time before the search starts (LootSettleS). tree=INERT at loot_by_hand=0.
+float LootSettleS = 0.30f;
+// [DEP: diag_loot_why] required-for=[LOOTWHY] - why a body the player stands over gets no loot / camouflage prompt in VR (Jay
+//      2026-10-27: "I can be directly over the body in VR and not be able to loot it, it wont show the prompt in the UI"). Inside the
+//      GetNearbyTriggers detour (HUD thread), twice a second while a body is within the gather's reach: the game's own gather
+//      (+EF2FC0) re-run with flags 3 / 1 / 0 (as the game / no look cone / no cone and no ray), each early gate of GetNearbyTriggers
+//      read, and per body the values every filter compares (STATE 2026-10-27, ida/lt4b + lt9 + lt9b-d + lt10). tree=PROBE-ONLY
+//      (log-only: calls the game's own read-only queries; writes nothing). DEV only, Steam rvas. HEADSET. DEFAULT OFF.
+bool  DiagLootWhy = false;
+
+namespace {
+
+// ---- OUR gamedll 97046bba constants - RESEARCH-NATIVE-LOOTING §5 (lb1_prologue_out.txt, lt3 / lt4b / lt6). ----
+constexpr uintptr_t kNearbyRva = 0xB9BBB0;   // PlayerDI::GetNearbyTriggers(player, out) - INV-615
+constexpr unsigned char kNearbyBytes[15] = { 0x4C, 0x8B, 0xDC, 0x49, 0x89, 0x53, 0x10, 0x49, 0x89, 0x4B, 0x08, 0x55, 0x56,
+                                             0x41, 0x54 };   // mov r11,rsp / mov [r11+10h],rdx / mov [r11+8],rcx / push rbp
+                                                             // / push rsi / push r12 - no RIP-relative operand (§5)
+constexpr uintptr_t kSetterRva = 0xBED850;   // sub_180BED850(player, trigger, char) - writes +5272/+5280 (called, not patched)
+constexpr uintptr_t kBodyVtRva = 0x164B528;  // BodyContainer's primary vftable (RTTI COL-checked, lt3)
+constexpr size_t    kPickHandle = 5272;      // PlayerDI+5272 != 0 -> +5280 = the stored pick (INV-615)
+constexpr size_t    kPickObj = 5280;
+constexpr size_t    kCtlObjOff = 24;         // candidate + 24 = IControlObject (the gather's own box read, lt4b :1286)
+// A FRESH corpse is gathered as the dead AI, not as a BodyContainer (INV-616, lf2 / lf4 / lf6): AI and HumanAI share
+// GetTriggerActionInternal +18E280 at vftable slot 179, and the AI's logic module answers X with the container held at AI+6000
+// (present when AI+5992 != 0). +6000 is read only on a candidate proven AI by its slot 179, and trusted only when the object it
+// points at carries the BodyContainer vftable.
+constexpr uintptr_t kAiTrigActRva = 0x18E280;
+constexpr size_t    kTrigActSlot = 179;
+constexpr size_t    kAiBodyHandle = 5992;
+constexpr size_t    kAiBodyObj = 6000;
+// Searched once (Jay: "a body can only be searched for loot a singular time"; RESEARCH-BODY-GRAB "SKELETON RUN"): the container's
+// trigger state = the dword at BodyContainer +824 (OURS gamedll: BodyContainer vftable slot 195 +A57BF0 returns it; slot 180
+// +A5A320 compares it with 5). Mac (comparison): PersistentTriggerObjectDI::GetState (+808) - GetBodyContainerTriggerAction offers
+// the search only while the state is 1, Container::IsLooted = state 5 (or 1 and empty). A press on a body whose state is not 1 is
+// not a search: with body_grab it grabs, without it it does not arm. Unreadable state = as before.
+constexpr size_t    kContStateOff = 824;
+constexpr uint32_t  kStateSearchable = 1;
+// Right grip camouflage block: the infected logic modules' slot-1 (R1) handler +30BE80 (module vftable slot 283, shared by Zombie /
+// Infected / Armored / HiveBrood / Prime / Spitter / Thug / Volatile - lc1; the human module's +2B9820 has no camouflage) returns
+// action 53 when, among player-side tests, module+408 > 1.5 and AI+5713 != 0 (lf6). The module sits at AI+3408; the AI uses it only
+// when its float [19] (+76) reads 0, else a default module (+18E280, lf4).
+constexpr size_t    kAiModule = 3408;
+constexpr size_t    kModuleDefaultFlag = 76;
+constexpr size_t    kModuleSlot1Fn = 283;
+constexpr uintptr_t kInfectedSlot1Rva = 0x30BE80;
+constexpr size_t    kModuleCamoTime = 408;
+constexpr size_t    kAiCamoFlag = 5713;
+constexpr ULONGLONG kCamoFreshMs = 500;   // the HUD re-picks every <= 0.1 s while no trigger runs; older = no longer the pick
+constexpr const char* kExtentsExport = "?GetExtentsInWorld@IControlObject@@QEBAAEBVextents@@XZ";   // engine +13E8B0
+constexpr float     kMaxHandOffsetM = 1.5f;  // throwable.cpp:175 / grappleaim.cpp:760 - a tracking glitch is not a hand
+constexpr int       kMaxBoxes = 16;
+constexpr float     kGripThreshold = 0.5f;   // ovr2xr.cpp's vr_grip threshold
+// body_grab: the longest a press with no body in reach waits for a due severed-limb reading (the search runs <= every 100 ms per
+// hand from squeeze 0.2; relict_single_run1 saw a NO-ARM 5 ms before the first query). The grip is withheld while it waits.
+constexpr double    kLateArmS = 0.15;
+
+using NearbyFn = void(__fastcall*)(void* player, void* out);
+using SetterFn = void(__fastcall*)(void* player, void* trigger, char flag);
+using ExtentsFn = const float*(__fastcall*)(void* ctlObj);
+
+struct GameVec {   // the out vector GetNearbyTriggers fills: { T** data; u32 count; u32 cap } (§5)
+    void** data;
+    unsigned count;
+    unsigned cap;
+};
+
+uintptr_t g_gd = 0;
+// the rvas as the loaded build has them (Steam values until TryInstall resolves them, before g_gd is published)
+uintptr_t g_rSetter = kSetterRva, g_rBodyVt = kBodyVtRva, g_rAiTrigAct = kAiTrigActRva, g_rInfectedSlot1 = kInfectedSlot1Rva;
+// The gaze re-pick (2026-10-27, run 8): the gather, the cone's FOV variable and two early gates, as the loaded build has them.
+constexpr uintptr_t kGatherRva2 = 0xEF2FC0, kVarRva2 = 0xC58E40, kUiGateRva2 = 0xCAEB00, kObjGateRva2 = 0x6D5590,
+                    kGameDiRva2 = 0x1C16348, kVarAltRva2 = 0x1C122C8;
+uintptr_t g_rGather = kGatherRva2, g_rVar = kVarRva2, g_rUiGate = kUiGateRva2, g_rObjGate = kObjGateRva2, g_rGameDi = kGameDiRva2,
+          g_rVarAlt = kVarAltRva2;
+NearbyFn  g_origNearby = nullptr;
+SetterFn  g_setter = nullptr;
+ExtentsFn g_extents = nullptr;
+volatile LONG g_installState = 0;   // 0 not tried, 1 READY, -1 REFUSED (named once)
+ULONGLONG g_lastTryMs = 0;
+int       g_tries = 0;
+
+// Shared pad thread <-> HUD hook. g_lootHand: -1 none, 0 left, 1 right (the hand settling / searching).
+volatile LONG g_lootHand = -1;
+volatile LONG g_handSeq = 0;
+float g_handPos[3] = {};
+volatile LONG g_boxSeq = 0;
+int   g_boxCount = 0;
+float g_boxA[kMaxBoxes][6] = {};   // the candidate's own box (a standalone BodyContainer, or the dead AI)
+float g_boxC[kMaxBoxes][6] = {};   // a dead AI's attached container's box
+bool  g_haveA[kMaxBoxes] = {};
+bool  g_haveC[kMaxBoxes] = {};
+void* g_boxObj[kMaxBoxes] = {};    // what the setter receives: the BodyContainer, or the dead AI
+
+// Counters (5 s totals). The last gather's counts also ride the NO-ARM line (BETA compiles LOG_PERIODIC out).
+volatile LONG g_nHook = 0, g_nSub = 0, g_nPass = 0, g_nNoBody = 0, g_nFault = 0;
+volatile LONG g_lastCand = 0, g_lastStandalone = 0, g_lastAi = 0, g_lastAiBody = 0;
+volatile LONG g_nArm = 0, g_nSearch = 0, g_nEndOpen = 0, g_nEndMoved = 0, g_nEndGone = 0, g_nNoArm = 0;
+volatile LONG g_nDrag = 0, g_nEndDrag = 0;   // body grab: DRAG, and every END of a drag
+constexpr LONG kMaxNoArmLines = 40;   // NO-ARM is one line per press edge - human rate; the cap only guards a flickering squeeze
+
+// Right grip camouflage block: set by NearbyHook (HUD thread) after each re-pick, read by GripCamoPoll (pad thread).
+volatile LONG      g_camoPick = 0;                 // 1 = the game's current pick is a camouflage target
+volatile LONG64    g_camoTickMs = 0;               // GetTickCount64 of that evaluation
+void* volatile     g_camoObj = nullptr;            // the pick, for the log
+volatile LONG      g_nCamoWithheld = 0, g_nCamoSeen = 0;
+looting::PressLatch g_camoLatch;
+
+looting::HandMachine g_machine[2];
+looting::SpeedWindow g_speed[2];   // tracking-space grip samples; reset on a press edge and when the pose drops out
+bool g_prevGripDown[2] = {};
+
+double NowS()
+{
+    LARGE_INTEGER f, c;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return static_cast<double>(c.QuadPart) / static_cast<double>(f.QuadPart);
+}
+
+// ---- SEH-guarded game reads (no C++ objects in these frames). ----
+bool ReadPtr(uintptr_t a, uintptr_t* out)
+{
+    __try { *out = *reinterpret_cast<const uintptr_t*>(a); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+bool ReadBox(void* obj, float out[6])
+{
+    __try {
+        const float* e = g_extents(static_cast<char*>(obj) + kCtlObjOff);
+        if (!e) { return false; }
+        for (int k = 0; k < 6; ++k) { out[k] = e[k]; }
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+bool ReadF32(uintptr_t a, float* out)
+{
+    __try { *out = *reinterpret_cast<const float*>(a); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+bool ReadU8(uintptr_t a, unsigned char* out)
+{
+    __try { *out = *reinterpret_cast<const unsigned char*>(a); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+bool CallSetter(void* player, void* body)
+{
+    __try { g_setter(player, body, 1); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// The hand in game world: camera + R*(grip - reported head) - throwable.cpp:500-528 (verified in play), either hand. `rot` (x, y,
+// z, w) = the same yaw applied to the grip rotation (10-24 (2), the severed-limb rotation hold: bodygrab_logic YawQuat is tested
+// against the position formula below).
+bool HandWorld(Hand h, float out[3], float trk[3], float rot[4])
+{
+    float rel = 0.0f;
+    float m[12] = {};
+    unsigned camAge = 0;
+    XrPosef head{}, grip{};
+    if (!CamHookGetOpenXrToGameYaw(rel) || !CamHookGetRenderedViewMatrix(m, &camAge) || !GetHeadPose(head) ||
+        !GetControllerGripPose(h, grip)) {
+        return false;
+    }
+    trk[0] = grip.position.x;
+    trk[1] = grip.position.y;
+    trk[2] = grip.position.z;
+    const XrVector3f hr = NeckPivotReportedPos(head);
+    const float off[3] = { grip.position.x - hr.x, grip.position.y - hr.y, grip.position.z - hr.z };
+    if (off[0] * off[0] + off[1] * off[1] + off[2] * off[2] >= kMaxHandOffsetM * kMaxHandOffsetM) { return false; }
+    const float c = std::cos(rel);
+    float s = std::sin(rel);
+    if (AimMirrorYaw) { s = -s; }
+    out[0] = m[3] + off[0] * c + off[2] * s;
+    out[1] = m[7] + off[1];
+    out[2] = m[11] - off[0] * s + off[2] * c;
+    float yq[4] = {};
+    bodygrab::YawQuat(AimMirrorYaw ? -rel : rel, yq);
+    const float gq[4] = { grip.orientation.x, grip.orientation.y, grip.orientation.z, grip.orientation.w };
+    bodygrab::QuatMul(yq, gq, rot);
+    return true;
+}
+
+// Nearest published body to p: index or -1; *dist = the nearer of its boxes, *da / *dc = each box's distance (-1 = no such box).
+int NearestBox(const float p[3], float* dist, void** objOut, float* da, float* dc)
+{
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        const LONG s0 = g_boxSeq;
+        if (s0 & 1) { continue; }
+        int best = -1;
+        float bd = 0.0f, ba = -1.0f, bc = -1.0f;
+        void* bo = nullptr;
+        const int n = g_boxCount;
+        for (int i = 0; i < n && i < kMaxBoxes; ++i) {
+            float a = -1.0f, c = -1.0f;
+            const float d = looting::NearerBoxDist(g_boxA[i], g_haveA[i], g_boxC[i], g_haveC[i], p, &a, &c);
+            if (d < 0.0f) { continue; }
+            if (best < 0 || d < bd) { best = i; bd = d; ba = a; bc = c; bo = g_boxObj[i]; }
+        }
+        if (g_boxSeq == s0) {
+            *dist = bd;
+            *da = ba;
+            *dc = bc;
+            if (objOut) { *objOut = bo; }
+            return best;
+        }
+    }
+    return -1;
+}
+
+// Is the player's stored pick (PlayerDI+5272/+5280, INV-615) an infected corpse the R1 slot would camouflage on? The game's own
+// handler (+30BE80) tests, besides the player-side CanUseCamouflage / dissolved / renderable / Hellraid: module+408 > 1.5 and
+// AI+5713 != 0. Every read is guarded; the module fields are read only after the AI test and the module's own slot-283 match.
+// Is `ai` an AI (vftable slot 179 == +18E280) whose logic module is the infected one (AI+3408, module+76 == 0, the module's slot 283 ==
+// +30BE80)? *moduleOut = that module. Shared by PickIsCamoTarget and the camouflage gesture (camogesture.cpp, LootInfectedModule).
+// COST: five guarded reads. g_gd 0 (loot by hand not installed) = false.
+bool InfectedModule(uintptr_t ai, uintptr_t* moduleOut)
+{
+    uintptr_t vt = 0, fn = 0, module = 0, mvt = 0, mfn = 0;
+    float defFlag = 1.0f;
+    *moduleOut = 0;
+    if (!g_gd || !ai) { return false; }
+    if (!ReadPtr(ai, &vt) || !ReadPtr(vt + 8 * kTrigActSlot, &fn) || fn != g_gd + g_rAiTrigAct) { return false; }
+    if (!ReadPtr(ai + kAiModule, &module) || !module || !ReadF32(module + kModuleDefaultFlag, &defFlag) || defFlag != 0.0f) {
+        return false;
+    }
+    if (!ReadPtr(module, &mvt) || !ReadPtr(mvt + 8 * kModuleSlot1Fn, &mfn) || mfn != g_gd + g_rInfectedSlot1) { return false; }
+    *moduleOut = module;
+    return true;
+}
+
+bool PickIsCamoTarget(uintptr_t player, uintptr_t* pickOut)
+{
+    uintptr_t h = 0, pick = 0, module = 0;
+    float camoTime = 0.0f;
+    unsigned char camoFlag = 0;
+    *pickOut = 0;
+    if (!ReadPtr(player + kPickHandle, &h) || !h || !ReadPtr(player + kPickObj, &pick) || !pick) { return false; }
+    *pickOut = pick;
+    if (!InfectedModule(pick, &module)) { return false; }
+    if (!ReadF32(module + kModuleCamoTime, &camoTime) || !ReadU8(pick + kAiCamoFlag, &camoFlag)) { return false; }
+    return camoFlag != 0 && camoTime > 1.5f;
+}
+
+// The search container's trigger state for a gathered body (a standalone BodyContainer, or a dead AI's container at +6000):
+// -1 = unreadable / no container. COST: up to five guarded pointer reads.
+int ContainerState(void* body)
+{
+    if (!body || !g_gd) { return -1; }
+    const uintptr_t b = reinterpret_cast<uintptr_t>(body);
+    const uintptr_t bodyVt = g_gd + g_rBodyVt;
+    uintptr_t vt = 0, c = 0, h = 0, cvt = 0, fn = 0;
+    if (!ReadPtr(b, &vt)) { return -1; }
+    if (vt == bodyVt) {
+        c = b;
+    } else if (ReadPtr(vt + 8 * kTrigActSlot, &fn) && fn == g_gd + g_rAiTrigAct && ReadPtr(b + kAiBodyHandle, &h) && h &&
+               ReadPtr(b + kAiBodyObj, &c) && c && ReadPtr(c, &cvt) && cvt == bodyVt) {
+        // c = the AI's container
+    } else {
+        return -1;
+    }
+    uintptr_t raw = 0;
+    if (!ReadPtr(c + kContStateOff, &raw)) { return -1; }
+    return static_cast<int>(static_cast<uint32_t>(raw));
+}
+
+// ---- [LOOTWHY] (diag_loot_why): why a body near the player is or is not the HUD's prompt. OUR gamedll 97046bba / engine
+// e9fbfc2c, Steam rvas (DEV tree only). Read 2026-10-27: GetNearbyTriggers +B9BBB0 (ida/lt4b :207-767), the gather +EF2FC0
+// (lt4b :1076-1667), PlayerDI slots 230 / 233 / 222 / 243 (lt9 / lt9c), +EF3CD0 IsApproachAngleCorrect / +EF3E70 (lt9b), the HUD
+// +5B9BA0 and the gates +CAEB00 / +6D5590 (lt9c / lt9d), ENGINE ITools slots 240 / 884 (lt10). ----
+namespace why {
+constexpr uintptr_t kGatherRva   = 0xEF2FC0;    // bool (ILevel*, ctx*, GameVec* out, unsigned a4, const float* dir)
+constexpr uintptr_t kApproachRva = 0xEF3CD0;    // bool (trigger, const float* eye) - TriggerObjectDI::IsApproachAngleCorrect (Mac)
+constexpr uintptr_t kActionRva   = 0xEF3E70;    // bool (trigger, ctx*, int a3)
+constexpr uintptr_t kVarRva      = 0xC58E40;    // float (table*, int index) - player variable 779 = CameraDefaultFOV (Mac name)
+constexpr uintptr_t kPickDirRva  = 0x439080;    // dword* (GameDI+4368, dword* out, char) - the pick's direction
+constexpr uintptr_t kUiGateRva   = 0xCAEB00;    // bool (*(ILevel+4632))
+constexpr uintptr_t kObjGateRva  = 0x6D5590;    // bool ()
+constexpr uintptr_t kGameDiRva   = 0x1C16348;   // GameDI
+constexpr uintptr_t kToolsRva    = 0x1C11A70;   // ITools (engine object, INV-257)
+constexpr uintptr_t kVarAltRva   = 0x1C122C8;   // the gather's alternative variable owner (lt4b :257)
+constexpr int       kSlotEye = 230, kSlotLook = 233, kSlotMelee = 222, kSlotItem = 243, kSlotPoint = 181;
+constexpr int       kCap = 256;                 // the gather never reallocates below this (its own growth path is CRT realloc)
+constexpr long      kMaxLines = 1200;           // INV-9: two a second -> 10 minutes
+using GatherFn   = bool(__fastcall*)(void* level, void* ctx, void* out, unsigned a4, const float* dir);
+using ApproachFn = bool(__fastcall*)(void* trig, const float* eye);
+using ActionFn   = bool(__fastcall*)(void* trig, void* ctx, int a3);
+using VarFn      = float(__fastcall*)(void* table, int index);
+using PickDirFn  = int*(__fastcall*)(uintptr_t gdi4368, int* out, char a3);
+using UiGateFn   = bool(__fastcall*)(uintptr_t a1);
+using ObjGateFn  = bool(__fastcall*)();
+using Vec3Fn     = float*(__fastcall*)(void* self, float* out);
+using ItemFn     = uintptr_t(__fastcall*)(void* self, int slot);
+using BoolFn     = unsigned char(__fastcall*)(void* self);
+using PtrFn      = uintptr_t(__fastcall*)(void* self);
+using LevelFn    = void*(__fastcall*)(void* igs);
+#pragma pack(push, 1)
+struct Ctx {                 // the gather's context (lt4b :250-270 / +5B9BA0 :599-604): 40 bytes
+    void*         player;
+    int           slot;      // 4 = every action slot 0..3
+    float         r1, r2;    // 1.8 / 2.6
+    unsigned char flags;     // &1 the ray, &2 the look cone
+    unsigned char pad[3];
+    float         angFar, angNear, dFar, dNear;
+};
+#pragma pack(pop)
+static_assert(sizeof(Ctx) == 40, "the gather reads 40 bytes of context");
+
+ULONGLONG g_lastMs = 0;
+long      g_lines = 0;
+bool      g_saidArmed = false;
+LevelFn   g_getLevel = nullptr;
+// Per thread: the HUD has two callers of GetNearbyTriggers (+5B9BA0, +50B410) on the engine's job workers - never one shared buffer.
+thread_local void* t_buf[4][kCap];
+
+template <typename F> bool Call(F f) { __try { f(); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; } }
+bool Gather(GatherFn fn, void* level, Ctx* ctx, GameVec* v, unsigned a4, const float* dir)
+{
+    __try { fn(level, ctx, v, a4, dir); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+bool CallVec3(uintptr_t self, int slot, float out[3])
+{
+    __try {
+        const uintptr_t vt = *reinterpret_cast<const uintptr_t*>(self);
+        reinterpret_cast<Vec3Fn>(*reinterpret_cast<const uintptr_t*>(vt + 8 * slot))(reinterpret_cast<void*>(self), out);
+        return std::isfinite(out[0]) && std::isfinite(out[1]) && std::isfinite(out[2]);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+int CallBoolSlot(uintptr_t self, int slot)   // -1 = fault
+{
+    __try {
+        const uintptr_t vt = *reinterpret_cast<const uintptr_t*>(self);
+        return reinterpret_cast<BoolFn>(*reinterpret_cast<const uintptr_t*>(vt + 8 * slot))(reinterpret_cast<void*>(self)) ? 1 : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+int Active(uintptr_t player, int id)   // controller ID active (player + 2976 + 8 ID, byte +16 - INV-327), -1 unread
+{
+    uintptr_t c = 0;
+    unsigned char b = 0;
+    if (!ReadPtr(player + 2976 + 8 * static_cast<uintptr_t>(id), &c) || !c || !ReadU8(c + 16, &b)) { return -1; }
+    return b ? 1 : 0;
+}
+int ItemGate(uintptr_t player)   // GetNearbyTriggers :229-232: hand item 0 and its +88 object's vfunc +2024; -1 unread
+{
+    __try {
+        const uintptr_t vt = *reinterpret_cast<const uintptr_t*>(player);
+        const uintptr_t item = reinterpret_cast<ItemFn>(*reinterpret_cast<const uintptr_t*>(vt + 8 * kSlotItem))(
+            reinterpret_cast<void*>(player), 0);
+        if (!item || item == static_cast<uintptr_t>(-88)) { return 0; }
+        const uintptr_t o = item + 88;
+        const uintptr_t ovt = *reinterpret_cast<const uintptr_t*>(o);
+        return reinterpret_cast<BoolFn>(*reinterpret_cast<const uintptr_t*>(ovt + 2024))(reinterpret_cast<void*>(o)) ? 1 : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+int GdiGate(uintptr_t gd)   // :235-240: *(GameDI+1344) vfunc +1952 -> +4616 != 0; -1 unread
+{
+    __try {
+        const uintptr_t gdi = *reinterpret_cast<const uintptr_t*>(gd + kGameDiRva);
+        const uintptr_t o = gdi ? *reinterpret_cast<const uintptr_t*>(gdi + 1344) : 0;
+        if (!o) { return 0; }
+        const uintptr_t r = reinterpret_cast<PtrFn>(*reinterpret_cast<const uintptr_t*>(*reinterpret_cast<const uintptr_t*>(o) +
+                                                                                        1952))(reinterpret_cast<void*>(o));
+        if (!r) { return 0; }
+        return *reinterpret_cast<const uintptr_t*>(r + 4616) ? 1 : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+// AABB distance (the gather's v32, lt4b :1287-1319) from p to a world box {min xyz, max xyz}
+float BoxDist(const float b[6], const float p[3])
+{
+    float s = 0.0f;
+    for (int k = 0; k < 3; ++k) {
+        const float c = 0.5f * (b[k] + b[k + 3]), h = b[k + 3] - c, d = p[k] - c;
+        if (std::fabs(d) > h) { const float e = d > 0.0f ? d - h : d + h; s += e * e; }
+    }
+    return std::sqrt(s);
+}
+float AngDeg(const float a[3], const float b[3])
+{
+    const float la = std::sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]), lb = std::sqrt(b[0] * b[0] + b[1] * b[1] + b[2] * b[2]);
+    if (la < 1e-6f || lb < 1e-6f) { return -1.0f; }
+    float c = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) / (la * lb);
+    c = c > 1.0f ? 1.0f : (c < -1.0f ? -1.0f : c);
+    return std::acos(c) * 57.29578f;
+}
+// a body = a standalone BodyContainer, or a dead AI carrying one (NearbyHook's own test)
+bool IsBody(uintptr_t obj)
+{
+    uintptr_t vt = 0, fn = 0, h = 0, c = 0, cvt = 0;
+    if (!ReadPtr(obj, &vt)) { return false; }
+    if (vt == g_gd + g_rBodyVt) { return true; }
+    return ReadPtr(vt + 8 * kTrigActSlot, &fn) && fn == g_gd + g_rAiTrigAct && ReadPtr(obj + kAiBodyHandle, &h) && h &&
+           ReadPtr(obj + kAiBodyObj, &c) && c && ReadPtr(c, &cvt) && cvt == g_gd + g_rBodyVt;
+}
+bool InVec(const GameVec& v, uintptr_t o)
+{
+    for (unsigned i = 0; i < v.count && i < static_cast<unsigned>(kCap); ++i) {
+        if (reinterpret_cast<uintptr_t>(v.data[i]) == o) { return true; }
+    }
+    return false;
+}
+
+// COST while diag_loot_why=1: every HUD re-pick a tick compare; twice a second three runs of the game's own gather (its box tests
+// and up to one raytrace per candidate each), ~30 guarded reads and ~15 game calls, one LOG line when a body is within reach.
+void Evaluate(void* player)
+{
+    const uintptr_t pl = reinterpret_cast<uintptr_t>(player);
+    const ULONGLONG now = GetTickCount64();
+    if (g_lines >= kMaxLines || now - g_lastMs < 500) { return; }
+    g_lastMs = now;
+    if (!g_getLevel) {
+        const HMODULE en = GetModuleHandleA("engine_x64_rwdi.dll");
+        g_getLevel = en ? reinterpret_cast<LevelFn>(GetProcAddress(en, "?GetLevel@IGSObject@@QEBAPEAVILevel@@XZ")) : nullptr;
+    }
+    // The probe's rvas are Steam values and NOT on the Epic allowlist: on any build whose loot rvas were translated (the BETA
+    // tree's buildrva, TryInstall), calling them would land in other code - refuse by name, once, and never call.
+    if (g_rSetter != kSetterRva) {
+        if (!g_saidArmed) {
+            g_saidArmed = true;
+            g_lines = kMaxLines;
+            // [PROBE: LOOTWHY] gate=diag_loot_why  site=HEADSET  log-only=yes
+            LOG("looting: [LOOTWHY] REFUSED - this gamedll is not the Steam build the probe's addresses were read from (the loot rvas "
+                "were translated); nothing is called");
+        }
+        return;
+    }
+    if (!g_saidArmed) {
+        g_saidArmed = true;
+        ++g_lines;
+        // [PROBE: LOOTWHY] gate=diag_loot_why  site=HEADSET  log-only=yes
+        LOG("looting: [LOOTWHY] ARMED (logged unconditionally) - gather +%llX x3 (flags 3 game / 1 no cone / 0 no cone no ray), "
+            "approach +%llX, action +%llX, pick dir +%llX, gates +%llX / +%llX, GetLevel %p | a line twice a second while a body is "
+            "within the gather's 2.6 m of the eye; Steam rvas (DEV)",
+            static_cast<unsigned long long>(kGatherRva), static_cast<unsigned long long>(kApproachRva),
+            static_cast<unsigned long long>(kActionRva), static_cast<unsigned long long>(kPickDirRva),
+            static_cast<unsigned long long>(kUiGateRva), static_cast<unsigned long long>(kObjGateRva),
+            reinterpret_cast<void*>(g_getLevel));
+    }
+    if (!g_getLevel) { return; }
+    void* level = nullptr;
+    if (!Call([&] { level = g_getLevel(reinterpret_cast<void*>(pl + 40)); }) || !level) { return; }
+
+    float eye[3] = {}, look[3] = {};
+    const bool haveEye = CallVec3(pl, kSlotEye, eye), haveLook = CallVec3(pl, kSlotLook, look);
+    float yaw = NAN, pitch = NAN;
+    ReadF32(pl + 4460, &yaw);
+    ReadF32(pl + 4464, &pitch);
+    // the cone's FOV (lt4b :256-266)
+    float fov = NAN;
+    {
+        unsigned char b80 = 0;
+        ReadU8(pl + 80, &b80);
+        uintptr_t owner = 0, alt = 0;
+        ReadPtr(pl + 8 * 459, &owner);
+        if (b80 && CallBoolSlot(pl, 2504 / 8) == 0 && ReadPtr(g_gd + kVarAltRva, &alt)) { owner = alt; }
+        uintptr_t table = 0;
+        if (owner && ReadPtr(owner + 208, &table) && table) {
+            Call([&] { fov = reinterpret_cast<VarFn>(g_gd + kVarRva)(reinterpret_cast<void*>(table), 779); });
+        }
+    }
+    const float angFar = fov * 0.0076794489f, angNearRaw = fov * 0.013823008f;
+    const float angNear = angNearRaw >= 1.5707964f ? 1.5707964f : angNearRaw;
+    unsigned char b9896 = 0;
+    ReadU8(pl + 9896, &b9896);
+
+    GameVec v[3];
+    int nBody[3] = {};
+    bool gOk[3] = {};
+    static const unsigned char kFlags[3] = { 3, 1, 0 };
+    for (int r = 0; r < 3; ++r) {
+        Ctx ctx{};
+        ctx.player = player;
+        ctx.slot = 4;
+        ctx.r1 = 1.8f;
+        ctx.r2 = 2.6f;
+        ctx.flags = kFlags[r];
+        ctx.angFar = angFar;
+        ctx.angNear = angNear;
+        ctx.dFar = 1.8f;
+        ctx.dNear = 0.5f;
+        v[r].data = t_buf[r];
+        v[r].count = 0;
+        v[r].cap = kCap;
+        gOk[r] = haveLook && std::isfinite(fov) &&
+                 Gather(reinterpret_cast<GatherFn>(g_gd + kGatherRva), level, &ctx, &v[r], b9896 ? 1u : 0u, look);
+        if (v[r].data != t_buf[r]) {   // never expected below kCap - if it happens the game's CRT owns that block: say so, stop
+            ++g_lines;
+            // [PROBE: LOOTWHY] gate=diag_loot_why  site=HEADSET  log-only=yes
+            LOG("looting: [LOOTWHY] STOPPED - the gather grew its list past %d entries (its own realloc); the probe stops here and "
+                "leaks that block rather than free it across CRTs", kCap);
+            g_lines = kMaxLines;
+            return;
+        }
+        for (unsigned i = 0; gOk[r] && i < v[r].count; ++i) {
+            if (IsBody(reinterpret_cast<uintptr_t>(v[r].data[i]))) { ++nBody[r]; }
+        }
+    }
+    if (nBody[2] == 0 && g_lines > 1) { return; }   // no body within reach at all - nothing to explain (the first line always prints)
+
+    // the early gates (GetNearbyTriggers :209-249) and the HUD's (+5B9BA0)
+    int grp = -99, b10896 = -1;
+    {
+        uintptr_t raw = 0;
+        if (ReadPtr(pl + 3324, &raw)) { grp = static_cast<int>(static_cast<uint32_t>(raw)); }
+        if (ReadPtr(pl + 10896, &raw)) { b10896 = static_cast<int>(static_cast<uint32_t>(raw)); }
+    }
+    int ui = -1, objGate = -1;
+    {
+        uintptr_t l4632 = 0;
+        if (ReadPtr(reinterpret_cast<uintptr_t>(level) + 4632, &l4632)) {
+            bool r = false;
+            if (Call([&] { r = reinterpret_cast<UiGateFn>(g_gd + kUiGateRva)(l4632); })) { ui = r ? 1 : 0; }
+        }
+        bool r = false;
+        if (Call([&] { r = reinterpret_cast<ObjGateFn>(g_gd + kObjGateRva)(); })) { objGate = r ? 1 : 0; }
+    }
+    const int melee = CallBoolSlot(pl, kSlotMelee), item = ItemGate(pl), gdiGate = GdiGate(g_gd);
+    // the pick direction and the engine's VR-branch bytes (ITools slots 240 / 884, lt10)
+    int vr = -1, s0 = -1, s1 = -1, s2 = -1, s37 = -1;
+    float pdir[3] = { NAN, NAN, NAN };
+    {
+        uintptr_t tools = 0;
+        if (ReadPtr(g_gd + kToolsRva, &tools) && tools) {
+            vr = CallBoolSlot(tools, 240);
+            uintptr_t set = 0;
+            if (Call([&] { set = reinterpret_cast<PtrFn>(*reinterpret_cast<const uintptr_t*>(*reinterpret_cast<const uintptr_t*>(tools) +
+                                                                                             8 * 884))(reinterpret_cast<void*>(tools)); }) && set) {
+                unsigned char b = 0;
+                if (ReadU8(set + 0, &b)) { s0 = b; }
+                if (ReadU8(set + 1, &b)) { s1 = b; }
+                if (ReadU8(set + 2, &b)) { s2 = b; }
+                if (ReadU8(set + 37, &b)) { s37 = b; }
+            }
+        }
+        uintptr_t gdi = 0;
+        if (ReadPtr(g_gd + kGameDiRva, &gdi) && gdi && s37 >= 0) {
+            int out[3] = {};
+            if (Call([&] { reinterpret_cast<PickDirFn>(g_gd + kPickDirRva)(gdi + 4368, out, static_cast<char>(s37)); })) {
+                std::memcpy(pdir, out, sizeof(pdir));
+            }
+        }
+    }
+    uintptr_t ph = 0, pick = 0;
+    const bool havePick = ReadPtr(pl + kPickHandle, &ph) && ph && ReadPtr(pl + kPickObj, &pick);
+
+    char bodies[1400];
+    size_t bn = 0;
+    bodies[0] = 0;
+    int shown = 0;
+    for (unsigned i = 0; gOk[2] && i < v[2].count && shown < 3; ++i) {
+        const uintptr_t o = reinterpret_cast<uintptr_t>(v[2].data[i]);
+        if (!IsBody(o)) { continue; }
+        ++shown;
+        float pt[3] = { NAN, NAN, NAN }, box[6] = {};
+        const bool havePt = CallVec3(o, kSlotPoint, pt);
+        const bool haveBox = ReadBox(reinterpret_cast<void*>(o), box);
+        const float dEye = haveBox && haveEye ? BoxDist(box, eye) : -1.0f;
+        float toPt[3] = { pt[0] - eye[0], pt[1] - eye[1], pt[2] - eye[2] };
+        const float angLook = havePt && haveEye && haveLook ? AngDeg(toPt, look) : -1.0f;
+        float lim = -1.0f;   // the gather's cone limit at this distance (lt4b :1592-1653: far 1.8 m, near 0.5 m)
+        if (dEye >= 0.0f) {
+            lim = dEye >= 1.8f ? angFar : (dEye <= 0.5f ? angNear : (angNear - angFar) * ((dEye - 1.8f) / (0.5f - 1.8f)) + angFar);
+            lim *= 57.29578f;
+        }
+        const float angPick = havePt && haveEye && std::isfinite(pdir[0]) ? AngDeg(toPt, pdir) : -1.0f;
+        const float dPick = havePt && haveEye ? std::sqrt(toPt[0] * toPt[0] + toPt[1] * toPt[1] + toPt[2] * toPt[2]) : -1.0f;
+        int appr = -1, act = -1;
+        {
+            bool r = false;
+            if (haveEye && Call([&] { r = reinterpret_cast<ApproachFn>(g_gd + kApproachRva)(reinterpret_cast<void*>(o), eye); })) {
+                appr = r ? 1 : 0;
+            }
+            Ctx ctx{};
+            ctx.player = player; ctx.slot = 4; ctx.r1 = 1.8f; ctx.r2 = 2.6f; ctx.flags = 3;
+            ctx.angFar = angFar; ctx.angNear = angNear; ctx.dFar = 1.8f; ctx.dNear = 0.5f;
+            if (Call([&] { r = reinterpret_cast<ActionFn>(g_gd + kActionRva)(reinterpret_cast<void*>(o), &ctx, b9896 ? 1 : 0); })) {
+                act = r ? 1 : 0;
+            }
+        }
+        char t[420];
+        _snprintf_s(t, sizeof(t), _TRUNCATE,
+                    " || body %p state %d: in game/no-cone/no-cone-no-ray %d/%d/%d | eye->box %.2f m | eye->point %.2f m, %.1f deg "
+                    "from the look (cone %.1f), %.1f deg from the pick dir (needs < 25.8) | point (%.2f %.2f %.2f) %s | approach %d "
+                    "action %d | %s",
+                    reinterpret_cast<void*>(o), ContainerState(reinterpret_cast<void*>(o)), InVec(v[0], o) ? 1 : 0,
+                    InVec(v[1], o) ? 1 : 0, 1, dEye, dPick, angLook, lim, angPick, pt[0], pt[1], pt[2],
+                    havePt ? "" : "(UNREAD)", appr, act, havePick && pick == o ? "THE PICK" : "not the pick");
+        for (const char* s = t; *s && bn + 1 < sizeof(bodies); ++s) { bodies[bn++] = *s; }
+        bodies[bn] = 0;
+    }
+    ++g_lines;
+    // [PROBE: LOOTWHY] gate=diag_loot_why  site=HEADSET  log-only=yes
+    LOG("looting: [LOOTWHY] #%ld | bodies gathered as the game / no cone / no cone no ray: %d / %d / %d (calls %d%d%d) | gates: "
+        "group %d, +10896 %d, grab %d dialog %d cannon %d knockdown %d injection %d defensive %d fire %d interaction %d trigger %d, "
+        "melee %d, hand item %d, UI %d, object %d, GameDI %d | eye (%.2f %.2f %.2f)%s, look yaw %.1f pitch %.1f deg, dir (%.2f %.2f "
+        "%.2f), CameraDefaultFOV %.1f -> cone %.1f..%.1f deg | pick dir (%.2f %.2f %.2f), engine VR %d settings %d%d%d / %d | "
+        "pick %p%s%s",
+        g_lines, nBody[0], nBody[1], nBody[2], gOk[0] ? 1 : 0, gOk[1] ? 1 : 0, gOk[2] ? 1 : 0, grp, b10896, Active(pl, 3),
+        Active(pl, 21), Active(pl, 8), Active(pl, 11), Active(pl, 19), Active(pl, 23), Active(pl, 15), Active(pl, 25),
+        Active(pl, 6), melee, item, ui, objGate, gdiGate, eye[0], eye[1], eye[2], haveEye ? "" : " (UNREAD)", yaw, pitch, look[0],
+        look[1], look[2], fov, angFar * 57.29578f, angNear * 57.29578f, pdir[0], pdir[1], pdir[2], vr, s0, s1, s2, s37,
+        havePick ? reinterpret_cast<void*>(pick) : nullptr, bodies, g_lines >= kMaxLines ? " | LAST LOOTWHY line" : "");
+}
+
+// ---- THE GAZE RE-PICK (Jay 2026-10-27: "No new setting, always on"). Run 8 ([LOOTWHY], backups/20261027_lootwhy_run8): the game's
+// LOOK CONE was the only filter that ever dropped a body near the player - in VR the game's look (+4460 / +4464, slot 233) is not
+// where the head looks (standing over a body looking down it read -50..-55 deg; crouched on one -25..+15). So after the game's own
+// pick, when none of GetNearbyTriggers' / the HUD's gates is set, the game's gather (+EF2FC0) runs again with the HEAD's gaze as its
+// cone direction - an ARGUMENT, so no game field is written (the HUD pick and the look write run on different job workers - STATE
+// 2026-10-27) - and the best-aligned candidate by the game's own rule (dot > 0.9 within 2.2 m, GetNearbyTriggers :585-646) goes in
+// through the game's own setter +BED850, the same call loot by hand makes here. X, the camouflage test and loot by hand then read
+// it. No view (flat, a stale camera), a gate set, or nothing aligned: the game's own pick stands, untouched.
+ULONGLONG g_gzWinMs = 0;
+volatile LONG g_gzRuns = 0, g_gzSet = 0, g_gzKept = 0, g_gzGated = 0, g_gzNoView = 0, g_gzNone = 0, g_gzFault = 0;
+volatile LONG g_gzSaidSet = 0, g_gzSaidGate = 0, g_gzSaidFault = 0;
+
+int GdiGateT(uintptr_t gd)   // GdiGate with the build's GameDI rva
+{
+    __try {
+        const uintptr_t gdi = *reinterpret_cast<const uintptr_t*>(gd + g_rGameDi);
+        const uintptr_t o = gdi ? *reinterpret_cast<const uintptr_t*>(gdi + 1344) : 0;
+        if (!o) { return 0; }
+        const uintptr_t r = reinterpret_cast<PtrFn>(*reinterpret_cast<const uintptr_t*>(*reinterpret_cast<const uintptr_t*>(o) +
+                                                                                        1952))(reinterpret_cast<void*>(o));
+        if (!r) { return 0; }
+        return *reinterpret_cast<const uintptr_t*>(r + 4616) ? 1 : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+// Every early gate of GetNearbyTriggers (lt4b :209-249) and the HUD (+5B9BA0): true = all read clear; *why = the first that did not
+// (an unreadable gate counts as set - the re-pick then stands aside).
+bool GatesClear(uintptr_t pl, void* level, const char** why)
+{
+    uintptr_t raw = 0;
+    int grp = -99, b10896 = 1;
+    if (ReadPtr(pl + 3324, &raw)) { grp = static_cast<int>(static_cast<uint32_t>(raw)); }
+    if (ReadPtr(pl + 10896, &raw)) { b10896 = static_cast<int>(static_cast<uint32_t>(raw)); }
+    if (grp == 12 || grp == 22 || grp == 24 || grp == -99) { *why = "controller group 12 / 22 / 24 (or unread)"; return false; }
+    if (b10896 > 0) { *why = "PlayerDI +10896 > 0"; return false; }
+    static const int kIds[] = { 3, 6, 8, 11, 19, 21, 25 };   // grab, trigger, cannon, knockdown, injection, dialog, interaction
+    static const char* const kNames[] = { "grab", "trigger", "stationary cannon", "knockdown", "injection", "dialog", "interaction" };
+    for (int i = 0; i < 7; ++i) {
+        if (Active(pl, kIds[i]) != 0) { *why = kNames[i]; return false; }
+    }
+    const int melee = CallBoolSlot(pl, kSlotMelee);
+    if (melee != 0 && (melee < 0 || Active(pl, 15) != 0 || Active(pl, 23) != 0)) { *why = "melee / kick with fire or defensive"; return false; }
+    if (ItemGate(pl) != 0) { *why = "the hand item"; return false; }
+    if (CallBoolSlot(pl, 36) != 0 || CallBoolSlot(pl, 271) != 0) { *why = "a candidate-filtering mode (slot 36 / 271)"; return false; }
+    if (GdiGateT(g_gd) != 0) { *why = "GameDI +1344 +4616"; return false; }
+    uintptr_t l4632 = 0;
+    bool r = true;
+    if (!ReadPtr(reinterpret_cast<uintptr_t>(level) + 4632, &l4632) ||
+        !Call([&] { r = reinterpret_cast<UiGateFn>(g_gd + g_rUiGate)(l4632); }) || r) {
+        *why = "the UI gate (+CAEB00)";
+        return false;
+    }
+    r = true;
+    if (!Call([&] { r = reinterpret_cast<ObjGateFn>(g_gd + g_rObjGate)(); }) || r) { *why = "the object gate (+6D5590)"; return false; }
+    *why = "none";
+    return true;
+}
+
+// COST per HUD re-pick (<= every 0.1 s, VR only): one view-matrix copy, ~25 guarded reads and ~10 game calls for the gates, one run
+// of the game's own gather (its box tests + up to one raytrace per candidate), one point call per candidate, and the setter only
+// when the pick changes. Fills *out with the gaze gather's candidates (this thread's buffer) for loot by hand.
+void GazeRepick(void* player, GameVec* out)
+{
+    out->data = t_buf[3];
+    out->count = 0;
+    out->cap = kCap;
+    const uintptr_t pl = reinterpret_cast<uintptr_t>(player);
+    InterlockedIncrement(&g_gzRuns);
+    float m[12] = {};
+    unsigned age = 0;
+    if (!CamHookGetRenderedViewMatrix(m, &age)) { InterlockedIncrement(&g_gzNoView); return; }   // flat, or the camera is stale
+    float gaze[3] = { -m[2], -m[6], -m[10] };   // forward = -(column 2) of the rendered view (lockpitch.cpp ViewPitchDeg)
+    const float gl = std::sqrt(gaze[0] * gaze[0] + gaze[1] * gaze[1] + gaze[2] * gaze[2]);
+    if (!(gl > 1e-4f)) { InterlockedIncrement(&g_gzNoView); return; }
+    for (float& c : gaze) { c /= gl; }
+    if (!g_getLevel) {
+        const HMODULE en = GetModuleHandleA("engine_x64_rwdi.dll");
+        g_getLevel = en ? reinterpret_cast<LevelFn>(GetProcAddress(en, "?GetLevel@IGSObject@@QEBAPEAVILevel@@XZ")) : nullptr;
+    }
+    void* level = nullptr;
+    if (!g_getLevel || !Call([&] { level = g_getLevel(reinterpret_cast<void*>(pl + 40)); }) || !level) {
+        InterlockedIncrement(&g_gzFault);
+        return;
+    }
+    const char* why = "none";
+    if (!GatesClear(pl, level, &why)) {
+        InterlockedIncrement(&g_gzGated);
+        if (!InterlockedExchange(&g_gzSaidGate, 1)) {
+            // [PROBE: LOOTGAZE] gate=always (no key)  site=HEADSET  log-only=no
+            LOG("looting: [LOOTGAZE] first stand-aside - a gate of the game's own trigger pick is set (%s); the game's pick stands "
+                "(counted on the totals line)", why);
+        }
+        return;
+    }
+    float eye[3] = {};
+    if (!CallVec3(pl, kSlotEye, eye)) { InterlockedIncrement(&g_gzFault); return; }
+    float fov = NAN;   // the cone's angles, as GetNearbyTriggers builds them (lt4b :256-266)
+    {
+        unsigned char b80 = 0;
+        ReadU8(pl + 80, &b80);
+        uintptr_t owner = 0, alt = 0, table = 0;
+        ReadPtr(pl + 8 * 459, &owner);
+        if (b80 && CallBoolSlot(pl, 2504 / 8) == 0 && ReadPtr(g_gd + g_rVarAlt, &alt)) { owner = alt; }
+        if (owner && ReadPtr(owner + 208, &table) && table) {
+            Call([&] { fov = reinterpret_cast<VarFn>(g_gd + g_rVar)(reinterpret_cast<void*>(table), 779); });
+        }
+    }
+    if (!std::isfinite(fov)) { InterlockedIncrement(&g_gzFault); return; }
+    unsigned char b9896 = 0;
+    ReadU8(pl + 9896, &b9896);
+    // The cone x kGazeConeScale (Jay 2026-10-27 after run 9, "still a little position specific" -> "Can you just up the gaze cone a
+    // little?" -> "Go with that": 1.25 -> ~29 deg far .. ~52 deg near at CameraDefaultFOV 52; the game's own 22.9..41.2).
+    constexpr float kGazeConeScale = 1.25f;
+    Ctx ctx{};
+    ctx.player = player; ctx.slot = 4; ctx.r1 = 1.8f; ctx.r2 = 2.6f; ctx.flags = 3;
+    const float angNear = fov * 0.013823008f * kGazeConeScale;
+    ctx.angFar = fov * 0.0076794489f * kGazeConeScale; ctx.angNear = angNear >= 1.5707964f ? 1.5707964f : angNear;
+    ctx.dFar = 1.8f; ctx.dNear = 0.5f;
+    if (!Gather(reinterpret_cast<GatherFn>(g_gd + g_rGather), level, &ctx, out, b9896 ? 1u : 0u, gaze) || out->data != t_buf[3]) {
+        if (out->data != t_buf[3] && !InterlockedExchange(&g_gzSaidFault, 1)) {
+            // [PROBE: LOOTGAZE] gate=always (no key)  site=HEADSET  log-only=no
+            LOG("looting: [LOOTGAZE] the gather grew its list past %d entries (its own realloc) - that block is left to the game's "
+                "CRT; no re-pick this time", kCap);
+        }
+        out->data = t_buf[3];
+        out->count = 0;
+        InterlockedIncrement(&g_gzFault);
+        return;
+    }
+    uintptr_t best = 0;
+    float bestDot = 0.8660254f, bestD = 0.0f;   // within 30 deg of the gaze (Jay 2026-10-27; the game's own rule 0.9 = 25.8) and 2.2 m
+    for (unsigned i = 0; i < out->count && i < static_cast<unsigned>(kCap); ++i) {
+        const uintptr_t o = reinterpret_cast<uintptr_t>(out->data[i]);
+        float p[3];
+        if (!o || !CallVec3(o, kSlotPoint, p)) { continue; }
+        const float v[3] = { p[0] - eye[0], p[1] - eye[1], p[2] - eye[2] };
+        const float d = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+        if (!(d > 1e-4f) || d >= 2.2f) { continue; }
+        const float dot = (v[0] * gaze[0] + v[1] * gaze[1] + v[2] * gaze[2]) / d;
+        if (dot > bestDot) { bestDot = dot; best = o; bestD = d; }
+    }
+    if (!best) { InterlockedIncrement(&g_gzNone); return; }
+    uintptr_t h = 0, cur = 0;
+    if (ReadPtr(pl + kPickHandle, &h) && h && ReadPtr(pl + kPickObj, &cur) && cur == best) { InterlockedIncrement(&g_gzKept); return; }
+    if (!CallSetter(player, reinterpret_cast<void*>(best))) { InterlockedIncrement(&g_gzFault); return; }
+    InterlockedIncrement(&g_gzSet);
+    if (!InterlockedExchange(&g_gzSaidSet, 1)) {
+        // [PROBE: LOOTGAZE] gate=always (no key)  site=HEADSET  log-only=no
+        LOG("looting: [LOOTGAZE] FIRST re-pick by the head's gaze - %p (%s) %.2f m from the eye, %.1f deg off the gaze, replaces the "
+            "game's pick %p | %u candidates in the gaze cone (CameraDefaultFOV %.1f) | thread %lu",
+            reinterpret_cast<void*>(best), IsBody(best) ? "a body" : "another trigger", bestD, std::acos(bestDot) * 57.29578f,
+            h ? reinterpret_cast<void*>(cur) : nullptr, out->count, fov, GetCurrentThreadId());
+    }
+}
+
+void GazeTotals()
+{
+    const ULONGLONG now = GetTickCount64();
+    if (now - g_gzWinMs < 5000) { return; }
+    g_gzWinMs = now;
+    // [PROBE: LOOTGAZE] gate=always (no key)  site=HEADSET  log-only=yes
+    LOG_PERIODIC("looting: [LOOTGAZE] 5 s | re-picks run %ld: set %ld, already the pick %ld, nothing aligned %ld, gated %ld, no view %ld, "
+                 "fault %ld", InterlockedExchange(&g_gzRuns, 0), InterlockedExchange(&g_gzSet, 0),
+                 InterlockedExchange(&g_gzKept, 0), InterlockedExchange(&g_gzNone, 0), InterlockedExchange(&g_gzGated, 0),
+                 InterlockedExchange(&g_gzNoView, 0), InterlockedExchange(&g_gzFault, 0));
+}
+}  // namespace why
+
+// ---- the detour: GetNearbyTriggers (+B9BBB0). Every call (installed once the camouflage block or loot by hand needs it): the
+// original, then the camouflage-target test on the pick it just stored (a few guarded reads). COST while loot_by_hand=1: the original + one pass over its candidates (a vptr
+// compare each; for a non-BodyContainer one more vtable-slot read, and for an AI two pointer reads + one vptr read; up to two box
+// reads per body) every HUD re-pick (<= every 0.1 s); a setter call only while a hand is armed. ----
+void __fastcall NearbyHook(void* player, void* out)
+{
+    g_origNearby(player, out);
+    if (!player || !out) { return; }
+    InterlockedIncrement(&g_nHook);
+    if (DiagLootWhy) { why::Evaluate(player); }   // [LOOTWHY] - log-only; off: one bool test
+    // [LOADBEARING: gaze re-pick] (no key, always on in VR) the X prompt / camouflage / loot by hand on what the head looks at -
+    // the game's own gather and setter, run 8's cone fix. Before the camouflage test, which reads the pick.
+    GameVec gz{};
+    why::GazeRepick(player, &gz);
+    why::GazeTotals();
+    BodyGrabPublishPlayer(player);   // severed limbs: bodygrab's level query takes the ILevel from the player
+    {
+        uintptr_t pick = 0;
+        const bool camo = PickIsCamoTarget(reinterpret_cast<uintptr_t>(player), &pick);
+        g_camoObj = reinterpret_cast<void*>(pick);
+        InterlockedExchange(&g_camoPick, camo ? 1 : 0);
+        InterlockedExchange64(&g_camoTickMs, static_cast<LONG64>(GetTickCount64()));
+        if (camo && InterlockedIncrement(&g_nCamoSeen) == 1) {
+            // [PROBE: GRIPCAMO] gate=always (no key)  site=HEADSET  log-only=yes
+            LOG("looting: [GRIPCAMO] first camouflage target seen as the game's pick %p (infected corpse: module slot 283 = "
+                "+%llX, its own preconditions met) - a right-grip press made on it now withholds R1 | thread %lu",
+                reinterpret_cast<void*>(pick), static_cast<unsigned long long>(kInfectedSlot1Rva), GetCurrentThreadId());
+        }
+    }
+    if (!LootByHand) { return; }
+    const GameVec* v = static_cast<const GameVec*>(out);
+    const uintptr_t bodyVt = g_gd + g_rBodyVt;
+    const uintptr_t aiTrigAct = g_gd + g_rAiTrigAct;
+    int n = 0, nStandalone = 0, nAi = 0, nAiBody = 0;
+    float boxA[kMaxBoxes][6] = {}, boxC[kMaxBoxes][6] = {};
+    bool haveA[kMaxBoxes] = {}, haveC[kMaxBoxes] = {};
+    void* objs[kMaxBoxes];
+    bool fault = false;
+    // the game's gathered list, then the gaze gather's (a body near the feet is often only in the second - run 8)
+    const unsigned count = v->count;
+    const unsigned total = count + gz.count;
+    for (unsigned i = 0; i < total && n < kMaxBoxes; ++i) {
+        uintptr_t obj = 0, vt = 0;
+        const bool fromGame = i < count;
+        if (fromGame) {
+            if (!ReadPtr(reinterpret_cast<uintptr_t>(v->data) + 8 * i, &obj) || !obj) { fault = true; continue; }
+        } else {
+            obj = reinterpret_cast<uintptr_t>(gz.data[i - count]);
+            if (!obj) { continue; }
+            bool dup = false;
+            for (int j = 0; j < n; ++j) { if (reinterpret_cast<uintptr_t>(objs[j]) == obj) { dup = true; break; } }
+            if (dup) { continue; }
+        }
+        if (!ReadPtr(obj, &vt)) { fault = true; continue; }
+        if (vt == bodyVt) {   // a standalone container (loot_hand_run1's body)
+            haveA[n] = ReadBox(reinterpret_cast<void*>(obj), boxA[n]);
+            haveC[n] = false;
+            if (!haveA[n]) { fault = true; continue; }
+            ++nStandalone;
+            objs[n++] = reinterpret_cast<void*>(obj);
+            continue;
+        }
+        uintptr_t fn = 0;
+        if (!ReadPtr(vt + 8 * kTrigActSlot, &fn)) { fault = true; continue; }
+        if (fn != aiTrigAct) { continue; }   // not an AI - +6000 is never read on it
+        ++nAi;
+        uintptr_t h = 0, c = 0, cvt = 0;
+        if (!ReadPtr(obj + kAiBodyHandle, &h) || !h || !ReadPtr(obj + kAiBodyObj, &c) || !c || !ReadPtr(c, &cvt) ||
+            cvt != bodyVt) {
+            continue;   // an AI without a search container (a live or non-lootable one)
+        }
+        haveA[n] = ReadBox(reinterpret_cast<void*>(obj), boxA[n]);
+        haveC[n] = ReadBox(reinterpret_cast<void*>(c), boxC[n]);
+        if (!haveA[n] && !haveC[n]) { fault = true; continue; }
+        ++nAiBody;
+        objs[n++] = reinterpret_cast<void*>(obj);   // the setter gets the AI: X then runs the game's own path for that body
+    }
+    if (fault) { InterlockedIncrement(&g_nFault); }
+    InterlockedExchange(&g_lastCand, static_cast<LONG>(count));
+    InterlockedExchange(&g_lastStandalone, nStandalone);
+    InterlockedExchange(&g_lastAi, nAi);
+    InterlockedExchange(&g_lastAiBody, nAiBody);
+    InterlockedIncrement(&g_boxSeq);   // odd: writing
+    for (int i = 0; i < n; ++i) {
+        for (int k = 0; k < 6; ++k) {
+            g_boxA[i][k] = boxA[i][k];
+            g_boxC[i][k] = boxC[i][k];
+        }
+        g_haveA[i] = haveA[i];
+        g_haveC[i] = haveC[i];
+        g_boxObj[i] = objs[i];
+    }
+    g_boxCount = n;
+    InterlockedIncrement(&g_boxSeq);   // even: settled
+
+    if (g_lootHand < 0) {
+        InterlockedIncrement(&g_nPass);
+        return;
+    }
+    float hp[3];
+    for (int attempt = 0;; ++attempt) {
+        const LONG s0 = g_handSeq;
+        hp[0] = g_handPos[0]; hp[1] = g_handPos[1]; hp[2] = g_handPos[2];
+        if (!(s0 & 1) && g_handSeq == s0) { break; }
+        if (attempt == 3) { InterlockedIncrement(&g_nNoBody); return; }
+    }
+    int best = -1;
+    float bd = 0.0f, bda = -1.0f, bdc = -1.0f;
+    for (int i = 0; i < n; ++i) {
+        float a = -1.0f, c = -1.0f;
+        const float d = looting::NearerBoxDist(boxA[i], haveA[i], boxC[i], haveC[i], hp, &a, &c);
+        if (d < 0.0f) { continue; }
+        if (best < 0 || d < bd) { best = i; bd = d; bda = a; bdc = c; }
+    }
+    if (best < 0 || bd > LootReachM) {
+        const LONG k = InterlockedIncrement(&g_nNoBody);
+        if (k == 1) {
+            // [PROBE: LOOTHAND] gate=loot_by_hand  site=HEADSET  log-only=no
+            LOG("looting: [LOOTHAND] PICK REFUSED #1 - a hand is armed but no gathered body is within %.2f m of it "
+                "(%d bodies gathered: %d standalone, %d dead AI with a container; nearest %.3f m) - the game's own pick stands | "
+                "thread %lu",
+                LootReachM, n, nStandalone, nAiBody, best < 0 ? -1.0f : bd, GetCurrentThreadId());
+        }
+        return;
+    }
+    uintptr_t h = 0, cur = 0;
+    const uintptr_t pl = reinterpret_cast<uintptr_t>(player);
+    const bool curOk = ReadPtr(pl + kPickHandle, &h) && (h == 0 || ReadPtr(pl + kPickObj, &cur));
+    if (curOk && h != 0 && cur == reinterpret_cast<uintptr_t>(objs[best])) { return; }   // already ours
+    const bool ok = CallSetter(player, objs[best]);
+    const LONG k = ok ? InterlockedIncrement(&g_nSub) : InterlockedIncrement(&g_nFault);
+    if (k == 1 || !ok) {
+        // [PROBE: LOOTHAND] gate=loot_by_hand  site=HEADSET  log-only=no
+        LOG("looting: [LOOTHAND] PICK %s #%ld - the hand's body %p (%s; %.3f m from the hand - own box %.3f, container box %.3f, "
+            "-1 = none) replaces the game's pick %p | %d bodies gathered | thread %lu",
+            ok ? "SET" : "*** SETTER FAULTED ***", k, objs[best], bdc >= 0.0f ? "a dead AI" : "a standalone container", bd, bda,
+            bdc, curOk && h ? reinterpret_cast<void*>(cur) : nullptr, n, GetCurrentThreadId());
+    }
+}
+
+void TryInstall()
+{
+    if (g_installState != 0) { return; }
+    const ULONGLONG now = GetTickCount64();
+    if (now - g_lastTryMs < 1000) { return; }
+    g_lastTryMs = now;
+    const HMODULE gd = GetModuleHandleA("gamedll_x64_rwdi.dll");
+    const HMODULE en = GetModuleHandleA("engine_x64_rwdi.dll");
+    if (!gd || !en) {
+        if (++g_tries == 1) {
+            // [PROBE: LOOTHAND] gate=loot_by_hand  site=FLAT  log-only=no
+            LOG("looting: [LOOTHAND] waiting - %s not mapped yet (retries once a second)", gd ? "engine_x64_rwdi.dll"
+                                                                                                : "gamedll_x64_rwdi.dll");
+        }
+        return;
+    }
+    // the build's rvas first (Steam, or the Epic build's from buildrva_table.h), then the base the readers test
+    g_rSetter = DLVR_LOOT_GD_RVA(kSetterRva);
+    g_rBodyVt = DLVR_LOOT_GD_RVA(kBodyVtRva);
+    g_rAiTrigAct = DLVR_LOOT_GD_RVA(kAiTrigActRva);
+    g_rInfectedSlot1 = DLVR_LOOT_GD_RVA(kInfectedSlot1Rva);
+    g_rGather = DLVR_LOOT_GD_RVA(kGatherRva2);
+    g_rVar = DLVR_LOOT_GD_RVA(kVarRva2);
+    g_rUiGate = DLVR_LOOT_GD_RVA(kUiGateRva2);
+    g_rObjGate = DLVR_LOOT_GD_RVA(kObjGateRva2);
+    g_rGameDi = DLVR_LOOT_GD_RVA(kGameDiRva2);
+    g_rVarAlt = DLVR_LOOT_GD_RVA(kVarAltRva2);
+    MemoryBarrier();
+    g_gd = reinterpret_cast<uintptr_t>(gd);
+    g_extents = reinterpret_cast<ExtentsFn>(GetProcAddress(en, kExtentsExport));
+    g_setter = reinterpret_cast<SetterFn>(g_gd + g_rSetter);
+    if (!g_extents) {
+        InterlockedExchange(&g_installState, -1);
+        // [PROBE: LOOTHAND] gate=loot_by_hand  site=FLAT  log-only=no
+        LOG("looting: [LOOTHAND] REFUSED - the engine does not export %s; loot by hand stays off this launch", kExtentsExport);
+        return;
+    }
+    int attempts = 0;
+    void* tramp = nullptr;
+    const bool ok = InstallSingleGameDetour(g_gd + kNearbyRva, kNearbyBytes, sizeof(kNearbyBytes),
+                                            reinterpret_cast<void*>(&NearbyHook), &tramp, "loot GetNearbyTriggers", &attempts);
+    if (!ok) {
+        InterlockedExchange(&g_installState, -1);
+        // [PROBE: LOOTHAND] gate=loot_by_hand  site=FLAT  log-only=no
+        LOG("looting: [LOOTHAND] REFUSED - the GetNearbyTriggers detour at gamedll +%llX (Steam rva) was not installed (its first "
+            "%zu bytes differ from the Steam / Epic builds these were read from, or the write was refused; %d attempt(s)). Loot "
+            "by hand stays off this launch; X looting is unchanged.",
+            static_cast<unsigned long long>(kNearbyRva), sizeof(kNearbyBytes), attempts);
+        return;
+    }
+    g_origNearby = reinterpret_cast<NearbyFn>(tramp);
+    InterlockedExchange(&g_installState, 1);
+    // [PROBE: LOOTHAND] gate=loot_by_hand  site=FLAT  log-only=no
+    LOG("looting: [LOOTHAND] READY - GetNearbyTriggers (Steam +%llX) detoured (%zu bytes verified, %d attempt(s)), setter +%llX, "
+        "body vftable +%llX, AI slot 179 +%llX, camouflage slot +%llX (as loaded; Steam %s), extents %p | reach %.2f m, still < "
+        "%.2f m/s, settle %.2f s",
+        static_cast<unsigned long long>(kNearbyRva), sizeof(kNearbyBytes), attempts,
+        static_cast<unsigned long long>(g_rSetter), static_cast<unsigned long long>(g_rBodyVt),
+        static_cast<unsigned long long>(g_rAiTrigAct), static_cast<unsigned long long>(g_rInfectedSlot1),
+        g_rSetter == kSetterRva ? "values" : "values translated - the Epic build",
+        reinterpret_cast<void*>(g_extents), LootReachM, LootStillSpeed, LootSettleS);
+}
+
+void LogTotals()
+{
+    static ULONGLONG last = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now - last < 5000) { return; }
+    last = now;
+    LOG_PERIODIC("looting: [LOOTHAND] 5 s totals (session) | install %ld | hook calls %ld, picks set %ld, passed through %ld, "
+                 "armed with no body in reach %ld, read faults %ld | ARM %ld, NO-ARM %ld, SEARCH %ld, END grip opened %ld / moved "
+                 "%ld / body gone %ld | DRAG %ld, drag END %ld | bodies gathered now %d",
+                 static_cast<long>(g_installState), static_cast<long>(g_nHook), static_cast<long>(g_nSub),
+                 static_cast<long>(g_nPass), static_cast<long>(g_nNoBody), static_cast<long>(g_nFault),
+                 static_cast<long>(g_nArm), static_cast<long>(g_nNoArm), static_cast<long>(g_nSearch),
+                 static_cast<long>(g_nEndOpen), static_cast<long>(g_nEndMoved), static_cast<long>(g_nEndGone),
+                 static_cast<long>(g_nDrag), static_cast<long>(g_nEndDrag), g_boxCount);
+}
+
+}  // namespace
+
+// COST per poll while loot_by_hand=1: per hand one squeeze read, the grip / head poses and the camera matrix (cached reads, the
+// throwables' mapping), a distance to <= 16 boxes; one speed-window push + a backward scan of <= 128 samples (stops at the first
+// >= 100 ms old, ~57 at 570 polls/s); one machine step; with a body in reach, ContainerState (<= 5 guarded reads) and with
+// body_grab two lock-free hand-offs (BodyGrabPublishCandidate / BodyGrabTorsoOf - the bone reads run on the game thread). Off: one
+// bool test.
+void LootPoll(bool vrGrip, bool leftOwned, bool rightOwned, bool& withholdL1, bool& withholdR1)
+{
+    withholdL1 = false;
+    withholdR1 = false;
+    if (!LootByHand) {
+        g_lootHand = -1;
+        return;
+    }
+    if (g_installState == 0) { TryInstall(); }
+    LogTotals();
+    if (g_installState != 1 || !vrGrip) {
+        g_lootHand = -1;
+        return;
+    }
+    // body_grab rides this machine (dragEnabled). Off: every body-grab input below stays at its default and nothing is published.
+    const looting::Params prmBase{ LootReachM, LootStillSpeed, LootSettleS, BodyGrab };
+    const bool blocked = BodyGrab && (OverlayVisible() || CalibScreenActive());   // the throwables' menu predicate (throwable.cpp)
+    const double now = NowS();
+    static bool s_firstSample = false;
+    LONG active = -1;
+    for (int hi = 0; hi < 2; ++hi) {
+        const Hand h = hi == 0 ? kLeftHand : kRightHand;
+        float sq = 0.0f;
+        const bool grip = GetControllerSqueeze(h, sq) && sq >= kGripThreshold;
+        float pos[3] = {}, trk[3] = {}, rot[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        const bool havePos = HandWorld(h, pos, trk, rot);
+        // D-269: speed over a ~100 ms window, never a per-poll delta. The window restarts on the press edge, so the reach onto the
+        // body before the squeeze does not spend the press; until 50 ms of samples are held it reads -1 and the machine sees 0.
+        if (grip && !g_prevGripDown[hi]) {
+            g_speed[hi].Reset();
+            // 10-24 (2) (Jay: catching a thrown part): a fresh severed-limb query at the press, and the press waits for it
+            if (BodyGrab) { BodyGrabRequestRelict(hi); }
+        }
+        g_prevGripDown[hi] = grip;
+        if (havePos) { g_speed[hi].Push(now, trk); } else { g_speed[hi].Reset(); }
+        const float winSpeed = g_speed[hi].Speed();
+        const float speed = winSpeed < 0.0f ? 0.0f : winSpeed;
+        float dist = -1.0f, distOwn = -1.0f, distCont = -1.0f;
+        void* body = nullptr;
+        if (havePos && NearestBox(pos, &dist, &body, &distOwn, &distCont) < 0) { dist = -1.0f; }
+        if (BodyGrab && havePos) { BodyGrabPublishHand(hi, pos, rot, now); }
+        CamoGesturePadPoll(hi, trk, havePos, now);   // the camouflage wipe (camo_gesture off: one bool test)
+        // Severed limbs (Jay: "Yes please"): bodygrab looks for them on the game thread while this grip is squeezed; one nearer than
+        // the gathered body becomes the press's body - never searchable, never the torso, so a press on it grabs.
+        if (BodyGrab) { BodyGrabPublishSqueeze(hi, sq); }
+        const float outerReach = LootReachM > BodyGrabReachM ? LootReachM : BodyGrabReachM;
+        // The gathered body stays the candidate while a limb is near, so its hitbox reading keeps coming (10-24 (2)).
+        if (BodyGrab) { BodyGrabPublishCandidate(hi, (havePos && body && dist >= 0.0f && dist <= outerReach) ? body : nullptr); }
+        bool isRelict = false;
+        float corpseHit = -1.0f;
+        float limbD = -1.0f;   // the fresh severed-limb reading for this hand (-1 = none), logged with the press
+        if (BodyGrab && havePos) {
+            // 10-24 (2): a limb and a corpse are compared by the same measure - each one's hitbox surface - never the limb against
+            // the corpse's box (a hand inside a lying corpse's box reads 0 there, and that box still spans a part cut off it:
+            // hitbox_dump_run1) nor its skeleton (it keeps a cut part's bones). A corpse with no hitbox reading (ragdoll released)
+            // never beats a limb within the margin. A tie goes to the limb.
+            corpseHit = body ? BodyGrabHitOf(hi, body) : -1.0f;
+            float rd = -1.0f;
+            void* rel = BodyGrabRelictOf(hi, &rd);
+            limbD = rel ? rd : -1.0f;
+            // Jay 2026-10-27 after run 10 ("Alright, go ahead"): a hand INSIDE an unsearched corpse's own box belongs to that corpse -
+            // the bone rule above decides search or drag; a loose severed limb lying there does not take the press (run 10: 9 of 17
+            // grabs were such limbs in a crowd). A searched body, or a hand outside the box: the limb comparison as before.
+            const bool inUnsearchedCorpse = body && distOwn >= 0.0f && distOwn <= 0.02f && ContainerState(body) == static_cast<int>(kStateSearchable);
+            if (rel && !inUnsearchedCorpse && rd >= 0.0f && rd <= BodyGrabHitboxMarginM && (corpseHit < 0.0f || rd <= corpseHit)) {
+                body = rel;
+                dist = rd;
+                distOwn = rd;
+                distCont = -1.0f;
+                isRelict = true;
+            }
+        }
+        const bool inReach = havePos && body && dist >= 0.0f && dist <= outerReach;
+        const looting::State before = g_machine[hi].state();
+        const looting::State other = g_machine[1 - hi].state();
+        // spec 6b.3: "torso" = within loot reach of the attached container's box (spine2). No container box = a standalone
+        // container, which is loot only. Away from the torso the press reaches as far as body_grab_reach_m.
+        // 10-24 (2) (Jay: "Do 1"): with body_grab the skeleton decides when it has a fresh reading - a spine / pelvis bone under the
+        // hand is the torso, any other bone is not; no reading = the box rule. And a body already searched is never the torso
+        // (Jay: "a body can only be searched for loot a singular time"): its press grabs.
+        const bool boxTorso = !isRelict && (distCont < 0.0f || distCont <= LootReachM);
+        const int skelTorso = (BodyGrab && inReach) ? BodyGrabTorsoOf(hi, body) : -1;
+        const int cstate = inReach ? ContainerState(body) : -1;
+        const bool searchable = cstate < 0 || cstate == static_cast<int>(kStateSearchable);
+        const bool onTorso = (skelTorso >= 0 ? skelTorso == 1 : boxTorso) && searchable;
+        looting::Params prm = prmBase;
+        if (BodyGrab && !onTorso) { prm.reachM = BodyGrabReachM; }
+        // a press that finds nothing while the severed-limb search is still due waits for it (looting_logic Params.lateArmS)
+        if (BodyGrab) { prm.lateArmS = kLateArmS; }
+        looting::Input in;
+        in.gripDown = grip;
+        // A drag owns its body: BodyGrabTick re-validates it every player update and names an END there; the machine keeps the
+        // grip withheld until it opens, whatever happened to the body (a body vanishing mid-squeeze must not send L1 / R1).
+        in.bodyDist = before == looting::State::Dragging ? 0.0f : (havePos ? dist : -1.0f);
+        // without body_grab a searched body offers nothing: the press does not arm ("no body")
+        if (!BodyGrab && !searchable && before == looting::State::Idle) { in.bodyDist = -1.0f; }
+        in.handSpeed = speed;
+        in.nowS = now;
+        in.gripOwnedElsewhere = hi == 0 ? leftOwned : rightOwned;
+        in.otherHandBusy = other == looting::State::Settling || other == looting::State::Searching;
+        in.onTorso = onTorso;
+        in.blocked = blocked;
+        in.limbPending = BodyGrab && BodyGrabRelictPending(hi);
+        const looting::Output o = g_machine[hi].Step(in, prm);
+        if (!s_firstSample && hi == 1) {
+            s_firstSample = true;
+            // [PROBE: LOOTHAND] gate=loot_by_hand  site=HEADSET  log-only=yes
+            LOG("looting: [LOOTHAND] first poll | right hand %s (%.3f, %.3f, %.3f) | grip %.2f | nearest body %.3f m (%d gathered)",
+                havePos ? "at" : "NOT MAPPED (no camera / yaw / pose yet)", pos[0], pos[1], pos[2], sq, dist, g_boxCount);
+        }
+        if (o.event) {
+            const char* ev = o.event;
+            if (ev[0] == 'A') { InterlockedIncrement(&g_nArm); }
+            else if (ev[0] == 'S') { InterlockedIncrement(&g_nSearch); }
+            else if (ev[0] == 'D') { InterlockedIncrement(&g_nDrag); }
+            else if (before == looting::State::Dragging) { InterlockedIncrement(&g_nEndDrag); }
+            else if (ev[4] == 'g' && ev[5] == 'r') { InterlockedIncrement(&g_nEndOpen); }
+            else if (ev[4] == 'm') { InterlockedIncrement(&g_nEndMoved); }
+            else { InterlockedIncrement(&g_nEndGone); }
+            // [PROBE: LOOTHAND] gate=loot_by_hand  site=HEADSET  log-only=no
+            LOG("looting: [LOOTHAND] %s | %s hand | body %p (%s) %.3f m (own box %.3f, container box %.3f; -1 = none) | hand speed "
+                "%.2f m/s over ~100 ms (-1 = under 50 ms of samples since the press) | grip %.2f | torso %d (body_grab %d) - box rule %d, "
+                "skeleton %d (-1 = no fresh reading), container state %d (%s) | gathered body's hitbox %.3f m (-1 = no fresh "
+                "reading) | nearest severed limb %.3f m (-1 = no fresh reading) | waited %.0f ms for the limb reading (-1 = no wait)",
+                ev, hi == 0 ? "left" : "right", body, isRelict ? "a severed limb" : "gathered", dist, distOwn, distCont, winSpeed, sq,
+                onTorso ? 1 : 0, BodyGrab ? 1 : 0,
+                boxTorso ? 1 : 0, skelTorso, cstate, cstate < 0 ? "unread - searchable as before" : searchable ? "searchable"
+                                                                                                             : "already searched",
+                corpseHit, limbD, o.waitedS < 0.0 ? -1.0 : o.waitedS * 1000.0);
+            // body grab: the press became a drag -> queue the grab of the body under the hand; any END of a drag -> stop pushing.
+            if (ev[0] == 'D') {
+                BodyGrabBegin(hi, body, pos);
+            } else if (before == looting::State::Dragging) {
+                BodyGrabEnd(hi, ev);
+            }
+        }
+        if (o.noArm) {
+            const LONG k = InterlockedIncrement(&g_nNoArm);
+            if (k <= kMaxNoArmLines) {
+                // [PROBE: LOOTHAND] gate=loot_by_hand  site=HEADSET  log-only=yes
+                LOG("looting: [LOOTHAND] NO-ARM #%ld - %s hand press did not arm: %s | hand %s | nearest body %.3f m (own box "
+                    "%.3f, container box %.3f; reach %.2f, %d gathered) | grip %.2f | holster / two-handed owns it %d, other hand "
+                    "looting %d | hook calls %ld, last gather: %ld candidates, %ld standalone containers, %ld AI (%ld with a "
+                    "container) | container state %d (1 = searchable, -1 = unread) | nearest severed limb %.3f m (-1 = no fresh "
+                    "reading) | waited %.0f ms for the limb reading (-1 = no wait)%s",
+                    k, hi == 0 ? "left" : "right",
+                    (!havePos && o.noArm[0] == 'n') ? "hand NOT MAPPED (no camera / yaw / pose, or > 1.5 m from the head)" : o.noArm,
+                    havePos ? "mapped" : "NOT MAPPED", dist, distOwn, distCont, LootReachM, g_boxCount, sq,
+                    static_cast<int>(in.gripOwnedElsewhere), static_cast<int>(in.otherHandBusy), static_cast<long>(g_nHook),
+                    static_cast<long>(g_lastCand), static_cast<long>(g_lastStandalone), static_cast<long>(g_lastAi),
+                    static_cast<long>(g_lastAiBody), cstate, limbD, o.waitedS < 0.0 ? -1.0 : o.waitedS * 1000.0,
+                    k == kMaxNoArmLines ? " | LAST NO-ARM line this session" : "");
+            }
+        }
+        if (o.withholdGrip) {
+            if (hi == 0) { withholdL1 = true; } else { withholdR1 = true; }
+            // a drag never re-picks the game's trigger: only a settling / searching hand hands its body to NearbyHook (a press still
+            // waiting for the limb reading has no body yet)
+            if (active < 0 && !o.dragging && o.state != looting::State::Waiting) {
+                active = hi;
+                if (havePos) {
+                    InterlockedIncrement(&g_handSeq);
+                    g_handPos[0] = pos[0]; g_handPos[1] = pos[1]; g_handPos[2] = pos[2];
+                    InterlockedIncrement(&g_handSeq);
+                }
+            }
+        }
+    }
+    g_lootHand = active;
+}
+
+// Hip yield (spec 2026-10-26-roomscale-physical-crouch-design §2.4, plan Task 4): the same reach and limb rule LootPoll applies, read
+// for the hip holsters BEFORE LootPoll runs this poll (same scePad thread). Yes = a gathered body within the press's outer reach
+// (loot_reach_m, or body_grab_reach_m when larger and body_grab is on) - without body_grab only a searchable one, since LootPoll gives
+// an already-searched body nothing - or a fresh severed-limb reading within body_grab_hitbox_margin_m. Pending = body_grab on, none
+// of those, and the limb reading still due: the press poll itself (LootPoll asks for the fresh query later in this poll) or
+// BodyGrabRelictPending for < kLateArmS. COST: called only on a hip press edge and while that press is Pending (<= 150 ms) - one
+// HandWorld (cached reads), one NearestBox (<= 16 boxes), ContainerState (<= 5 guarded reads) with a body in reach, two lock-free reads.
+holster::Yield LootYieldAt(int hand, bool pressEdge, float* outDist, bool* outLimb, double* outWaitS)
+{
+    static double s_pressS[2] = {};
+    if (outDist) { *outDist = -1.0f; }
+    if (outLimb) { *outLimb = false; }
+    if (outWaitS) { *outWaitS = -1.0; }
+    if (hand < 0 || hand > 1) { return holster::Yield::No; }
+    const double now = NowS();
+    if (pressEdge) { s_pressS[hand] = now; }
+    const double waited = now - s_pressS[hand];
+    if (outWaitS) { *outWaitS = waited; }
+    if (!LootByHand || g_installState != 1) { return holster::Yield::No; }
+    float pos[3] = {}, trk[3] = {}, rot[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    if (!HandWorld(hand == 0 ? kLeftHand : kRightHand, pos, trk, rot)) { return holster::Yield::No; }
+    const float reach = (BodyGrab && BodyGrabReachM > LootReachM) ? BodyGrabReachM : LootReachM;
+    float dist = -1.0f, distOwn = -1.0f, distCont = -1.0f;
+    void* body = nullptr;
+    if (NearestBox(pos, &dist, &body, &distOwn, &distCont) >= 0 && body && dist >= 0.0f && dist <= reach) {
+        const int cs = ContainerState(body);
+        if (BodyGrab || cs < 0 || cs == static_cast<int>(kStateSearchable)) {
+            if (outDist) { *outDist = dist; }
+            return holster::Yield::Yes;
+        }
+    }
+    if (!BodyGrab) { return holster::Yield::No; }
+    float rd = -1.0f;
+    void* rel = BodyGrabRelictOf(hand, &rd);
+    if (rel && rd >= 0.0f && rd <= BodyGrabHitboxMarginM) {
+        if (outDist) { *outDist = rd; }
+        if (outLimb) { *outLimb = true; }
+        return holster::Yield::Yes;
+    }
+    if (pressEdge || (BodyGrabRelictPending(hand) && waited < kLateArmS)) { return holster::Yield::Pending; }
+    return holster::Yield::No;
+}
+
+// COST per poll: one squeeze read, two atomic reads, one tick read, one latch step. The detour install runs at most once a second until
+// it settles (READY / REFUSED).
+void GripCamoPoll(bool vrGrip, bool& withholdR1)
+{
+    withholdR1 = false;
+    if (!vrGrip) { return; }
+    if (g_installState == 0) { TryInstall(); }
+    float sq = 0.0f;
+    const bool down = GetControllerSqueeze(kRightHand, sq) && sq >= kGripThreshold;
+    const ULONGLONG now = GetTickCount64();
+    const ULONGLONG age = now - static_cast<ULONGLONG>(g_camoTickMs);
+    const bool target = g_installState == 1 && g_camoPick != 0 && age <= kCamoFreshMs;
+    static bool s_prev = false;
+    const bool w = g_camoLatch.Step(down, target);
+    if (w && !s_prev) {
+        const LONG k = InterlockedIncrement(&g_nCamoWithheld);
+        if (k <= 40) {
+            // [PROBE: GRIPCAMO] gate=always (no key)  site=HEADSET  log-only=no
+            LOG("looting: [GRIPCAMO] R1 WITHHELD #%ld - right-grip press made while the game's pick %p is an infected corpse "
+                "(camouflage) - the press is not sent as R1 until the grip opens | pick %llu ms old | grip %.2f%s",
+                k, g_camoObj, static_cast<unsigned long long>(age), sq, k == 40 ? " | LAST line of this kind" : "");
+        }
+    }
+    s_prev = w;
+    withholdR1 = w;
+}
+
+void LootPadByte(unsigned char* p)
+{
+    if (!LootByHand || !p) { return; }
+    if (g_machine[0].state() == looting::State::Searching || g_machine[1].state() == looting::State::Searching) {
+        *reinterpret_cast<uint32_t*>(p) |= 0x8000u;   // Square = the game's X (_ACTION_EXECUTE_TRIGGER, inputs_pad.scr:56)
+    }
+}
+
+bool LootInfectedModule(uintptr_t ai, uintptr_t* module)
+{
+    return InfectedModule(ai, module);
+}
+
+}  // namespace dlvr

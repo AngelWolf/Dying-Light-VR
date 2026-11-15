@@ -1,0 +1,14 @@
+{
+  "name": "dlvr-ovr2xr",
+  "version-string": "0.1.0",
+  "description": "LibOVR-over-OpenXR translation layer for Dying Light",
+  "dependencies": [
+    "openxr-loader",
+    {
+      "name": "imgui",
+      "features": ["dx11-binding", "win32-binding"]
+    }
+  ],
+  "builtin-baseline": "7e43e0768a5af180a9cf75d87d692dce1b9da34f",
+  "overrides": []
+}

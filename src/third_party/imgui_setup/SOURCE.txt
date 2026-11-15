@@ -1,0 +1,18 @@
+Dear ImGui 1.92.8, copied UNCHANGED 2026-10-17 from D:\vcpkg\buildtrees\imgui\src\v1.92.8-8e9c05eb59.clean (the same version as the layer's vcpkg imgui).
+For DyingLightVR_Setup only (built with the static CRT). MIT licence: LICENSE.txt. md5 of every file:
+
+b8cd90c48092bf3bc38d9fc3dcf35180  LICENSE.txt
+6d72ec565621abd010ffce208cb33bb4  imconfig.h
+1d16ab3f9c1709fb22f438653d3d63c8  imgui.cpp
+e43a06ff13cc9a21b55a13cfd607fc3b  imgui.h
+ead2451e082647a6c932388501d16f42  imgui_draw.cpp
+932897f76cd1f1c5e1105dffe3c52611  imgui_internal.h
+19737015414e886193775e2b2460e9af  imgui_tables.cpp
+13cad9aa0733d43d024c2ee8c65dcd63  imgui_widgets.cpp
+6d2e91438e28a768e6005e9bc2a9b017  imstb_rectpack.h
+fa75e6fb1ce62ff555c2fe8c9032bd9c  imstb_textedit.h
+4a1ad01a339ddf3d65292930ad6fe4f4  imstb_truetype.h
+bc25684acf933db5f5c8abb40e20410d  backends/imgui_impl_dx11.cpp
+e976eb85e2daf52b73a9d17d66b1ece7  backends/imgui_impl_dx11.h
+f67a01ef31de1acc44d40aaec3c9bf78  backends/imgui_impl_win32.cpp
+119a8787d343cbc401961d47b49ab98d  backends/imgui_impl_win32.h
