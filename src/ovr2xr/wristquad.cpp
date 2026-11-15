@@ -36,25 +36,28 @@ float UiWristFadeEndDeg = 75.0f;
 // [DEP: ui_wrist_size] required-for=every piece's size (UiWristSize): x 0.000115 m per UI px (stage 2's size - the minimap ~9 cm at 1.0). Needs ui_wrist_hud. Tier D.  tree=INERT
 float UiWristSize = 1.0f;
 // [DEP: UiWristHand] required-for=ui_wrist_minimap_hand / ui_wrist_health_hand / ui_wrist_quests_hand / ui_wrist_weapon_hand / ui_wrist_quick_hand: which hand holds the piece, 0 left / 1 right / 2 off (hidden - the router still takes it off the eyes, no quad; spec Q4 "Hidden"). Needs ui_wrist_hud. Tier D.  tree=INERT
-int   UiWristHand[5] = { 1, 0, 1, 1, 0 };
-// [DEP: UiWristX] required-for=ui_wrist_<piece>_x: the piece's centre along the grip's X, metres (+X = back of the RIGHT hand / palm of the LEFT, RUN WS2). Needs ui_wrist_hud. Tier D.  tree=INERT
-float UiWristX[5] = { 0.04f, -0.04f, 0.04f, -0.06f, 0.06f };
-// [DEP: UiWristY] required-for=ui_wrist_<piece>_y: the piece's centre along the grip's +Y (up), metres. Needs ui_wrist_hud. Tier D.  tree=INERT
-float UiWristY[5] = { 0.02f, 0.02f, 0.02f, 0.0f, 0.0f };
-// [DEP: UiWristZ] required-for=ui_wrist_<piece>_z: the piece's centre along the grip's +Z (back toward the forearm), metres. Needs ui_wrist_hud. Tier D.  tree=INERT
-float UiWristZ[5] = { 0.03f, 0.05f, 0.13f, 0.03f, 0.03f };
+// THE BUILT-IN STARTING VALUES = PRESET A = JAY's TUNING (2026-11-15, Jay: "My current tuning values for the wrist HUD ... are to be
+// SET as the A preset"; his dlvr\ovr2xr.txt 07efa60c; trace docs/traces/20261115_2020_wrist_preset_a_jay_tuning.md). Keep these
+// arrays and kPresets[0] equal - a new player starts on A.
+int   UiWristHand[5] = { 0, 0, 2, 1, 0 };
+// [DEP: UiWristX] required-for=ui_wrist_<piece>_x: the piece's centre along the anchor's X, metres (grip: +X = back of the RIGHT hand / palm of the LEFT, RUN WS2). Needs ui_wrist_hud. Tier D.  tree=INERT
+float UiWristX[5] = { 0.0671082f, 0.156311f, 0.04f, 0.260864f, 0.234619f };
+// [DEP: UiWristY] required-for=ui_wrist_<piece>_y: the piece's centre along the anchor's +Y (grip: up), metres. Needs ui_wrist_hud. Tier D.  tree=INERT
+float UiWristY[5] = { 0.00325012f, -0.0472336f, 0.02f, 0.0342255f, -0.0438843f };
+// [DEP: UiWristZ] required-for=ui_wrist_<piece>_z: the piece's centre along the anchor's +Z (grip: back toward the forearm), metres. Needs ui_wrist_hud. Tier D.  tree=INERT
+float UiWristZ[5] = { 0.0245361f, 0.0157776f, 0.13f, -0.00646973f, -0.0161743f };
 // [DEP: UiWristPitch] required-for=ui_wrist_<piece>_pitch: the quad's tilt about its own X, degrees (after roll, before yaw). Needs ui_wrist_hud. Tier D.  tree=INERT
-float UiWristPitch[5] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
-// [DEP: UiWristYaw] required-for=ui_wrist_<piece>_yaw: the quad's turn about the grip's +Y, degrees (+90 = its front faces grip +X). Needs ui_wrist_hud. Tier D.  tree=INERT
-float UiWristYaw[5] = { 90.0f, -90.0f, 90.0f, -90.0f, 90.0f };
+float UiWristPitch[5] = { -5.39321f, 71.1794f, 0.0f, -77.6069f, 70.6539f };
+// [DEP: UiWristYaw] required-for=ui_wrist_<piece>_yaw: the quad's turn about the anchor's +Y, degrees (+90 = its front faces +X). Needs ui_wrist_hud. Tier D.  tree=INERT
+float UiWristYaw[5] = { -2.37228f, 4.925f, 90.0f, 164.573f, -136.234f };
 // [DEP: UiWristRoll] required-for=ui_wrist_<piece>_roll: the picture's spin in its own plane, degrees (fixes "upside down", RUN WS2). Needs ui_wrist_hud. Tier D.  tree=INERT
-// ROLL 180 (2026-11-13, RUN S3A1 - Jay: "they're inverted by default"; his shot: health "168" read "891", the quick item's "01"
-// upside down = a half turn in the picture's plane; trace docs/traces/20261113_1052_wrist_roll180.md). Presets A and C carry the same.
-float UiWristRoll[5] = { 180.0f, 180.0f, 180.0f, 180.0f, 180.0f };
+// ROLL 180 (2026-11-13, RUN S3A1 - Jay: "they're inverted by default"; trace docs/traces/20261113_1052_wrist_roll180.md) was the old
+// grip-frame A's value; Jay's tuning (2026-11-15) has its own roll per piece. Preset B still carries 180.
+float UiWristRoll[5] = { -12.6019f, 0.267904f, 180.0f, 40.1018f, 132.933f };
 // [DEP: UiWristScale] required-for=ui_wrist_<piece>_scale: this piece's size x ui_wrist_size. Needs ui_wrist_hud. Tier D.  tree=INERT
 float UiWristScale[5] = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
-// [DEP: UiWristAnchor] required-for=ui_wrist_<piece>_anchor: what the piece's x / y / z / pitch / yaw / roll are relative to - 0 the controller's grip (presets), 1 the DRAWN forearm, 2 the DRAWN hand (the arm solve's own values, boneblend RigArmAnchorRead; trace docs/traces/20261113_1145_wrist_arm_anchor.md). Set by a place (the nearest bone, Jay 2026-11-13 "Nearest bone"); presets / Reset = 0. Needs ui_wrist_hud. Tier D.  tree=INERT
-int   UiWristAnchor[5] = { 0, 0, 0, 0, 0 };
+// [DEP: UiWristAnchor] required-for=ui_wrist_<piece>_anchor: what the piece's x / y / z / pitch / yaw / roll are relative to - 0 the controller's grip, 1 the DRAWN forearm, 2 the DRAWN hand (the arm solve's own values, boneblend RigArmAnchorRead; trace docs/traces/20261113_1145_wrist_arm_anchor.md). Set by a place (the nearest bone, Jay 2026-11-13 "Nearest bone"); a preset / Reset sets the preset's own anchor (A = Jay's: minimap hand, health / weapon / quick forearm, quests grip; B = grip). Needs ui_wrist_hud. Tier D.  tree=INERT
+int   UiWristAnchor[5] = { 2, 1, 0, 1, 1 };
 
 namespace wristquad {
 
@@ -90,21 +93,24 @@ float MetresPerUiPxNow() { return static_cast<float>(uipanel::MetresPerUiPx(stat
 //     OFF (Jay 2026-11-13: "Off (hidden)"; its position keeps A's so turning it back on puts it somewhere sensible). STARTING VALUES
 //     picked 2026-11-13 (mine; Jay tunes them with the sliders): each wrist's pair 0.10 m apart along the forearm, as A's minimap /
 //     quests.
-struct Place { int hand; float pos[3]; float pitch, yaw, roll, scale; };
+// A (2026-11-15) = JAY's TUNING (Jay: "My current tuning values for the wrist HUD ... are to be SET as the A preset"), each piece in
+//     its own anchor (the place he left it at: 2 the drawn hand, 1 the drawn forearm, 0 the grip). = the UiWrist* starting values.
+//     Was: the grip-frame starting values after Mamfro's layout (minimap / quests on the back of the right hand, health on the left).
+struct Place { int hand; float pos[3]; float pitch, yaw, roll, scale; int anchor; };
 const Place kPresets[2][kP] = {
-    {   // A
-        { 1, {  0.04f, 0.02f, 0.03f }, 0.0f,  90.0f, 180.0f, 1.0f },   // minimap - back of the right hand
-        { 0, { -0.04f, 0.02f, 0.05f }, 0.0f, -90.0f, 180.0f, 1.0f },   // health - back of the left hand
-        { 1, {  0.04f, 0.02f, 0.13f }, 0.0f,  90.0f, 180.0f, 1.0f },   // quests - back of the right hand, toward the forearm
-        { 1, { -0.06f, 0.00f, 0.03f }, 0.0f, -90.0f, 180.0f, 1.0f },   // weapon (primary) - above the right palm
-        { 0, {  0.06f, 0.00f, 0.03f }, 0.0f,  90.0f, 180.0f, 1.0f },   // quick item (secondary) - above the left palm
+    {   // A - Jay's tuning
+        { 0, { 0.0671082f, 0.00325012f, 0.0245361f }, -5.39321f, -2.37228f, -12.6019f, 1.0f, 2 },   // minimap - left hand (drawn hand)
+        { 0, { 0.156311f, -0.0472336f, 0.0157776f }, 71.1794f, 4.925f, 0.267904f, 1.0f, 1 },      // health - left forearm
+        { 2, { 0.04f, 0.02f, 0.13f }, 0.0f, 90.0f, 180.0f, 1.0f, 0 },                              // quests - OFF
+        { 1, { 0.260864f, 0.0342255f, -0.00646973f }, -77.6069f, 164.573f, 40.1018f, 1.0f, 1 },    // weapon (primary) - right forearm
+        { 0, { 0.234619f, -0.0438843f, -0.0161743f }, 70.6539f, -136.234f, 132.933f, 1.0f, 1 },    // quick item - left forearm
     },
-    {   // B (the split; spec §6's "C" - Jay 11-13: "There's no point skipping a letter")
-        { 0, { -0.04f, 0.02f, 0.15f }, 0.0f, -90.0f, 180.0f, 1.0f },   // minimap - back of the left wrist, above health
-        { 0, { -0.04f, 0.02f, 0.05f }, 0.0f, -90.0f, 180.0f, 1.0f },   // health - back of the left wrist
-        { 2, {  0.04f, 0.02f, 0.13f }, 0.0f,  90.0f, 180.0f, 1.0f },   // quests - OFF
-        { 1, {  0.04f, 0.02f, 0.05f }, 0.0f,  90.0f, 180.0f, 1.0f },   // weapon (primary) - back of the right wrist
-        { 1, {  0.04f, 0.02f, 0.15f }, 0.0f,  90.0f, 180.0f, 1.0f },   // quick item (secondary) - back of the right wrist, above it
+    {   // B (the split; spec §6's "C" - Jay 11-13: "There's no point skipping a letter") - grip frame
+        { 0, { -0.04f, 0.02f, 0.15f }, 0.0f, -90.0f, 180.0f, 1.0f, 0 },   // minimap - back of the left wrist, above health
+        { 0, { -0.04f, 0.02f, 0.05f }, 0.0f, -90.0f, 180.0f, 1.0f, 0 },   // health - back of the left wrist
+        { 2, {  0.04f, 0.02f, 0.13f }, 0.0f,  90.0f, 180.0f, 1.0f, 0 },   // quests - OFF
+        { 1, {  0.04f, 0.02f, 0.05f }, 0.0f,  90.0f, 180.0f, 1.0f, 0 },   // weapon (primary) - back of the right wrist
+        { 1, {  0.04f, 0.02f, 0.15f }, 0.0f,  90.0f, 180.0f, 1.0f, 0 },   // quick item (secondary) - back of the right wrist, above it
     },
 };
 
@@ -827,7 +833,7 @@ void ApplyPreset(int preset)
         UiWristX[p] = s.pos[0]; UiWristY[p] = s.pos[1]; UiWristZ[p] = s.pos[2];
         UiWristPitch[p] = s.pitch; UiWristYaw[p] = s.yaw; UiWristRoll[p] = s.roll;
         UiWristScale[p] = s.scale;
-        UiWristAnchor[p] = 0;   // the presets' values are in the controller's grip frame
+        UiWristAnchor[p] = s.anchor;   // the preset's own anchor (A: Jay's arm anchors; B: the grip)
     }
 }
 
@@ -838,7 +844,7 @@ bool MatchesPreset(int preset)
     const auto same = [](float a, float b, float tol) { return std::fabs(a - b) <= tol; };   // not `near` - a windows.h macro
     for (int p = 0; p < kP; ++p) {
         const Place& s = kPresets[preset][p];
-        if (UiWristHand[p] != s.hand || UiWristAnchor[p] != 0) { return false; }
+        if (UiWristHand[p] != s.hand || UiWristAnchor[p] != s.anchor) { return false; }
         if (!same(UiWristX[p], s.pos[0], 5e-4f) || !same(UiWristY[p], s.pos[1], 5e-4f) || !same(UiWristZ[p], s.pos[2], 5e-4f)) {
             return false;
         }
@@ -1188,7 +1194,7 @@ void ResetPiece(int piece)
     UiWristX[piece] = s.pos[0]; UiWristY[piece] = s.pos[1]; UiWristZ[piece] = s.pos[2];
     UiWristPitch[piece] = s.pitch; UiWristYaw[piece] = s.yaw; UiWristRoll[piece] = s.roll;
     UiWristScale[piece] = s.scale;
-    UiWristAnchor[piece] = 0;
+    UiWristAnchor[piece] = s.anchor;
     // STAGE B: Reset on the weapon box also removes the held gun family's place (the box goes back to its arm place on that gun)
     bool gunCleared = false;
     if (piece == kWeaponPiece && g_rightIsGun) {

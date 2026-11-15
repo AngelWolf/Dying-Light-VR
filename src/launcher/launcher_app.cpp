@@ -10,6 +10,7 @@
 #include <set>
 #include <thread>
 
+#include "launcher_gpu.h"
 #include "launcher_launch.h"
 #include "launcher_logs.h"
 #include "launcher_net.h"
@@ -89,8 +90,8 @@ std::string Target(const std::string& rel, bool flat)
 
 std::string AaLabel(const setup::AaOption& o)
 {
-    static const char* kQ[] = {"Native AA", "Quality", "Balanced", "Performance"};
-    const char* q = (o.quality >= 0 && o.quality <= 3) ? kQ[o.quality] : "?";
+    static const char* kQ[] = {"Native AA", "Quality", "Balanced", "Performance", "Ultra Performance"};
+    const char* q = (o.quality >= 0 && o.quality <= 4) ? kQ[o.quality] : "?";
     if (o.method == setup::AaWord::Dlss) { return o.quality == 0 ? "DLAA" : std::string("DLSS ") + q; }
     return std::string(o.method == setup::AaWord::Fsr4 ? "FSR 4 " : "FSR 3.1 ") + q;
 }
@@ -107,7 +108,7 @@ void LauncherApp::Init(const fs::path& gameDir, const std::wstring& releaseDir)
     const setup::Recommendation rec = setup::Recommend(g.name, g.vendor);
     s_.gpuName = g.name;
     s_.vdAdvice = rec.vdAdvice ? rec.vdAdvice : "";
-    s_.aaOptions = setup::OptionsFor(rec, g.name, g.vendor, &s_.aaDefault);
+    s_.aaOptions = AllUpscalerOptions(rec, g.name, g.vendor, &s_.aaDefault);   // every preset the card supports (launcher_gpu.h)
     nvidia_ = g.vendor == 0x10DE;
     if (!releaseDir_.empty()) {
         const fs::path d(releaseDir_);
@@ -204,10 +205,11 @@ void LauncherApp::Refresh()
     const std::string layer = Md5File(s_.game / fs::u8path(Target("LibOVRRT64_1.dll", flat)));
     s_.schemaMatchesLayer = s_.schemaOk && SchemaMatches(md5, layer);
     s_.ovr2xr = detected_.ovr2xrText;
-    const setup::OnDisk d = setup::ReadOnDisk(detected_);
-    s_.haveAa = d.haveAa;
-    s_.aaMethod = d.method;
-    s_.aaQuality = d.quality;
+    setup::AaOption onDisk{};   // dlss 0..4 / fsr 0..3 (setup::ReadOnDisk took 0..3 only - Ultra Performance read as "none")
+    s_.haveAa = ReadAaOnDisk(detected_.aaMethodText, detected_.dlssQualityText, &onDisk);
+    s_.aaMethod = onDisk.method;
+    s_.aaQuality = onDisk.quality;
+    if (s_.haveAa) { setup::SelectCurrent(&s_.aaOptions, true, onDisk, s_.aaDefault); }   // a choice the card list lacks is kept + shown
     s_.havePrevious = fs::exists(s_.game / L"dlvr" / L"previous" / L"release.txt");
 }
 
