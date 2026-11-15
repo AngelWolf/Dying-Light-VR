@@ -117,6 +117,8 @@ void LauncherApp::Init(const fs::path& gameDir, const std::wstring& releaseDir)
         Log("release folder " + W2U(releaseDir_) + ": " + (haveRelease_ ? release_.name : "REFUSED - " + why));
     } else if (std::string(kRepoUrl).empty()) {
         s_.releaseWhy = "Updates are not set up yet (the mod's repository is not published).";
+    } else {
+        s_.releaseWhy = "Press Check for updates to get the latest version.";
     }
     SelectGame(!gameDir.empty() ? gameDir : (s_.candidates.empty() ? fs::path() : s_.candidates[0]));
 }
@@ -576,7 +578,12 @@ Result LauncherApp::CheckForUpdates()
 {
     if (std::string(kRepoUrl).empty()) { return {false, "Updates are not set up yet (the mod's repository is not published)."}; }
     std::string body, why;
-    if (!HttpGetText(kRepoUrl, &body, &why)) { return {false, "Could not check for updates: " + why}; }
+    if (!HttpGetText(kRepoUrl, &body, &why)) {
+        if (why.find("status 404") != std::string::npos) {   // a private repo, or one with no release yet
+            return {false, "No public release was found yet - the mod's repository is private or has no release."};
+        }
+        return {false, "Could not check for updates: " + why};
+    }
     LatestInfo li;
     if (!ParseLatestRelease(body, &li, &why)) { return {false, "The latest release is not usable: " + why}; }
     if (haveInstalled_ && !NeedsUpdate(installed_.name, li.tag)) { return {true, "You have the latest version (" + li.tag + ")."}; }
@@ -588,7 +595,7 @@ Result LauncherApp::CheckForUpdates()
     const std::pair<const std::string*, const wchar_t*> assets[] = {
         {&li.manifestUrl, L"release.txt"}, {&li.notesUrl, L"notes.txt"}, {&li.zipUrl, L"files.zip"},
         {&li.schemaUrl, L"settings_schema.json"}, {&li.launcherUrl, L"DyingLightVR_Launcher.exe"},
-        {&li.redistUrl, L"vc_redist.x64.exe"}, {&li.resetsUrl, L"resets.tsv"}};
+        {&li.redistUrl, L"vc_redist.x64.exe"}, {&li.resetsUrl, L"resets.tsv"}, {&li.retiredUrl, L"retired.txt"}};
     for (const auto& a : assets) {
         if (a.first->empty()) { continue; }
         if (!HttpGetToFile(*a.first, dir / a.second, &why)) { return {false, "Download failed: " + why}; }

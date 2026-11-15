@@ -43,9 +43,10 @@ static std::string ReadFile(const char* p)
 
 int main()
 {
-    {   // the update source: the repo URL is EMPTY until Jay publishes -> no network; a local folder works now
-        CHECK(std::string(kRepoUrl).empty());
-        CHECK(UpdateSourceFor(kRepoUrl, L"") == UpdateSource::None);
+    {   // the update source: the repo's latest-release API address (2026-11-15); a local folder still wins
+        CHECK(std::string(kRepoUrl) == "https://api.github.com/repos/bymodify-ux/Dying-Light-VR/releases/latest");
+        CHECK(UpdateSourceFor(kRepoUrl, L"") == UpdateSource::GitHub);
+        CHECK(UpdateSourceFor("", L"") == UpdateSource::None);
         CHECK(UpdateSourceFor(kRepoUrl, L"D:\\rel") == UpdateSource::Local);
         CHECK(UpdateSourceFor("https://github.com/x/y", L"") == UpdateSource::GitHub);
     }
@@ -60,12 +61,14 @@ int main()
             {"name": "notes.txt", "browser_download_url": "https://h/notes.txt"},
             {"name": "files.zip", "browser_download_url": "https://h/files.zip"},
             {"name": "settings_schema.json", "browser_download_url": "https://h/s.json"},
-            {"name": "DyingLightVR_Launcher.exe", "browser_download_url": "https://h/l.exe"}]})";
+            {"name": "DyingLightVR_Launcher.exe", "browser_download_url": "https://h/l.exe"},
+            {"name": "retired.txt", "browser_download_url": "https://h/retired.txt"}]})";
         LatestInfo li;
         std::string why;
         CHECK(ParseLatestRelease(j, &li, &why));
         CHECK(li.tag == "DLVR-2026.12.01" && li.zipUrl == "https://h/files.zip" && li.launcherUrl == "https://h/l.exe");
         CHECK(li.notesUrl == "https://h/notes.txt" && li.schemaUrl == "https://h/s.json" && li.manifestUrl == "https://h/release.txt");
+        CHECK(li.retiredUrl == "https://h/retired.txt");
         const std::string noZip = R"({"tag_name": "x", "assets": [{"name": "release.txt", "browser_download_url": "u"}]})";
         CHECK(!ParseLatestRelease(noZip, &li, &why) && why.find("files.zip") != std::string::npos);
         CHECK(NeedsUpdate("DLVR-2026.11.20", li.tag) && !NeedsUpdate("DLVR-2026.12.01", "DLVR-2026.12.01") && !NeedsUpdate("a", ""));

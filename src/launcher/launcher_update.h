@@ -18,9 +18,9 @@
 
 namespace dlvr::launcher {
 
-// The GitHub repo's API URL for its latest release, e.g. "https://api.github.com/repos/<owner>/<repo>/releases/latest".
-// EMPTY until the repo is published (spec 12.1). The ONE place it is set.
-inline const char* kRepoUrl = "";
+// The GitHub repo's API URL for its latest release - the ONE place it is set (spec 12.1; repo created 2026-11-15, PRIVATE at
+// first: until it is public the API answers 404 to the launcher, which does not sign in, and CheckForUpdates says so).
+inline const char* kRepoUrl = "https://api.github.com/repos/bymodify-ux/Dying-Light-VR/releases/latest";
 
 inline const char* kPreviousDir = "dlvr/previous/";
 
@@ -41,7 +41,7 @@ inline UpdateSource UpdateSourceFor(const std::string& repoUrl, const std::wstri
 }
 
 struct LatestInfo {
-    std::string tag, manifestUrl, notesUrl, zipUrl, launcherUrl, schemaUrl, redistUrl, resetsUrl;
+    std::string tag, manifestUrl, notesUrl, zipUrl, launcherUrl, schemaUrl, redistUrl, resetsUrl, retiredUrl;
 };
 
 // GitHub "releases/latest" JSON. Refused (naming the asset) when release.txt, files.zip, the launcher or the schema is missing.
@@ -63,6 +63,7 @@ inline bool ParseLatestRelease(const std::string& jsonText, LatestInfo* out, std
         else if (n == "settings_schema.json") { li.schemaUrl = u; }
         else if (n == "vc_redist.x64.exe") { li.redistUrl = u; }
         else if (n == "resets.tsv") { li.resetsUrl = u; }
+        else if (n == "retired.txt") { li.retiredUrl = u; }
     }
     const std::pair<const char*, const std::string*> need[] = {{"release.txt", &li.manifestUrl}, {"files.zip", &li.zipUrl},
                                                               {"DyingLightVR_Launcher.exe", &li.launcherUrl},
