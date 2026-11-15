@@ -37,6 +37,8 @@ I'd like to thank the following people for their assistance & contributions to t
 ## Support me##
 
 If you enjoy the mod and want to support further updates, here's my Ko-fi
+
+
 <a href="https://ko-fi.com/sadbxi_/tip">
   <img src="assets/branding/kofi-support.png" alt="Support me on Ko-fi" width="320">
 </a>
