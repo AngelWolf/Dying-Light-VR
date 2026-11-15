@@ -1,3 +1,4 @@
+![Dying Light VR](assets/branding/banner.png)
 # Dying Light VR
 
 A native 6DoF OpenXR VR mod for Dying Light (Enhanced Edition): true stereo, motion controls, no helper program.
