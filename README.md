@@ -34,7 +34,7 @@ I'd like to thank the following people for their assistance & contributions to t
 - **OpenXR SDK** by the Khronos Group (Apache 2.0).
 - **All of my beta testers** (Sorry, there's so many of you <3)
 
-##Support me##
+## Support me##
 
 If you enjoy the mod and want to support further updates, here's my Ko-fi
 <a href="https://ko-fi.com/sadbxi_/tip">
