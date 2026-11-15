@@ -2,8 +2,13 @@
 
 A native 6DoF OpenXR VR mod for Dying Light (Enhanced Edition): true stereo, motion controllers, no helper program.
 
-To play, download the latest release and run `DyingLightVR_Launcher.exe`. The launcher installs, updates and removes the
-mod, switches between VR and flatscreen, and lets you change the settings before you launch.
+## Download
+
+**[Download the launcher (DyingLightVR_Launcher.exe)](https://github.com/bymodify-ux/Dying-Light-VR/releases/latest/download/DyingLightVR_Launcher.exe)**
+- always the newest version. Run it, press **Check for updates**, then **Install**.
+
+The launcher installs, updates and removes the mod, switches between VR and flatscreen, and lets you change the settings before
+you launch. Every release is also listed under [Releases](https://github.com/bymodify-ux/Dying-Light-VR/releases).
 
 ## Building from source
 
