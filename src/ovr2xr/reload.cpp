@@ -1501,7 +1501,7 @@ const char* DriveXbow(uintptr_t ctrl, ItemState* st, const float* hand, const fl
     }
 
     reload::XParams p;
-    p.rackGrabM = reload::kXbowRackGrabM;   // 0.10 m (Jay 2026-11-04), not reload_grab_m
+    p.rackGrabM = reload::kXbowRackGrabM + reload::kGrabWidenM;   // 0.10 m (Jay 2026-11-04) + 0.04 (trace 20261116_1126), not reload_grab_m
     p.rackDoneM = x.rackDoneM;
     p.catchM = BowNockCatchM;
     p.holdM = BowNockHoldM;
@@ -4477,7 +4477,8 @@ void ClassifyModel(uintptr_t model, uintptr_t player, uintptr_t ctrl, uintptr_t 
             r ? r->magOutAxis.x : 0.0f, r ? r->magOutAxis.y : 0.0f, r ? r->magOutAxis.z : 1.0f, r ? r->rackAxis.x : 1.0f,
             r ? r->rackAxis.y : 0.0f, r ? r->rackAxis.z : 0.0f, r ? " (the row's)" : " (no row: the parents' +Z / +X)",
             r ? r->boltTravelM : 0.0368f, reload::RackPullFor(g_gun.family, r, ReloadRackPullM),
-            reload::RackGrabFor(g_gun.family, ReloadGrabM), ReloadGrabM, reinterpret_cast<void*>(ctrl), slot, reinterpret_cast<void*>(item), reinterpret_cast<void*>(ctrl2), slot2,
+            reload::RackGrabFor(g_gun.family, ReloadGrabM) + reload::kGrabWidenM, ReloadGrabM + reload::kGrabWidenM,   // as the grabs use them
+            reinterpret_cast<void*>(ctrl), slot, reinterpret_cast<void*>(item), reinterpret_cast<void*>(ctrl2), slot2,
             g_gun.rackRow ? g_gun.rackRow->key : "none - today's hand", g_gun.rackRow2 ? g_gun.rackRow2->key : "none",
             g_gun.magRow ? g_gun.magRow->key : "none - today's hand",
             g_gun.pullRow ? g_gun.pullRow->key : "none - the mag row pulls",
@@ -4810,8 +4811,9 @@ const char* DriveSteps(uintptr_t ctrl, ItemState* st, const float* hand, const f
     // The rail: the mag is out (MagInHand) only once it has cleared the well AND eased into the fingers - never inside the well.
     p.pullOutM = railGun ? std::fmax(ReloadPullOutM, g_gun.clearM + kRailEaseM) : ReloadPullOutM;
     p.rackPullM = reload::RackPullFor(g_gun.family, g_gun.row, ReloadRackPullM);   // pistol: its full slide travel
-    p.grabM = ReloadGrabM;
-    p.rackGrabM = reload::RackGrabFor(g_gun.family, ReloadGrabM);                  // pistol slide: 0.12 m
+    // + kGrabWidenM (trace 20261116_1126): the drawn palm now sits on the controller - the old union of the two is contained.
+    p.grabM = ReloadGrabM + reload::kGrabWidenM;
+    p.rackGrabM = reload::RackGrabFor(g_gun.family, ReloadGrabM) + reload::kGrabWidenM;   // pistol slide: 0.12 + 0.04 m
     const reload::Out o = st->machine.Update(in, p);
 
     // Events: latch what the next steps need.
@@ -5002,7 +5004,7 @@ const char* DriveSteps(uintptr_t ctrl, ItemState* st, const float* hand, const f
     // For the pad thread: R2 withheld while a step is live; a left press starting now is ours mid-reload or at the mag / slide.
     // Rifle plan Task 5: the same answer also keeps that press from the two-handed hold (ovr2xr.cpp: ReloadPadPoll before TwoHandPoll,
     // reload_logic.h ReloadOwnsLeftPress / TwoHandPressRefused). On the Commando in.handToSlideM is to the NEARER handle.
-    const bool atPart = (in.handToMagM <= ReloadGrabM) ||
+    const bool atPart = (in.handToMagM <= p.grabM) ||   // the grab's own (widened) zone - trace 20261116_1126
                         (o.step == reload::Step::NeedsRack && in.handToSlideM <= p.rackGrabM);
     Publish(o.withholdR2, reload::ReloadOwnsLeftPress(o.step != reload::Step::Idle, atPart));
     // The left hand's poses for the solve and the finger pass (plan 2026-11-01-reload-hand-poses Task 3 step 1): the rack lock while

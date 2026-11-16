@@ -57,12 +57,31 @@ static void both_eyes_identical()
     CHECK(Differ(e0, e1));
 }
 
+// Meta's PC runtime (Quest Link): any symmetrising acts as 0; every other runtime keeps the setting (Jay 2026-11-16: "A").
+// Names as logged: "Oculus 1.208.0" (the runtimeName field is "Oculus"), "VirtualDesktopXR", "SteamVR/OpenXR".
+static void meta_runtime_uses_its_own_fov()
+{
+    CHECK(RuntimeStretchesToOwnFov("Oculus"));
+    CHECK(!RuntimeStretchesToOwnFov("VirtualDesktopXR"));
+    CHECK(!RuntimeStretchesToOwnFov("SteamVR/OpenXR"));
+    CHECK(!RuntimeStretchesToOwnFov("Ocul"));
+    CHECK(!RuntimeStretchesToOwnFov(""));
+    CHECK(!RuntimeStretchesToOwnFov(nullptr));
+    CHECK(EffectiveSymmetric(2, true) == 0);
+    CHECK(EffectiveSymmetric(1, true) == 0);
+    CHECK(EffectiveSymmetric(0, true) == 0);
+    CHECK(EffectiveSymmetric(2, false) == 2);
+    CHECK(EffectiveSymmetric(1, false) == 1);
+    CHECK(EffectiveSymmetric(0, false) == 0);
+}
+
 int main()
 {
     steam_frame_eyes_get_one_frustum();
     mirror_eyes_unchanged();
     shared_contains_both_eyes();
     both_eyes_identical();
+    meta_runtime_uses_its_own_fov();
     std::printf("eyefov_logic_test: %d failure(s)\n", g_fail);
     return g_fail;
 }

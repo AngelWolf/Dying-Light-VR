@@ -497,6 +497,12 @@ inline float RackGrabFor(Family f, float grabKeyM)
 // The CROSSBOW's rack grab radius (Empty -> Racking, xbow_logic.h): 0.10 m around Jay's rack pose (Jay after RUN XB1b, 2026-11-03: "Rack
 // needs slightly more radius" -> 2026-11-04 "10 cm"); was reload_grab_m (0.08). Crossbow rack only - the mag grabs keep reload_grab_m.
 constexpr float kXbowRackGrabM = 0.10f;
+// [LOADBEARING: wristBack drawn basis] THE GRAB WIDENING (trace docs/traces/20261116_1126_wristback_drawn_basis.md; Jay 2026-11-16:
+// "Widen it, we'll tune it if it feels too forgiving"). Before that fix the drawn left palm sat ~3.8 cm off the controller's grip, and
+// the mag / rack grabs took the NEARER of the two (a union of two balls) and the crossbow tested the controller-based hand; now the two
+// coincide. Added to the mag grab, the rack grab (pistol, SMG, rifle), the press ownership (atPart) and the crossbow rack, so each zone
+// contains the old one. reload_grab_m keeps its meaning (the slider), and the fuel cord grab (drawn vs drawn) is not widened.
+constexpr float kGrabWidenM = 0.04f;
 
 // The bolt's REST local point for the drawn bolt (Task 5 fix round 1 order, final fix wave as a point): the rest LATCHED this draw (the
 // game's own, with rounds > 0) > the row's chamberRest from the mesh (when its x > 0) > (the SMG meshes' clip rest, 0, 0) (the caller's

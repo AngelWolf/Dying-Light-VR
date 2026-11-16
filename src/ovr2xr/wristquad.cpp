@@ -1437,6 +1437,16 @@ int Render(XrSpace appSpace, bool viewsValid, const XrPosef eyes[2], int room, X
         q.subImage.imageRect.offset = { 0, w.p * kSlotH };
         q.subImage.imageRect.extent = { cw[i], ch[i] };
         q.pose = w.local;
+        // The controller grip offset (trace 20261116_1750_grip_offset_sliders): the getters return the shifted grip, so a quad held
+        // IN the raw grip space takes the same grip-local offset - a translation in that frame - to ride the shifted hand.
+        if (!w.inApp) {
+            float ho[3];
+            if (RigHandOffsetLocalM(hand, ho)) {
+                q.pose.position.x += ho[0];
+                q.pose.position.y += ho[1];
+                q.pose.position.z += ho[2];
+            }
+        }
         q.size = { widthM, heightM };
         ++w_shown[w.p];
         if (!g_saidFirst) {
@@ -1460,6 +1470,14 @@ int Render(XrSpace appSpace, bool viewsValid, const XrPosef eyes[2], int room, X
         XrPosef piece{};
         const XrSpace pieceSp = (g_carrier == 0 || g_carrier == 1) ? ControllerGripSpace(g_carrier == 0 ? kLeftHand : kRightHand) : appSpace;
         piece = (g_carrier == 0 || g_carrier == 1) ? g_carryOff : g_floatPose;
+        if (g_carrier == 0 || g_carrier == 1) {   // held in the raw grip space: the grip offset, as the pieces above
+            float ho[3];
+            if (RigHandOffsetLocalM(g_carrier == 0 ? kLeftHand : kRightHand, ho)) {
+                piece.position.x += ho[0];
+                piece.position.y += ho[1];
+                piece.position.z += ho[2];
+            }
+        }
         if (pieceSp != XR_NULL_HANDLE && extras > 0 && nOut < kMaxQuads) {
             XrCompositionLayerQuad& q = out[nOut++];
             q = XrCompositionLayerQuad{ XR_TYPE_COMPOSITION_LAYER_QUAD };

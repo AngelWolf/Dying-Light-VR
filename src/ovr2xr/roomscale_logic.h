@@ -75,5 +75,26 @@ inline Out Update(const In& in)
     return out;
 }
 
+// INV-740: the walk body is asked to close only the part of the remainder past this. A head turn moves the full-arc neck point by the
+// difference between the wearer's own neck -> eye offset and the shipped one (head_neck_pivot_*_mm, one user's head): 15-25 mm off it
+// left 0.13-1.14 m of walking per 10 s of turns in the harness (scratchpad rsproof); 0.05 m left 0.000 m for every head tested while a
+// real 0.30 m step still walked 0.25 m. Fixed, not a setting.
+const float kCmdDeadZoneM = 0.05f;
+
+// cmd shortened by deadM along itself; 0 when |cmd| <= deadM or deadM < 0 is passed as 0.
+inline void DeadZoneCommand(float& cmdX, float& cmdZ, float deadM)
+{
+    const float dz = deadM > 0.0f ? deadM : 0.0f;
+    const float len = std::sqrt(cmdX * cmdX + cmdZ * cmdZ);
+    if (len <= dz || len <= 0.0f) {
+        cmdX = 0.0f;
+        cmdZ = 0.0f;
+        return;
+    }
+    const float k = (len - dz) / len;
+    cmdX *= k;
+    cmdZ *= k;
+}
+
 }  // namespace roomscale
 }  // namespace dlvr

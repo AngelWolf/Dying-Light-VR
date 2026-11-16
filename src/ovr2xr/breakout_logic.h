@@ -162,10 +162,16 @@ inline bool Expired(double shoveT, double nowT) { return nowT - shoveT > 1.0; }
 // manual shove" -> "change the timing on the gate"). The hit is blocked during a grab only from kMeleeOpenMs after GRAB START:
 // in the archived logs the first detected shove came a median 759 ms in (5 of 200 before 400 ms), the 46 attacks in flight at a
 // grab start ended 2-345 ms after it, and the game's own kick lock is 0.37 s. startMs 0 = no stamp -> open.
-constexpr unsigned long long kMeleeOpenMs = 400;
-inline bool MeleeGateClosed(bool grabbed, unsigned long long startMs, unsigned long long nowMs)
+// Jay 2026-11-16 ("it just phases through" -> "Do it"): once the player has WON the grab the gate is open again - the game's GRAB END
+// came 0.70-1.21 s after our escape call (RUN HA1 / HA2, 18 of 18 escapes) and 18 of the runs' 35 gated swings fired in that gap.
+// Won = INV-618's phases 6 finish_win, 7 fast_finish_win_front, 8 fast_finish_win_break (9 finish_lose is not a win).
+// Jay 2026-11-16 ("I want you to tune the gate too" -> "Lengthen the window to 500ms"): 400 -> 500. HA1 / HA2: 11 of the 15 swings
+// gated while still held came 0.15-1.27 s before any escape (real attacks); archive first shove p10 587 ms (INV-638).
+constexpr unsigned long long kMeleeOpenMs = 500;
+inline bool WonPhase(int phase) { return phase >= 6 && phase <= 8; }
+inline bool MeleeGateClosed(bool grabbed, unsigned long long startMs, unsigned long long nowMs, int phase)
 {
-    return grabbed && startMs != 0 && nowMs >= startMs && nowMs - startMs >= kMeleeOpenMs;
+    return grabbed && !WonPhase(phase) && startMs != 0 && nowMs >= startMs && nowMs - startMs >= kMeleeOpenMs;
 }
 
 }  // namespace breakout

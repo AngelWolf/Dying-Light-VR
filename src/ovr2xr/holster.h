@@ -153,5 +153,10 @@ bool HolsterBoltWheelHoldsR2();
 // afterwards the bit is cleared and SetHudEnabled(mask == 0) - so a game group that also hides it keeps it hidden. Refuses by name
 // (byte check, registry layout check, group count) and then does nothing. Idle COST: one volatile read + a compare.
 void HolsterHudHideTick();
+// HIPCAP (trace 20261116_1400_hipcap_probe): diag_hip_capture - log-only, DEFAULT OFF. HolsterHipCapture is called from LocateViews
+// (ovr2xr.cpp) once per locate with the frame's display time, whether the head has both valid bits, the head pose and the appSpace
+// base (position + yaw); it writes one line per display time to dlvr_hipcap.log. Any LocateViews thread. COST off: one bool load.
+extern bool DiagHipCapture;
+void HolsterHipCapture(long long t, bool headValid, const float hp[3], const float hq[4], const float base[3], float baseYawDeg);
 
 }  // namespace dlvr

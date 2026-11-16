@@ -111,6 +111,7 @@ float g_hudPos[3] = {}, g_hudQuat[4] = { 0.0f, 0.0f, 0.0f, 1.0f }, g_hudPlaced[3
 // The selection wheels' frame (WheelFrame): written by RenderHud on the submit thread, read by the holster poll.
 SRWLOCK   g_wfLock = SRWLOCK_INIT;
 float     g_wfC[3] = {}, g_wfR[3] = {}, g_wfU[3] = {}, g_wfN[3] = {};
+float     g_wfE[4] = {};   // the drawn quad's edges from the wheel centre, metres on the panel: x lo, x hi, y lo, y hi (2026-11-16)
 ULONGLONG g_wfAt = 0;
 // Task 6 (D13): the wheel's own latch while a selection wheel shows.
 bool      g_wheelLatched = false;
@@ -866,6 +867,12 @@ int RenderHud(XrSpace appSpace, bool viewsValid, const XrPosef* eyes, const XrQu
             g_wfU[i] = ay[i];
             g_wfN[i] = az[i];
         }
+        // The quad's edges from the wheel centre (while a wheel shows, the quad IS the wheel's crop r): a hand pointing outside
+        // them is off the wheel as drawn (Jay 2026-11-16, trace 20261116_1328_wheel_offwheel).
+        g_wfE[0] = -0.5f * width - u;
+        g_wfE[1] = 0.5f * width - u;
+        g_wfE[2] = -0.5f * height - v;
+        g_wfE[3] = 0.5f * height - v;
         g_wfAt = now;
         ReleaseSRWLockExclusive(&g_wfLock);
     }
@@ -913,7 +920,7 @@ int Render(XrSpace appSpace, bool viewsValid, const XrPosef* eyes, const XrQuate
     return quads;
 }
 
-bool WheelFrame(float centre[3], float right[3], float up[3], float normal[3])
+bool WheelFrame(float centre[3], float right[3], float up[3], float normal[3], float extent[4])
 {
     AcquireSRWLockShared(&g_wfLock);
     const ULONGLONG at = g_wfAt;
@@ -923,6 +930,7 @@ bool WheelFrame(float centre[3], float right[3], float up[3], float normal[3])
         up[i] = g_wfU[i];
         normal[i] = g_wfN[i];
     }
+    for (int i = 0; i < 4; ++i) { extent[i] = g_wfE[i]; }
     ReleaseSRWLockShared(&g_wfLock);
     return at != 0 && GetTickCount64() - at <= 250;
 }

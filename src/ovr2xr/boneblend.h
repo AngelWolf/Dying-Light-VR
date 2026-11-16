@@ -692,6 +692,9 @@ extern float RigGripRightFixWeapon;
 // constant, the right one rotated by rig_grip_right_fix as the solve does. False = rig_grip_use_baked off / no constant.
 // Read-only, any thread.
 bool CalibGripEmptyHand(int side, float out[9]);
+// The hand's DRAWN turn on top of cW . grip (row-major 3x3) - the solve's wristBack post (trace 20261116_1126): the authored rest
+// (latched, or the baked one in the main menu) x the hand-angle dials. side 0 = right, 1 = left. Read-only, any thread.
+void HandPostForSide(int side, float post[9]);
 // SPEC-EYE-FORWARD: the view at the face's eyes (0..1.5 of the eye-bone -> face-eyes vector) and the eye's arc about the
 // neck on the camera only. Live once installed.
 extern float CamEyeForward;

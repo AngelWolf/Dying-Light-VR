@@ -104,8 +104,48 @@ static void matches_hand_rotation_at_90_with_a_nod()
     for (int k = 0; k < 3; ++k) { CHECK(Near(d[k], rn[k] - yn[k], 1e-5f)); }
 }
 
+// INV-740: FullArcPoint is roomscale's input. The eyes of a head pivoting on a FIXED neck (eye = neck + R n): the point must not
+// move for any turn / nod - and at rest (R = I) it is the eye itself, so roomscale's origin (centred on the at-rest eye) sees 0.
+static void full_arc_point_still_on_a_pure_head_motion()
+{
+    const float neck[3] = { 0.31f, -0.02f, 0.47f };
+    float rest[3], q0[4];
+    Head(0.0f, 0.0f, q0);
+    const float eye0[3] = { neck[0] + kN[0], neck[1] + kN[1], neck[2] + kN[2] };
+    FullArcPoint(q0, eye0, kN, rest);
+    for (int k = 0; k < 3; ++k) { CHECK(Near(rest[k], eye0[k], 1e-6f)); }
+    for (float yaw : { 15.0f, 60.0f, 90.0f, 179.4f, -45.0f, -120.0f }) {
+        for (float pitch : { 0.0f, -25.0f, 30.0f }) {
+            float q[4], rn[3], eye[3], p[3];
+            Head(yaw, pitch, q);
+            RotYP(yaw, pitch, kN, rn);
+            for (int k = 0; k < 3; ++k) { eye[k] = neck[k] + rn[k]; }
+            FullArcPoint(q, eye, kN, p);
+            for (int k = 0; k < 3; ++k) { CHECK(Near(p[k], rest[k], 1e-5f)); }
+        }
+    }
+}
+
+// CONTROL (the defect it replaces): today's roomscale input under the decouple - base = the head's own yaw - moves by the yaw arc on
+// the same pure turn (> 50 mm at 60 deg), so the test above is not passing because nothing ever moves.
+static void yaw_base_point_moves_on_a_pure_turn()
+{
+    const float neck[3] = { 0.0f, 0.0f, 0.0f };
+    float q[4], yq[4], rn[3], eye[3], d[3];
+    Head(60.0f, 0.0f, q);
+    Yaw(60.0f, yq);
+    RotYP(60.0f, 0.0f, kN, rn);
+    for (int k = 0; k < 3; ++k) { eye[k] = neck[k] + rn[k]; }
+    ArcOffset(q, yq, kN, d);
+    const float p[3] = { eye[0] - d[0], eye[1] - d[1], eye[2] - d[2] };
+    const float moved[3] = { p[0] - kN[0], p[1] - kN[1], p[2] - kN[2] };   // vs the at-rest eye (neck + n)
+    CHECK(Len(moved) > 0.05f);
+}
+
 int main()
 {
+    full_arc_point_still_on_a_pure_head_motion();
+    yaw_base_point_moves_on_a_pure_turn();
     matches_hand_rotation_at_90_with_a_nod();
     pure_yaw_is_zero_against_its_own_yaw();
     pure_yaw_against_identity_is_todays_arc();

@@ -31,5 +31,18 @@ inline void ArcOffset(const float q[4], const float base[4], const float n[3], f
     }
 }
 
+// out = eye - (R(q) - I) n: the WHOLE arc removed (yaw too), whatever the decouple does. INV-740: roomscale's input - a pure head
+// turn / nod / tilt leaves it where it was at rest (eye at R = I), so turning the head no longer walks the character. Not
+// holster::NeckPoint (= eye - R n, the absolute neck): roomscale's origin was centred on the at-rest eye.
+inline void FullArcPoint(const float q[4], const float eye[3], const float n[3], float out[3])
+{
+    const float base[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    float d[3];
+    ArcOffset(q, base, n, d);
+    out[0] = eye[0] - d[0];
+    out[1] = eye[1] - d[1];
+    out[2] = eye[2] - d[2];
+}
+
 }  // namespace neckpivot
 }  // namespace dlvr

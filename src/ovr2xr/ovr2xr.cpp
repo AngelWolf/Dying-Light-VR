@@ -404,6 +404,12 @@ struct Session {
     XrSession session = XR_NULL_HANDLE;
     XrSpace appSpace = XR_NULL_HANDLE;
     XrSpace viewSpace = XR_NULL_HANDLE;
+    // The runtime's floor (2026-11-16, trace 20261116_1545_standing_posture): a STAGE space, read only - appFloorY = the appSpace
+    // origin's height above it, re-located every 30th LocateViews; floorOk false until it locates (or when the runtime has none).
+    XrSpace stageSpace = XR_NULL_HANDLE;
+    float appFloorY = 0.0f;
+    bool floorOk = false;
+    unsigned floorTick = 0;
     XrSessionState state = XR_SESSION_STATE_UNKNOWN;
 
     bool running = false;
@@ -696,6 +702,19 @@ bool  g_fovCenterCorrect = false;  // declaring != rendered warps the image
 // fov_center_correct puts the image back in the right place at submit time.
 int   g_symmetricFov = 2;
 
+// [LOADBEARING: FOV-META-OWN-FOV] Meta's PC OpenXR runtime (Quest Link / Air Link) shows each eye's image over ITS OWN FOV,
+//      whatever fov the projection view declares (Venture PR #79 on "Oculus" 1.208.0), so the symmetric superset lands squeezed
+//      and off-centre = the cross-eye + jitter a tester reported at symmetric_fov=2, both gone at 0 (Jay 2026-11-16: "A"; trace
+//      docs/traces/20261116_1835_meta_runtime_symmetric_fov.md). Set once in ovr_Create from the runtime's name; every reader of
+//      the mode goes through SymmetricFovMode(). The setting itself (file, config: dump) is never rewritten. VDXR / SteamVR keep
+//      the setting (D-265: 0 misaligns the eyes on VDXR).
+bool  g_runtimeStretchesFov = false;
+
+int SymmetricFovMode()
+{
+    return dlvr::eyefov::EffectiveSymmetric(g_symmetricFov, g_runtimeStretchesFov);
+}
+
 // Where the FOV we hand the game comes from.
 //   0 = the symmetric fallback only (tan(0.8) both axes)
 //   1 = the real per-eye FOV measured from the runtime
@@ -831,12 +850,13 @@ XrPosef PitchPose(const XrPosef& p, float degrees)
 
 ovrFovPort SymmetriseFov(ovrFovPort f)
 {
-    if (g_symmetricFov >= 1) {
+    const int mode = SymmetricFovMode();   // 0 on Meta's runtime (FOV-META-OWN-FOV)
+    if (mode >= 1) {
         const float v = (f.UpTan > f.DownTan) ? f.UpTan : f.DownTan;
         f.UpTan = v;
         f.DownTan = v;
     }
-    if (g_symmetricFov >= 2) {
+    if (mode >= 2) {
         const float h = (f.LeftTan > f.RightTan) ? f.LeftTan : f.RightTan;
         f.LeftTan = h;
         f.RightTan = h;
@@ -1151,6 +1171,28 @@ bool NeckPivotCompute(const XrPosef& raw, XrVector3f& out, bool* refused)
     out.x = raw.position.x - d[0];
     out.y = raw.position.y - d[1];
     out.z = raw.position.z - d[2];
+    return true;
+}
+
+// INV-740 (trace docs/traces/20261116_1101_roomscale_neck_point_dead_zone.md): ROOMSCALE's input. NeckPivotCompute keeps the eyes'
+// YAW arc while the decouple is on (base = head yaw, above), so every head turn moved roomscale's offset and walked the character
+// (~0.0844 m x the turn rate, applied in one physics step; > 0.1 m/s starts the game's walk bob). This removes the WHOLE arc - same gates
+// as NeckPivotCompute (head_neck_pivot on, |n| <= 300 mm; otherwise raw). Roomscale only; every other neck-pivot consumer is unchanged.
+// COST: one quaternion -> matrix and nine multiplies, once per frame (ApplyRoomscale).
+static bool NeckPivotNeckPoint(const XrPosef& raw, XrVector3f& out)
+{
+    out = raw.position;
+    if (!HeadNeckPivot) { return false; }
+    const float nx = HeadNeckPivotXmm * 0.001f, ny = HeadNeckPivotYmm * 0.001f, nz = HeadNeckPivotZmm * 0.001f;
+    if (nx * nx + ny * ny + nz * nz > 0.3f * 0.3f) { return false; }
+    const float q[4] = { raw.orientation.x, raw.orientation.y, raw.orientation.z, raw.orientation.w };
+    const float eye[3] = { raw.position.x, raw.position.y, raw.position.z };
+    const float n[3] = { nx, ny, nz };
+    float p[3];
+    ::dlvr::neckpivot::FullArcPoint(q, eye, n, p);
+    out.x = p[0];
+    out.y = p[1];
+    out.z = p[2];
     return true;
 }
 
@@ -2150,6 +2192,11 @@ const Setting kSettings[] = {
             "How fast the muzzle must snap upward to flick the open double-barrel shut. Lower = easier."),
     // diag_duck_probe: OUTSIDE every DLVR_BETA_LEAN block on purpose (2026-10-25: a diag inside a lean block is compiled out of
     // BETA and the file's 1 is never read).
+    S_BOOL("diag_hip_capture", dlvr::DiagHipCapture,
+           "Diagnostics: [HIPCAP] standing recording for the hip holsters (log-only)", "Aim",
+           "Log-only. One line per frame to dlvr_hipcap.log: your head, both controllers' grip poses with grip and trigger, the "
+           "play-space shifts and the holsters' body facing - the recording the hip holsters' new anchor is tested on. Writes "
+           "nothing the game reads. HEADSET. DEFAULT OFF."),
     S_BOOL("diag_roomscale_probe", dlvr::DiagRoomscaleProbe,
            "Diagnostics: [ROOMSCALE] walk body + head-to-world map (log-only)", "Aim",
            "Log-only. Twice a second: the player's walk body (wanted velocity, its guards), the controller group, the control "
@@ -2484,41 +2531,51 @@ const Setting kSettings[] = {
             "Rigging: radial deviation limit (toward the thumb)", "Camera hook",
             "Human range is only 15-21 degrees - by far the tightest of the four, "
             "and the one a single symmetric cone gets most wrong."),
+    // 2026-11-16, Jay: "put the sliders that the users wanted into the rig settings in VR comfort" (testers: "Weapon/wrist angle also
+    // seems off") -> the six hand-angle dials move to VR Comfort > Hands & Arms (group "VR Comfort" keeps their text in BETA lean;
+    // overlay.cpp isRig). Ranges, defaults and every reader unchanged (trace docs/traces/20261116_1750_grip_offset_sliders.md). The
+    // pitch / yaw turn about the hand bone's own Y / Z after the authored rest (boneblend.cpp CorrectHandLocal) - their on-screen
+    // direction is not named in the labels because it has not been seen; the roll is the twist about the bone axis.
     S_FLOAT("rig_grip_pitch_deg", RigGripPitchDeg, -180.0f, 180.0f,
-            "Rigging: right-hand correction, pitch axis", "Camera hook",
-            "The second of THREE hand-correction angles. Taken from the working "
-            "mod's own structure, not guessed: it carries \"[rigcorr] right-hand "
-            "rig correction (%.1f %.1f %.1f) deg\" behind a validated three-float "
-            "setter, plus separate scalars for the left hand and for throwable "
-            "aiming. We carried one roll about the bone axis, which cannot express "
-            "a correction needing the other two axes - and [DRAWN R] has reported "
-            "the hand 95-125 degrees off intended throughout, while every "
-            "POSITION error was being fixed around it. Default 0, an exact no-op, "
-            "so rig_grip_roll_deg keeps its measured meaning. Applied in the "
-            "hand's own local frame, last, for the same reason the roll is: a "
-            "fixed authoring offset is not motion, and anything upstream that "
-            "reads it as motion hands it to the forearm."),
+            "Right hand angle: bend A (degrees)", "VR Comfort",
+            "Turns your right hand (and what it holds) on the controller, one way. If the hand or weapon sits at the wrong angle "
+            "to your real hand, try small amounts here, bend B and twist. 0 = as the mod draws it."),
     S_FLOAT("rig_grip_yaw_deg", RigGripYawDeg, -180.0f, 180.0f,
-            "Rigging: right-hand correction, yaw axis", "Camera hook",
-            "The third of the three hand-correction angles. See "
-            "rig_grip_pitch_deg. Default 0, an exact no-op."),
+            "Right hand angle: bend B (degrees)", "VR Comfort",
+            "Turns your right hand (and what it holds) on the controller, across the other way from bend A. 0 = as the mod "
+            "draws it."),
     S_FLOAT("rig_left_grip_pitch_deg", RigLeftGripPitchDeg, -180.0f, 180.0f,
-            "Rigging: left-hand correction, pitch axis", "Camera hook",
-            "Left-hand equivalent of rig_grip_pitch_deg. The left hand's "
-            "correction is kept separate from the right's rather than mirroring "
-            "it - the two hands hold their own "
-            "controllers differently. Default 0, an exact no-op."),
+            "Left hand angle: bend A (degrees)", "VR Comfort",
+            "Turns your left hand on the controller, one way. Set separately from the right hand. 0 = as the mod draws it."),
     S_FLOAT("rig_left_grip_yaw_deg", RigLeftGripYawDeg, -180.0f, 180.0f,
-            "Rigging: left-hand correction, yaw axis", "Camera hook",
-            "Left-hand equivalent of rig_grip_yaw_deg. Default 0, an exact no-op."),
+            "Left hand angle: bend B (degrees)", "VR Comfort",
+            "Turns your left hand on the controller, across the other way from bend A. 0 = as the mod draws it."),
     S_FLOAT("rig_grip_roll_deg", RigGripRollDeg, -180.0f, 180.0f,
-            "Rigging: roll between the forearm and hand bone conventions", "Camera hook",
-            "The grip is captured as 'hand aligned with the forearm', which forces "
-            "the hand's local matrix to identity - and that assumes both bones "
-            "share a roll convention. Biped rigs routinely do not, and this one "
-            "sits a quarter turn out: a straight forearm left the palm facing "
-            "left. Measured in the headset, not guessed. Signed, so if 90 turns "
-            "the palm the wrong way, -90 is the fix."),
+            "Right hand angle: twist (degrees)", "VR Comfort",
+            "Twists your right hand about your forearm's line. 0 = as the mod draws it."),
+    // The controller grip offset (trace docs/traces/20261116_1750_grip_offset_sliders.md; testers: "a grip offset slider would be very
+    // helpful"; Jay: "Move the controller"): moves where the game takes each controller to be, in the controller's own frame - the
+    // drawn hand, grabs, holsters, the wheel, the bow, the calibration and the wrist HUD all follow. Declared in controllers.cpp.
+    S_FLOAT("rig_hand_offset_r_fwd_cm", RigHandOffsetRFwdCm, -10.0f, 10.0f,
+            "Right hand position: forward / back (cm)", "VR Comfort",
+            "Moves your right hand forward (+) or back (-) along the controller, if the drawn hand does not sit where your real "
+            "hand is. Grabs, holsters and the wrist HUD move with it. Recalibrate your arms after a big change. 0 = no change."),
+    S_FLOAT("rig_hand_offset_r_up_cm", RigHandOffsetRUpCm, -10.0f, 10.0f,
+            "Right hand position: up / down (cm)", "VR Comfort",
+            "Moves your right hand up (+) or down (-) relative to the controller. 0 = no change."),
+    S_FLOAT("rig_hand_offset_r_right_cm", RigHandOffsetRRightCm, -10.0f, 10.0f,
+            "Right hand position: right / left (cm)", "VR Comfort",
+            "Moves your right hand to the right (+) or left (-) relative to the controller. 0 = no change."),
+    S_FLOAT("rig_hand_offset_l_fwd_cm", RigHandOffsetLFwdCm, -10.0f, 10.0f,
+            "Left hand position: forward / back (cm)", "VR Comfort",
+            "Moves your left hand forward (+) or back (-) along the controller, if the drawn hand does not sit where your real "
+            "hand is. Grabs, holsters and the wrist HUD move with it. Recalibrate your arms after a big change. 0 = no change."),
+    S_FLOAT("rig_hand_offset_l_up_cm", RigHandOffsetLUpCm, -10.0f, 10.0f,
+            "Left hand position: up / down (cm)", "VR Comfort",
+            "Moves your left hand up (+) or down (-) relative to the controller. 0 = no change."),
+    S_FLOAT("rig_hand_offset_l_right_cm", RigHandOffsetLRightCm, -10.0f, 10.0f,
+            "Left hand position: right / left (cm)", "VR Comfort",
+            "Moves your left hand to the right (+) or left (-) relative to the controller. 0 = no change."),
     S_BOOL("rig_left_arm", RigLeftArm,
            "Rigging: drive the LEFT arm too", "Camera hook",
            "Same solver, mirrored element indices (clavicle 9, upper 12, fore 13, "
@@ -2527,11 +2584,8 @@ const Setting kSettings[] = {
            "independently, because that is a property of how that hand holds its "
            "own controller."),
     S_FLOAT("rig_left_grip_roll_deg", RigLeftGripRollDeg, -180.0f, 180.0f,
-            "Rigging: LEFT hand bone-convention roll", "Camera hook",
-            "The right measured +90. The left is probably -90 by symmetry, but "
-            "probably is what cost several runs today - so it is its own value. If "
-            "the left palm faces the wrong way, this is the dial, and the sign is "
-            "the first thing to try."),
+            "Left hand angle: twist (degrees)", "VR Comfort",
+            "Twists your left hand about your forearm's line. 0 = as the mod draws it."),
     S_BOOL("rig_left_mirror_deviation", RigLeftMirrorDeviation,
            "Rigging: swap ulnar/radial limits for the LEFT wrist", "Camera hook",
            "Ulnar is toward the pinky and radial toward the thumb, so on the left "
@@ -7091,8 +7145,8 @@ ovrFovPort GameEyeFov(Session* s, int idx, const char** srcOut)
     //      draws the held eye with the FRESH eye's projection (dlssflat.cpp AfwRebuildRun, INV-597), so two different
     //      frustums put every rebuilt frame off in zoom - 1.9 % on the Steam Frame (eye0 1.7260 / eye1 1.6938). Mirror-image
     //      headsets compute identical frustums here and are unchanged. Modes 0 / 1 hand over deliberately mirrored frustums
-    //      and are left alone.
-    if (g_symmetricFov >= 2) {
+    //      and are left alone. SymmetricFovMode(): Meta's runtime reads 0 here (FOV-META-OWN-FOV).
+    if (SymmetricFovMode() >= 2) {
         const ovrFovPort o = OwnEyeFov(s, 1 - (idx & 1), nullptr);
         const dlvr::eyefov::Tans own{ f.LeftTan, f.RightTan, f.UpTan, f.DownTan };
         const dlvr::eyefov::Tans oth{ o.LeftTan, o.RightTan, o.UpTan, o.DownTan };
@@ -7244,6 +7298,20 @@ bool EnsureSession(Session* s, ID3D11Device* device)
     sp.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
     XrOk(xrCreateReferenceSpace_(s->session, &sp, &s->viewSpace),
          "xrCreateReferenceSpace(VIEW)");
+
+    // The floor for the holsters' standing / seated posture (trace 20261116_1545_standing_posture): a STAGE space beside appSpace,
+    // only ever LOCATED (appSpace is not touched). VDXR: STAGE = the floor (VirtualDesktop-OpenXR space.cpp:626-635).
+    {
+        XrReferenceSpaceCreateInfo st{ XR_TYPE_REFERENCE_SPACE_CREATE_INFO };
+        st.poseInReferenceSpace = XrIdentity();
+        st.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
+        const XrResult sr = xrCreateReferenceSpace_(s->session, &st, &s->stageSpace);
+        if (XR_FAILED(sr)) { s->stageSpace = XR_NULL_HANDLE; }
+        // [PROBE: POSTURE] gate=none  site=HEADSET  log-only=no
+        LOG("[POSTURE] floor space (STAGE) %s (XrResult %d) - %s", XR_SUCCEEDED(sr) ? "CREATED" : "REFUSED", static_cast<int>(sr),
+            XR_SUCCEEDED(sr) ? "the holsters measure standing / seated from it"
+                             : "no floor: the holsters treat the player as SEATED (the f365b5c0 facing)");
+    }
 
     // Not fatal if this fails - the game still gets a head pose either way,
     // it just means aim redirection has nothing to read from yet.
@@ -7429,6 +7497,28 @@ void LocateViews(Session* s)
             ::dlvr::recentre::HeadPush(s->headRing, static_cast<long long>(s->frameState.predictedDisplayTime),
                                        ::dlvr::recentre::YawDegAboutY(&s->headPose.orientation.x), s->headPose.position.x,
                                        s->headPose.position.y, s->headPose.position.z);
+        }
+        // [PROBE: HIPCAP] gate=diag_hip_capture  site=HEADSET  log-only=yes - the standing recording for the hip-anchor redesign
+        // (holster.cpp HolsterHipCapture, trace 20261116_1400_hipcap_probe). Off = one bool load.
+        if (::dlvr::DiagHipCapture) {
+            const float hcHp[3] = { s->headPose.position.x, s->headPose.position.y, s->headPose.position.z };
+            const float hcHq[4] = { s->headPose.orientation.x, s->headPose.orientation.y, s->headPose.orientation.z,
+                                    s->headPose.orientation.w };
+            const float hcBase[3] = { s->appBasePos.x, s->appBasePos.y, s->appBasePos.z };
+            ::dlvr::HolsterHipCapture(static_cast<long long>(s->frameState.predictedDisplayTime), oriOk && posOk, hcHp, hcHq, hcBase,
+                                      s->appBaseYawDeg);
+        }
+        // The floor (trace 20261116_1545_standing_posture): every 30th locate, where the appSpace origin sits above the STAGE floor.
+        // COST: one xrLocateSpace per 30 locates; nothing without a stage space.
+        if (s->stageSpace != XR_NULL_HANDLE && xrLocateSpace_ && (s->floorTick++ % 30u) == 0u) {
+            XrSpaceLocation fl{ XR_TYPE_SPACE_LOCATION };
+            if (XR_SUCCEEDED(xrLocateSpace_(s->appSpace, s->stageSpace, s->frameState.predictedDisplayTime, &fl)) &&
+                (fl.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0) {
+                s->appFloorY = fl.pose.position.y;
+                s->floorOk = true;
+            } else {
+                s->floorOk = false;
+            }
         }
 
         float dx = s->views[1].pose.position.x - s->views[0].pose.position.x;
@@ -7749,7 +7839,7 @@ static void ApplyRoomscale(Session* s)
         // app = inverse of world = (c x + s z, -s x + c z)
         const float mx = c * wx - sn * wz, mz = sn * wx + c * wz;
         XrVector3f rep = loc.pose.position;
-        NeckPivotCompute(loc.pose, rep, nullptr);
+        NeckPivotNeckPoint(loc.pose, rep);   // INV-740: the whole arc removed - a head turn is not a step
         unsigned menuAge = 0;
         const int ms = ::dlvr::uipin::PublishedMenuState(&menuAge);
         const bool menu = ::dlvr::OverlayVisible() || ::dlvr::CalibScreenActive() || ((ms == 1 || ms == 2) && menuAge <= 250);
@@ -7774,9 +7864,12 @@ static void ApplyRoomscale(Session* s)
                 w.shifted += shM;
             }
         }
+        // INV-740: only the part of the remainder past kCmdDeadZoneM (the residual arc of a head that differs from the shipped n)
+        float cmdX = o.cmdX, cmdZ = o.cmdZ;
+        ::dlvr::roomscale::DeadZoneCommand(cmdX, cmdZ, ::dlvr::roomscale::kCmdDeadZoneM);
         // the command: app -> world (HandWorld's map), as a velocity, capped
-        vx = (c * o.cmdX + sn * o.cmdZ) / kCatchS;
-        vz = (-sn * o.cmdX + c * o.cmdZ) / kCatchS;
+        vx = (c * cmdX + sn * cmdZ) / kCatchS;
+        vz = (-sn * cmdX + c * cmdZ) / kCatchS;
         const float v = std::sqrt(vx * vx + vz * vz);
         if (v > kMaxMps) { vx *= kMaxMps / v; vz *= kMaxMps / v; }
         if (v > 0.0f) { ++w.cmdFrames; w.cmdSum += (v > kMaxMps ? kMaxMps : v); }
@@ -8483,8 +8576,17 @@ OVR_PUBLIC_FUNCTION(ovrResult) ovr_Create(ovrSession* pSession, ovrGraphicsLuid*
             LOG("runtime: %s %u.%u.%u", ip.runtimeName,
                 XR_VERSION_MAJOR(ip.runtimeVersion), XR_VERSION_MINOR(ip.runtimeVersion),
                 XR_VERSION_PATCH(ip.runtimeVersion));
+            // [LOADBEARING: FOV-META-OWN-FOV] the runtime's name decides the symmetric_fov mode used; logged either way.
+            g_runtimeStretchesFov = dlvr::eyefov::RuntimeStretchesToOwnFov(ip.runtimeName);
+            LOG("symmetric_fov: file value %d -> using %d (runtime \"%s\" %s)", g_symmetricFov, SymmetricFovMode(),
+                ip.runtimeName,
+                g_runtimeStretchesFov
+                    ? "= Meta's runtime, which shows the image over its own FOV - the runtime's own frustum is used, not symmetrised"
+                    : "keeps the setting");
         } else {
             LOG("runtime: xrGetInstanceProperties failed");
+            g_runtimeStretchesFov = false;
+            LOG("symmetric_fov: file value %d used as it is - the runtime's name could not be read", g_symmetricFov);
         }
     }
 
@@ -8596,6 +8698,11 @@ OVR_PUBLIC_FUNCTION(void) ovr_Destroy(ovrSession session)
     if (s->viewSpace) {
         xrDestroySpace_(s->viewSpace);
     }
+    if (s->stageSpace) {
+        xrDestroySpace_(s->stageSpace);   // the holsters' floor (trace 20261116_1545_standing_posture)
+        s->stageSpace = XR_NULL_HANDLE;
+        s->floorOk = false;
+    }
     BodyTrackShutdown();   // the body tracker belongs to the session
     if (s->session) {
         xrDestroySession_(s->session);
@@ -8647,7 +8754,7 @@ OVR_PUBLIC_FUNCTION(ovrHmdDesc) ovr_GetHmdDesc(ovrSession session)
             LOG_FIRST(4, "   HmdDesc eye%d FOV (%s): runtime L=%.4f R=%.4f U=%.4f D=%.4f "
                          "-> given L=%.4f R=%.4f U=%.4f D=%.4f (symmetric_fov=%d)",
                       i, src, real.LeftTan, real.RightTan, real.UpTan, real.DownTan,
-                      f.LeftTan, f.RightTan, f.UpTan, f.DownTan, g_symmetricFov);
+                      f.LeftTan, f.RightTan, f.UpTan, f.DownTan, SymmetricFovMode());
             // How much the symmetric superset costs, so the waste is a measured
             // number in the log rather than something to argue about.
             const float wasted = ((f.LeftTan + f.RightTan) * (f.UpTan + f.DownTan)) /
@@ -11258,6 +11365,27 @@ bool GetHeadPose(XrPosef& outPose)
         return false;
     }
     outPose = g_session->headPose;
+    return true;
+}
+bool GetAppBase(float pos[3], float* yawDeg)
+{
+    Guard lk;
+    if (!g_session) {
+        return false;
+    }
+    pos[0] = g_session->appBasePos.x;
+    pos[1] = g_session->appBasePos.y;
+    pos[2] = g_session->appBasePos.z;
+    if (yawDeg) { *yawDeg = g_session->appBaseYawDeg; }
+    return true;
+}
+bool GetEyeAboveFloor(float* metres)
+{
+    Guard lk;
+    if (!g_session || !g_session->floorOk) {
+        return false;
+    }
+    if (metres) { *metres = g_session->headPose.position.y + g_session->appFloorY; }
     return true;
 }
 bool HeadPoseLocatedOnce() { return InterlockedCompareExchange(&g_headLocatedOnce, 0, 0) != 0; }

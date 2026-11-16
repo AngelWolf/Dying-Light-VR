@@ -51,8 +51,10 @@ namespace uipanel {
 // SELECTION WHEELS (plan 2026-10-27-vr-selection-wheels, spec D12 - Jay: "hand over the wheel as I see it"): the game's item
 // wheel as DRAWN on the HUD panel - its centre (the eye image's centre: hud.xui centres the wheels on the canvas, INV-529's UI
 // plane is centred on the eye image) and the panel's right / up / normal (toward the viewer) unit axes, in the layer's appSpace,
-// from the last HUD submit. False = no HUD panel shown within 250 ms. Any thread. COST: one shared SRW lock + a 13-float copy.
-bool WheelFrame(float centre[3], float right[3], float up[3], float normal[3]);
+// from the last HUD submit. extent = the drawn quad's edges measured from the wheel centre along right / up, metres: x lo, x hi,
+// y lo, y hi (while a wheel shows, the quad is the wheel's crop). False = no HUD panel shown within 250 ms. Any thread. COST: one
+// shared SRW lock + a 16-float copy.
+bool WheelFrame(float centre[3], float right[3], float up[3], float normal[3], float extent[4]);
 
 // The frustum the GAME rendered eye `eye` (0 / 1) with - the FOV it echoed in ovrLayerEyeFov at the last submit (ovr2xr.cpp
 // g_lmEye[].game; INV-735: every headset differs, nothing is assumed). False until a submit has described that eye. Any thread

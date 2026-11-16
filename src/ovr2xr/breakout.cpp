@@ -118,6 +118,7 @@ bool g_wasGrabbed = false;
 uintptr_t g_lastEnemy = 0;      // GrabController +144 of the grab in progress - a different enemy = a new grab (breakout::Edges)
 double g_grabStartT = 0.0;
 volatile ULONGLONG g_grabStartMs = 0;   // GetTickCount64 at GRAB START - BreakoutMeleeGateClosed (0 = never stamped)
+volatile int g_gatePhase = -1;           // the grab's phase (GrabController +204) as this tick read it, -1 not grabbed - BreakoutMeleeGateClosed
 int g_lastPhase = -1, g_grabType = -1, g_shoves = 0, g_calls = 0;
 
 double NowS()   // the same clock as looting.cpp / bodygrab.cpp NowS
@@ -239,8 +240,9 @@ const char* KindName(breakout::Kind k)
 bool BreakoutPlayerGrabbed() { return g_grabbed; }
 
 // The swing's hit gate: open for the first kMeleeOpenMs of a grab (an attack as the zombie grabs still counts), closed after (a
-// shove reads as a swing). Both fields are written by BreakoutTick on the game thread - the swing's thread too. COST: two loads.
-bool BreakoutMeleeGateClosed() { return breakout::MeleeGateClosed(g_grabbed, g_grabStartMs, GetTickCount64()); }
+// shove reads as a swing) until the player has won the grab (phase 6-8, Jay 2026-11-16). All three fields are written by
+// BreakoutTick on the game thread - the swing's thread too. COST: three loads.
+bool BreakoutMeleeGateClosed() { return breakout::MeleeGateClosed(g_grabbed, g_grabStartMs, GetTickCount64(), g_gatePhase); }
 
 // scePad poll (~570/s). COST: off = one bool test; on = three OpenXR pose reads (cached by the controller layer) + the detector's
 // two 128-sample windows (a backward scan to the sample 0.1 s old). No game reads.
@@ -352,6 +354,7 @@ void BreakoutTick(void* playerVis)
     }
     g_wasGrabbed = grabbed;
     g_lastEnemy = grabbed ? ea : 0;
+    g_gatePhase = grabbed ? phase : -1;   // before g_grabbed: a reader that sees this tick's grab sees this tick's phase or the last
     g_grabbed = grabbed;
     if (grabbed) { g_lastPhase = phase; }
 

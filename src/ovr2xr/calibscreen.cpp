@@ -252,8 +252,9 @@ bool CalibScreenRender(XrSpace viewSpace, XrSpace appSpace, XrTime time, XrCompo
                 }
                 const float ctl[3] = { gp.position.x, gp.position.y, gp.position.z };
                 const float q[4] = { gp.orientation.x, gp.orientation.y, gp.orientation.z, gp.orientation.w };
-                float T[3], B[9];
-                calibraw::RawT(ctl, headRep, q, grip, side, T);
+                float T[3], B[9], post[9];
+                HandPostForSide(side, post);   // the solve's drawn-hand step-back (trace 20261116_1126) - 0 = right, as `side` here
+                calibraw::RawT(ctl, headRep, q, grip, post, side, T);
                 calibraw::RawHandBasis(q, grip, side, B);
                 // holster_hip_from_calib: the same grip point as the holsters measure it - from the RAW head (loc.pose, not
                 // headRep: holster.cpp uses GetHeadPose's raw position), head yaw removed. COST: one atan2, a sin, a cos.

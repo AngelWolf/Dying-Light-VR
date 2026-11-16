@@ -798,8 +798,154 @@ static void TempleSilentInShoulderZoneWhileTakeLive()
     CHECK(TemplePress(false, false).pressHolster);
 }
 
+// ===== The facing v2 + the hip point (2026-11-16, trace 20261116_1450_hip_anchor_facing_v2) =====
+// Steps v2 for `secs`; the hands are placed by `bodyDeg` (they turn with the body, not the head) at side / drop / fore from the neck.
+static void RunV2(Facing& f, double& t, float secs, float headDeg, float bodyDeg, float side, float drop, float fore,
+                  float pitchDeg = 0.0f)
+{
+    Vec3 l, r;
+    HandsAt(bodyDeg, side, drop, fore, l, r);
+    for (int i = 0; i * kDt < secs; ++i, t += kDt) {
+        FacingStepV2(f, kNeck, l, r, true, true, headDeg * kD2R, pitchDeg * kD2R, false, false, false, t, kDt);
+    }
+}
+
+static void v2_holds_inside_the_band()
+{
+    Facing f; double t = 0.0;
+    RunV2(f, t, 0.5f, 0.0f, 0.0f, 0.2f, -0.30f, -0.10f);
+    RunV2(f, t, 10.0f, 25.0f, 0.0f, 0.2f, -0.30f, -0.10f);          // a 25 deg glance held 10 s
+    CHECK(Near(f.yaw, 0.0f, 1e-4f));
+}
+
+static void v2_head_only_turn_is_not_followed_and_not_clamped()
+{
+    Facing f; double t = 0.0;
+    RunV2(f, t, 0.5f, 0.0f, 0.0f, 0.2f, -0.30f, -0.10f);
+    RunV2(f, t, 5.0f, 60.0f, 0.0f, 0.2f, -0.30f, -0.10f);           // head 60 deg, hands stay with the body
+    CHECK(Near(f.yaw, 0.0f, 1e-4f));
+    RunV2(f, t, 5.0f, 120.0f, 0.0f, 0.2f, -0.30f, -0.10f);          // past v1's 70 deg clamp: still held
+    CHECK(Near(f.yaw, 0.0f, 1e-4f));
+}
+
+static void v2_body_turn_confirmed_by_the_hands_is_followed()
+{
+    Facing f; double t = 0.0;
+    RunV2(f, t, 0.5f, 0.0f, 0.0f, 0.2f, -0.30f, -0.10f);
+    for (int k = 1; k <= 6; ++k) { RunV2(f, t, 0.08f, 10.0f * k, 10.0f * k, 0.2f, -0.30f, -0.10f); }   // the body turns 60
+    RunV2(f, t, 3.0f, 60.0f, 60.0f, 0.2f, -0.30f, -0.10f);
+    CHECK(Near(f.yaw / kD2R, 60.0f, 6.0f));
+}
+
+static void v2_extended_or_looking_down_never_follows()
+{
+    Facing f; double t = 0.0;
+    RunV2(f, t, 0.5f, 0.0f, 0.0f, 0.15f, -0.20f, -0.50f);           // hands out in front (aiming): radius > 0.35 m
+    for (int k = 1; k <= 6; ++k) { RunV2(f, t, 0.08f, 10.0f * k, 10.0f * k, 0.15f, -0.20f, -0.50f); }
+    RunV2(f, t, 3.0f, 60.0f, 60.0f, 0.15f, -0.20f, -0.50f);
+    CHECK(Near(f.yaw, 0.0f, 1e-4f));
+    Facing g; double u = 0.0;
+    RunV2(g, u, 0.5f, 0.0f, 0.0f, 0.2f, -0.30f, -0.10f);
+    for (int k = 1; k <= 6; ++k) { RunV2(g, u, 0.08f, 10.0f * k, 10.0f * k, 0.2f, -0.30f, -0.10f, -50.0f); }
+    RunV2(g, u, 3.0f, 60.0f, 60.0f, 0.2f, -0.30f, -0.10f, -50.0f);  // looking down (pitch -50): held
+    CHECK(Near(g.yaw, 0.0f, 1e-4f));
+}
+
+static void head_pitch_sign()
+{
+    const Q down = AxisAngle(1.0f, 0.0f, 0.0f, -40.0f);   // pitched down about +X
+    CHECK(Near(HeadPitch(down.x, down.y, down.z, down.w) / kD2R, -40.0f, 0.01f));
+}
+
+static Vec3 HipRun(HipPoint& h, float secs, const Vec3& neck)
+{
+    Vec3 a{ 0, 0, 0 };
+    for (int i = 0; i * kDt < secs; ++i) { a = HipStep(h, neck, 0.0f, kDt); }
+    return a;
+}
+
+static void hip_point_upright_is_the_neck()
+{
+    HipPoint h;
+    CHECK(NearV(HipRun(h, 1.0f, kNeck), kNeck));
+}
+
+static void hip_point_lean_holds_the_hips()
+{
+    HipPoint h;
+    HipRun(h, 1.0f, kNeck);
+    const Vec3 lean{ kNeck.x, kNeck.y - 0.09f, kNeck.z - 0.20f };   // 20 cm forward, 9 cm down (HC1's lean)
+    const Vec3 a = HipRun(h, 2.0f, lean);
+    CHECK(std::fabs(a.y - kNeck.y) < 0.05f);                         // the hips barely drop (the neck dropped 9 cm)
+    CHECK(a.z > kNeck.z);                                            // and push back, against the neck (+Z behind)
+}
+
+static void hip_point_squat_drops_and_moves_back()
+{
+    HipPoint h;
+    HipRun(h, 1.0f, kNeck);
+    const Vec3 squat{ kNeck.x, kNeck.y - 0.60f, kNeck.z - 0.15f };
+    const Vec3 a = HipRun(h, 2.0f, squat);
+    CHECK(a.y < kNeck.y - 0.25f && a.y > kNeck.y - 0.45f);           // ~0.6 x the unexplained drop, not the neck's 0.6
+    CHECK(a.z > kNeck.z + 0.10f);                                    // moved back
+}
+
+static void hip_point_sit_recentres_and_step_catches_up()
+{
+    HipPoint h;
+    HipRun(h, 1.0f, kNeck);
+    const Vec3 sit{ kNeck.x, kNeck.y - 0.45f, kNeck.z + 0.28f };     // down, the neck BEHIND the body axis
+    CHECK(NearV(HipRun(h, 1.0f, sit), sit));
+    HipPoint s;
+    HipRun(s, 1.0f, kNeck);
+    const Vec3 step{ kNeck.x, kNeck.y, kNeck.z - 0.60f };           // a real step: same height
+    const Vec3 a = HipRun(s, 2.0f, step);
+    CHECK(std::fabs(a.x - step.x) < 0.01f && std::fabs(a.y - step.y) < 0.01f && std::fabs(a.z - step.z) < 0.01f);
+}
+
+// v2.1 (trace 20261116_1545_standing_posture): a head held past the band with the hands OUT (busy) - followed only when standing.
+static void v21_held_turn_followed_only_standing()
+{
+    for (int standing = 0; standing < 2; ++standing) {
+        Facing f; double t = 0.0;
+        Vec3 l, r;
+        HandsAt(0.0f, 0.15f, -0.20f, -0.60f, l, r);   // hands out in front, 0.62 m: never a hands confirmation
+        for (int i = 0; i * kDt < 0.5f; ++i, t += kDt) {
+            FacingStepV2(f, kNeck, l, r, true, true, 0.0f, 0.0f, false, false, false, t, kDt, standing != 0);
+        }
+        for (int i = 0; i * kDt < 4.0f; ++i, t += kDt) {
+            FacingStepV2(f, kNeck, l, r, true, true, 90.0f * kD2R, 0.0f, false, false, false, t, kDt, standing != 0);
+        }
+        if (standing) { CHECK(Near(f.yaw / kD2R, 90.0f, 6.0f)); } else { CHECK(Near(f.yaw, 0.0f, 1e-4f)); }
+    }
+}
+
+static void v21_posture_hysteresis()
+{
+    Posture p; double t = 0.0;
+    CHECK(!PostureStep(p, true, 1.60f, t)); CHECK(!p.standing);           // not yet: needs 2 s above
+    t = 2.1;  PostureStep(p, true, 1.60f, t); CHECK(p.standing);
+    t = 2.5;  PostureStep(p, true, 1.35f, t); CHECK(p.standing);          // inside the gap: no change
+    t = 3.0;  PostureStep(p, true, 1.00f, t); CHECK(p.standing);          // a crouch starts
+    t = 4.0;  PostureStep(p, true, 1.55f, t); CHECK(p.standing);          // back up within 2 s: still standing
+    t = 5.0;  PostureStep(p, true, 1.10f, t);
+    t = 7.1;  PostureStep(p, true, 1.10f, t); CHECK(!p.standing);         // 2 s below: seated
+    t = 8.0;  PostureStep(p, false, 0.0f, t); CHECK(!p.standing);         // no floor: seated
+}
+
 int main()
 {
+    v21_held_turn_followed_only_standing();
+    v21_posture_hysteresis();
+    v2_holds_inside_the_band();
+    v2_head_only_turn_is_not_followed_and_not_clamped();
+    v2_body_turn_confirmed_by_the_hands_is_followed();
+    v2_extended_or_looking_down_never_follows();
+    head_pitch_sign();
+    hip_point_upright_is_the_neck();
+    hip_point_lean_holds_the_hips();
+    hip_point_squat_drops_and_moves_back();
+    hip_point_sit_recentres_and_step_catches_up();
     belt_centre_lifts_and_moves_forward();
     belt_centre_clamps_to_jays_ranges();
     belt_forward_is_toward_the_face();

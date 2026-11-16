@@ -15,6 +15,15 @@ namespace calibraw {
 // (the right one missed the logged wristBack by a constant 21.70 mm).
 constexpr float kHhAuthored[2][3] = { { 0.09999989f, 3.8146975e-08f, -0.024999849f },
                                       { 0.096248291f, 0.0f, -0.023768237f } };
+// The AUTHORED hand rest local (row-major, axes in the columns), right / left - the [BONEREST] "authored REST LOCAL basis" lines,
+// identical in every archived session (77.0 deg = tilt 13.73 + roll +-75.12, INV-150). For the MAIN MENU calibration only, where no
+// player model exists and boneblend's latch is empty (HandPostForSide). Logged to 4 decimals: < 0.02 mm at the handholder.
+constexpr float kRestAuthored[2][9] = { {  0.9714f,  0.1429f,  0.1895f,
+                                           0.1491f,  0.2539f, -0.9557f,
+                                          -0.1847f,  0.9566f,  0.2253f },
+                                        {  0.9714f, -0.1429f,  0.1895f,
+                                          -0.1491f,  0.2539f,  0.9557f,
+                                          -0.1847f, -0.9566f,  0.2253f } };
 // Build B ruling B1: the stand-in shoulder for the pose CHECK only - Jay's in-game S, mean over 9 calibrations, body frame
 // (fwd, up, out) from headRep. The fit never reads it.
 constexpr float kStandinS[3] = { -0.1302f, -0.2487f, 0.1909f };
@@ -46,11 +55,16 @@ inline void ToBody(const float v[3], int side, float o[3])   // M: tracking -> b
 }
 
 // Body-frame T from tracking-space values. side 0 = R, 1 = L.
-inline void RawT(const float ctl[3], const float headRep[3], const float q[4], const float grip[9], int side, float outT[3])
+// post = the hand's DRAWN turn on top of cq . grip (boneblend HandPostForSide: the authored rest x the hand-angle dials) - the solve's
+// step-back is turned by the drawn hand (trace docs/traces/20261116_1126_wristback_drawn_basis.md), so this must be too. Identity =
+// the previous result.
+inline void RawT(const float ctl[3], const float headRep[3], const float q[4], const float grip[9], const float post[9], int side,
+                 float outT[3])
 {
-    float cq[9], hb[9];
+    float cq[9], hc[9], hb[9];
     QuatMat(q, cq);
-    Mul3(cq, grip, hb);
+    Mul3(cq, grip, hc);
+    Mul3(hc, post, hb);
     const float* t = kHhAuthored[side ? 1 : 0];
     const float wb[3] = { hb[0] * t[0] + hb[1] * t[1] + hb[2] * t[2], hb[3] * t[0] + hb[4] * t[1] + hb[5] * t[2],
                           hb[6] * t[0] + hb[7] * t[1] + hb[8] * t[2] };
