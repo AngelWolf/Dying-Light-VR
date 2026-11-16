@@ -78,7 +78,7 @@
 #include "wristquad.h"   // wrist HUD stage 2: the pieces on quads on the hands (dlvr\wrist_hud.txt)
 #include "uipin.h"
 #include "uipanel.h"
-#include "deskmirror.h"   // the desktop window's picture: view 0's image, one eye (trace 20261114_1030_desktop_mirror_single_eye)
+#include "deskmirror.h"   // the desktop window's picture: view 1's (the right eye's) image, one eye (trace 20261114_1030_desktop_mirror_single_eye)
 #include "loadscreen.h"
 #include "watchwrite.h"   // WatchExecSayOrphans - the U-26 orphan-trap count on the 600-frame line
 #include "settings.h"
@@ -585,7 +585,7 @@ ovrErrorInfo g_lastError{};
 // wrong. Kept configurable for performance tuning, not correctness.
 float g_renderScale = 1.0f;
 int   g_maxDim = 0;   // 0 = no cap; pass the runtime's recommendation through
-// The desktop window shows the left eye (deskmirror.cpp). SHIPS ON since 2026-11-14 - Tier A, Jay: "Done. Ship it on" after RUN DM2
+// The desktop window shows the right eye (deskmirror.cpp kMirrorView; the left eye until 2026-11-16). SHIPS ON since 2026-11-14 - Tier A, Jay: "Done. Ship it on" after RUN DM2
 // (DM1 "That's worked"; Discord share "no issues"). Trace docs/traces/20261114_1115_mirror_ship_on.md.
 bool  g_mirror = true;
 // [DEP: vr_force_vsync_off] required-for=loading the game's VSync OFF in VR: patches the engine's own VSync=2 store (engine+0x2E63F2, inside the Oculus bring-up, INV-379) to 0 from ovr_Initialize, once at launch. Replaces the DXGI Present hook that crashed (INV-378, D-179). Jay 2026-10-03: "We NEED that to be off" / "it DOES AFFECT OTHER MACHINES"  tree=INERT. DEFAULT ON (Jay's requirement). Applies at launch only; the store only runs when the headset bring-up succeeds. WIDENED 2026-10-21 (Jay: "force the framerate cap to be off", "No new key"): the store is now a jmp to a stub that zeroes VSync, MaxFPS, HBAO+, DOF, PCSS and MotionBlur in the parsed video.scr values, and ovr_Create OK patches the engine frame limiter (engine+0x239E00) to ret - spec docs/superpowers/specs/2026-10-21-vr-video-force-design.md.
@@ -1677,7 +1677,7 @@ const Setting kSettings[] = {
     // Desktop mirror (deskmirror.cpp; Jay 2026-11-14: "Add a toggle for the mirror in VR Comfort"; trace 20261114_1110). Live: read
     // every submit. Was group "Timing" (hidden tab in BETA, its text stripped).
     S_BOOL("mirror", g_mirror, "Desktop mirror", "VR Comfort",
-           "Show the left eye's picture - what the headset is given - in the desktop window, cropped to the "
+           "Show the right eye's picture - what the headset is given - in the desktop window, cropped to the "
            "window's shape, refreshed at most 60 times a second. Wrist HUD and other headset add-ons are not "
            "in it. Off: the window only shows a picture behind the mod menu while the menu is open."),
     S_ENUM("calib_posture", dlvr::CalibPosture, "I play (calibration)", "VR Comfort",
@@ -10563,7 +10563,7 @@ ovr_SubmitFrame(ovrSession session, long long frameIndex,
             ::dlvr::loadscreen::NoteEyeChain(e, c->handle, static_cast<int64_t>(ToDxgi(c->desc.Format)));
             // DESKTOP MIRROR, ONE EYE (deskmirror.h; Jay 2026-11-14 "The desktop window should show what the headset sees"; trace
             // docs/traces/20261114_1030_desktop_mirror_single_eye.md). The engine copies the mirror texture into its window after
-            // every submit (INV-379), so this fills it with view 0's image - the texture and rectangle projViews[0] is given below -
+            // every submit (INV-379), so this fills it with view 1's (the right eye's) image - the texture and rectangle projViews[1] is given -
             // cropped to the window's shape. mirror=1: live, at most 60 per second. The overlay still forces a backdrop every 8th
             // submit while the mod menu is open, so the panel (OverlayRenderToMirror, after the layers) has the game behind it.
             // Drawn BEFORE this chain's release below: an image may only be read while it is acquired. The old CopyResource here
@@ -10577,11 +10577,23 @@ ovr_SubmitFrame(ovrSession session, long long frameIndex,
                 }
                 const int why = ::dlvr::deskmirror::Due(g_mirror, backdropDue);
                 if (why != 0) {
-                    ID3D11Texture2D* shown = c->sdMode ? SdShownTexture(c)
-                                                       : ((c->acquired && c->index < c->images.size()) ? c->images[c->index].texture
-                                                                                                         : nullptr);
-                    const int vr[4] = { viewport[src].Pos.x, viewport[src].Pos.y, viewport[src].Size.w, viewport[src].Size.h };
-                    if (::dlvr::deskmirror::Draw(s->device, s->mirrors[0]->tex, shown, ToDxgi(c->desc.Format), vr, src, why)) {
+                    // The view the window shows (deskmirror::kMirrorView = 1, the RIGHT eye; Jay 2026-11-16; trace
+                    // 20261116_1925_desktop_mirror_right_eye): drawn HERE, in view 0's pass, because a shared chain is released
+                    // in this pass below - but from that view's own source, picked exactly as the loop picks src.
+                    int msrc = srcForView[::dlvr::deskmirror::kMirrorView];
+                    if (g_swapEyes) {
+                        msrc = 1 - msrc;
+                    }
+                    SwapChain* mc = SC(colorTex[msrc] ? colorTex[msrc] : colorTex[0]);
+                    if (!mc || mc->handle == XR_NULL_HANDLE) {
+                        mc = c;
+                        msrc = src;
+                    }
+                    ID3D11Texture2D* shown = mc->sdMode ? SdShownTexture(mc)
+                                                        : ((mc->acquired && mc->index < mc->images.size()) ? mc->images[mc->index].texture
+                                                                                                           : nullptr);
+                    const int vr[4] = { viewport[msrc].Pos.x, viewport[msrc].Pos.y, viewport[msrc].Size.w, viewport[msrc].Size.h };
+                    if (::dlvr::deskmirror::Draw(s->device, s->mirrors[0]->tex, shown, ToDxgi(mc->desc.Format), vr, msrc, why)) {
                         mirrorRefreshed = true;
                     }
                 }

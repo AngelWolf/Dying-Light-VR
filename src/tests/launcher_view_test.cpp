@@ -59,6 +59,18 @@ int main()
         CHECK(std::string(InstallButtonLabel(v)) == "Installed");
         v.match = InstallMatch::Modified;
         CHECK(std::string(InstallButtonLabel(v)) == "Repair");
+        v.newerRelease = true;   // 2026-11-16 (a tester's report): a modified install with a newer release updates - Repair would refuse
+        CHECK(std::string(InstallButtonLabel(v)) == "Update");
+        CHECK(OffersUpdate(v));
+        v.newerRelease = false;
+        CHECK(!OffersUpdate(v));
+        v.match = InstallMatch::Exact; v.newerRelease = true;
+        CHECK(OffersUpdate(v));
+        v.match = InstallMatch::None;
+        CHECK(!OffersUpdate(v));
+        v.match = InstallMatch::Foreign;
+        CHECK(!OffersUpdate(v));
+        v.newerRelease = false;
         v.match = InstallMatch::Foreign;
         CHECK(std::string(InstallButtonLabel(v)) == "Uninstall first");
     }

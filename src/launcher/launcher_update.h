@@ -109,6 +109,7 @@ struct UpdateInputs {
     std::vector<std::string> retiredKeys;
     std::set<std::string> presentLower;      // game-folder files, lower-case
     bool flatMode = false;
+    std::vector<std::string> differing;      // MatchInstalled's list: re-copied even when both releases ship the same md5
 };
 
 namespace detail {
@@ -143,10 +144,16 @@ inline std::vector<LAction> PlanUpdate(const UpdateInputs& in)
         const std::string t = detail::Target(f.relPath, in.flatMode);
         if (present(t)) { out.push_back({LAct::Move, t, std::string(kPreviousDir) + f.relPath, "", "", false}); }
     }
+    auto damaged = [&](const std::string& p) {
+        for (const auto& d : in.differing) {
+            if (detail::LowerPath(d) == detail::LowerPath(p)) { return true; }
+        }
+        return false;
+    };
     for (const auto& g : in.to.files) {
         const ManifestEntry* f = detail::FindFile(in.from, g.relPath);
         const std::string t = detail::Target(g.relPath, in.flatMode);
-        if (f && f->md5 == g.md5 && present(t)) { continue; }
+        if (f && f->md5 == g.md5 && present(t) && !damaged(g.relPath)) { continue; }
         if (userMarker(g.relPath) && present(t)) { continue; }
         if (g.dlssOnly && !present(t)) { continue; }   // only where it was (an AMD install has none)
         out.push_back({LAct::Copy, g.relPath, t, g.md5, "", false});

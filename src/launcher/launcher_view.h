@@ -40,12 +40,16 @@ inline std::string ModeLine(const LauncherView& v)
     return Installed(v) ? "The mod is ON (VR)." : "The mod is not installed.";
 }
 
+// A newer release is offered to any launcher install, damaged or not: Update re-copies the damaged files too (PlanUpdate's
+// differing), and Repair only works from the installed release's own files (2026-11-16, a tester: "Repair" dead-ended on 1.01).
+inline bool OffersUpdate(const LauncherView& v) { return Installed(v) && v.newerRelease; }
+
 inline const char* InstallButtonLabel(const LauncherView& v)
 {
     switch (v.match) {
         case InstallMatch::None: return "Install";
         case InstallMatch::Foreign: return "Uninstall first";
-        case InstallMatch::Modified: return "Repair";
+        case InstallMatch::Modified: return v.newerRelease ? "Update" : "Repair";
         case InstallMatch::Exact: break;
     }
     return v.newerRelease ? "Update" : "Installed";

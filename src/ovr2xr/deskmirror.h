@@ -15,6 +15,11 @@
 namespace dlvr {
 namespace deskmirror {
 
+// Which headset view the window shows: 1 = the RIGHT eye (OpenXR PRIMARY_STEREO view 1; Jay 2026-11-16: "change the desktop mirror to
+// the right eye instead"; trace docs/traces/20261116_1925_desktop_mirror_right_eye.md). The submit loop still draws in view 0's pass
+// (before any chain is released) but takes this view's chain, rectangle and game eye; DrawPanel takes this view's half of the panel.
+constexpr int kMirrorView = 1;
+
 // Why a submit draws: 0 = not this submit, 1 = live (mirror on, the 60 per second clock is due), 2 = the overlay's backdrop. Also keeps
 // the 30 s [DESKMIRROR] line. COST: off and the menu shut = not called; else one QueryPerformanceCounter.
 int Due(bool live, bool backdropDue);
