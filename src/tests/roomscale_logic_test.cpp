@@ -98,8 +98,36 @@ static void moved_beyond_offset_is_shifted_out()
     CHECK(Near(o.cmdX, -0.05f) && Near(o.leanM, 0.05f));
 }
 
+// INV-740: the command dead zone.
+static void dead_zone_drops_small_commands()
+{
+    float x = 0.027f, z = -0.036f;                         // |cmd| 0.045, inside the zone
+    DeadZoneCommand(x, z, kCmdDeadZoneM);
+    CHECK(x == 0.0f && z == 0.0f);
+    x = 0.0f; z = 0.049f;
+    DeadZoneCommand(x, z, kCmdDeadZoneM);
+    CHECK(x == 0.0f && z == 0.0f);
+    x = 0.0f; z = 0.0f;
+    DeadZoneCommand(x, z, kCmdDeadZoneM);                  // nothing in, nothing out (no NaN)
+    CHECK(x == 0.0f && z == 0.0f);
+}
+static void dead_zone_shortens_along_itself()
+{
+    float x = 0.18f, z = 0.24f;                            // |cmd| 0.30 -> 0.25, same direction
+    DeadZoneCommand(x, z, kCmdDeadZoneM);
+    CHECK(Near(x, 0.15f) && Near(z, 0.20f));
+    x = -0.30f; z = 0.0f;
+    DeadZoneCommand(x, z, 0.0f);                           // zone 0 = unchanged (the pre-INV-740 command)
+    CHECK(Near(x, -0.30f) && z == 0.0f);
+    x = -0.30f; z = 0.0f;
+    DeadZoneCommand(x, z, -1.0f);                          // a negative zone is taken as 0
+    CHECK(Near(x, -0.30f) && z == 0.0f);
+}
+
 int main()
 {
+    dead_zone_drops_small_commands();
+    dead_zone_shortens_along_itself();
     bleed_moves_toward_origin();
     bleed_never_overshoots();
     bleed_off_at_zero_rate();

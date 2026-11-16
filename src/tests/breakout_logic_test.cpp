@@ -230,19 +230,41 @@ static void melee_gate_opens_for_the_start_of_a_grab()
 {
     using dlvr::breakout::MeleeGateClosed;
     using dlvr::breakout::kMeleeOpenMs;
-    static_assert(kMeleeOpenMs == 400, "the open window is 400 ms (Jay 2026-10-27)");
-    CHECK(!MeleeGateClosed(false, 0, 99999));            // not grabbed: never closed
-    CHECK(!MeleeGateClosed(true, 10000, 10000));         // the grab's first frame: open
-    CHECK(!MeleeGateClosed(true, 10000, 10399));         // just inside the window
-    CHECK(MeleeGateClosed(true, 10000, 10400));          // the window's end: closed
-    CHECK(MeleeGateClosed(true, 10000, 13000));          // the shove's time: closed
-    CHECK(!MeleeGateClosed(true, 0, 5000));              // no start stamp (0): open, never a stale close
-    CHECK(MeleeGateClosed(true, 10000, 9000) == false);  // a clock that reads before the stamp: open
+    static_assert(kMeleeOpenMs == 500, "the open window is 500 ms (Jay 2026-10-27: 400; 2026-11-16: \"Lengthen the window to 500ms\")");
+    CHECK(!MeleeGateClosed(false, 0, 99999, 5));            // not grabbed: never closed
+    CHECK(!MeleeGateClosed(true, 10000, 10000, 5));         // the grab's first frame: open
+    CHECK(!MeleeGateClosed(true, 10000, 10499, 5));         // just inside the window
+    CHECK(MeleeGateClosed(true, 10000, 10500, 5));          // the window's end: closed
+    CHECK(MeleeGateClosed(true, 10000, 13000, 5));          // the shove's time: closed
+    CHECK(!MeleeGateClosed(true, 0, 5000, 5));              // no start stamp (0): open, never a stale close
+    CHECK(MeleeGateClosed(true, 10000, 9000, 5) == false);  // a clock that reads before the stamp: open
+}
+
+// Jay 2026-11-16 ("it just phases through" -> "Do it"): once the player has WON the grab (INV-618: 6 finish_win, 7 fast_finish_win_front,
+// 8 fast_finish_win_break) the gate opens - the game's GRAB END comes 0.70-1.21 s after our escape call (HA1 / HA2, 18 of 18), and 18 of
+// the 35 gated swings in those runs fired in that gap. Every other phase keeps today's rule; 9 (finish_lose) is not a win.
+static void melee_gate_opens_once_the_grab_is_won()
+{
+    using dlvr::breakout::MeleeGateClosed;
+    using dlvr::breakout::WonPhase;
+    CHECK(WonPhase(6) && WonPhase(7) && WonPhase(8));
+    CHECK(!WonPhase(5) && !WonPhase(9) && !WonPhase(10) && !WonPhase(-1) && !WonPhase(0) && !WonPhase(16));
+    for (int ph = 6; ph <= 8; ++ph) {
+        CHECK(!MeleeGateClosed(true, 10000, 10500, ph));    // past the window, won: open
+        CHECK(!MeleeGateClosed(true, 10000, 13000, ph));
+    }
+    const int held[] = { -1, 0, 1, 2, 3, 4, 5, 9, 10, 11, 12, 16 };
+    for (int ph : held) {
+        CHECK(MeleeGateClosed(true, 10000, 13000, ph));     // past the window, not won: closed as before
+        CHECK(!MeleeGateClosed(true, 10000, 10499, ph));    // inside the window: open as before
+    }
+    CHECK(!MeleeGateClosed(false, 10000, 13000, 5));        // not grabbed: open whatever the phase
 }
 
 int main()
 {
     melee_gate_opens_for_the_start_of_a_grab();
+    melee_gate_opens_once_the_grab_is_won();
     push_forward_both_hands_shoves();
     one_hand_never_shoves();
     below_threshold_no_shove();

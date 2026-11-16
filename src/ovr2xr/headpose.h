@@ -15,6 +15,13 @@ bool GetHeadPose(XrPosef& outPose);
 // (NOTE 2026-11-15: GetHeadPose's code returns true once a SESSION exists, before any locate - the pose is then XrIdentity().)
 // True from the first xrLocateViews with both valid bits, for the rest of the launch (B13, trace 20261115_1545).
 bool HeadPoseLocatedOnce();
+// The appSpace base (2026-11-16, trace 20261116_1450_hip_anchor_facing_v2): appSpace = the reference space turned by yawDeg about +Y
+// and moved to pos (ShiftAppSpaceTo / a recentre absorb), so a point p in appSpace is ToWorldYaw(p, yaw) + pos in the reference
+// space. Roomscale moves it every step. False = no session. Any thread; takes the frame Guard like GetHeadPose.
+bool GetAppBase(float pos[3], float* yawDeg);
+// The head's height above the runtime's floor (STAGE), metres (2026-11-16, trace 20261116_1545_standing_posture). False = no floor
+// (no STAGE space, or it has not located yet). Any thread; the frame Guard.
+bool GetEyeAboveFloor(float* metres);
 
 // ===== HEAD-YAW DECOUPLE (docs/SPEC-HEAD-YAW-DECOUPLE-2026-09-26.md, R10) =====
 // When active, ovr_GetTrackingState reports the head to the ENGINE with its yaw

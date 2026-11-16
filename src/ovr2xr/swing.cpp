@@ -5,7 +5,7 @@
 #include "swing.h"
 
 #include "bodygrab.h"       // BodyGrabHandActive - no hit while the right hand holds a body
-#include "breakout.h"       // BreakoutMeleeGateClosed - no hit from 400 ms into a zombie grab (a shove reads as a swing)
+#include "breakout.h"       // BreakoutMeleeGateClosed - no hit from 500 ms into a zombie grab (a shove reads as a swing)
 #include "boneblend.h"
 #include "controllers.h"
 #include "headpose.h"
@@ -2048,7 +2048,7 @@ void DriverFrame(void* self)
     // Body grab (plan 2026-10-23-body-grab Task 4): the right hand holds a body - its weapon is hidden, so the swing's hit is not
     // called (a fast drag reads as a swing). The detector and its FIRE / END lines run as before. COST: one volatile load.
     // Physical breakout (plan 2026-10-24-physical-breakout, Build constants (e)): no hit while a zombie holds the player - a
-    // two-handed shove reads as a swing - but only from 400 ms into the grab (breakout_logic.h MeleeGateClosed; Jay 2026-10-27:
+    // two-handed shove reads as a swing - but only from 500 ms into the grab (breakout_logic.h MeleeGateClosed; Jay 2026-10-27 / 11-16:
     // an attack as the zombie grabs should count, "change the timing on the gate"). breakout_physical=0 -> always false.
     // COST: one volatile load + GetTickCount64.
     const bool grabbing = BodyGrabHandActive(1) || BreakoutMeleeGateClosed();
@@ -2064,7 +2064,7 @@ void DriverFrame(void* self)
         ++s_nHoldOff;
         // [PROBE: SWING] gate=melee_swing_mode  site=HEADSET  log-only=no
         LOG("swing: [SWING] HELD-SWING OFF #%ld - swing #%ld was under way while a body grab (right hand) or a zombie grab past "
-            "its first 400 ms was on, and is still running after it: no hit (B1) until its END", s_nHoldOff, g_totFires);
+            "its first 500 ms was on, and is still running after it: no hit (B1) until its END", s_nHoldOff, g_totFires);
     }
     if (st.ended || holdAllows) { s_holdSaid = false; }
     if (MeleeSwingMode == 2 && !throwMute && !throwableBusy && holdAllows) {   // g_disabled is already refused by SwingUpdateThunk

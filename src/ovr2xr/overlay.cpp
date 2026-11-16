@@ -1858,11 +1858,11 @@ const char* const kSettledKeys[] = {
     "cam_head_pitch_flip", "cam_head_roll_axis", "cam_head_roll_flip", "cam_auto", "cam_derive",
     "cam_write_combined", "cam_combined_pre", "cam_write_view", "cam_matrix_transposed", "cam_delta_deg",
     "cam_delta_axis", "cam_delta_world",
-    // ---- Rigging tab (113) ----
+    // ---- Rigging tab (107; was 113 before the six hand-angle dials moved to VR Comfort 2026-11-16) ----
     "rig_wrist", "rig_yaw_camera_blend", "rig_shoulder_from_eye", "rig_yaw_camera_smooth", "rig_forearm_twist",
-    "rig_wrist_flex_deg", "rig_wrist_ext_deg", "rig_wrist_ulnar_deg", "rig_wrist_radial_deg", "rig_grip_pitch_deg",
-    "rig_grip_yaw_deg", "rig_left_grip_pitch_deg", "rig_left_grip_yaw_deg", "rig_grip_roll_deg", "rig_left_arm",
-    "rig_left_grip_roll_deg", "rig_left_mirror_deviation", "rig_left_wrist_swap_axes", "rig_wrist_swap_axes",
+    // 2026-11-16: the six hand-angle dials moved to VR Comfort > Hands & Arms (trace 20261116_1750_grip_offset_sliders) - not listed here.
+    "rig_wrist_flex_deg", "rig_wrist_ext_deg", "rig_wrist_ulnar_deg", "rig_wrist_radial_deg", "rig_left_arm",
+    "rig_left_mirror_deviation", "rig_left_wrist_swap_axes", "rig_wrist_swap_axes",
     "rig_hand_len", "rig_twist_to_twistbone", "rig_write_at_player_tail", "rig_block_arm_bones",
     "rig_block_keep_visible", "rig_grip_use_baked", "rig_grip_compose_rest", "rig_hand_grip_pose",
     "rig_regrip_button", "rig_suppress_stretch", "rig_shoulder_freeze_dir", "rig_stable_shoulder",
@@ -2399,8 +2399,14 @@ void DrawComfortTab()
     // 2026-11-15, Jay: "I'd like you to put the rigging options in their own dropdown in VR Comfort" -> "Hands & Arms" (trace
     // docs/traces/20261115_1655_comfort_hands_arms_dropdown.md): these rows are drawn in that closed node, not the flat list.
     const auto isRig = [](const Setting& st) {
+        // 2026-11-16, Jay: "put the sliders that the users wanted into the rig settings in VR comfort" -> + the six hand-angle dials
+        // and the six controller grip offsets (trace docs/traces/20261116_1750_grip_offset_sliders.md); drawn in table order.
         static const char* const kRigKeys[] = { "buggy_hand_steer", "rig_cutscene_standdown", "finger_track",
-                                                "rig_two_hand_tune_rz_deg", "comfort_body_follows_head", "calib_posture" };
+                                                "rig_two_hand_tune_rz_deg", "comfort_body_follows_head", "calib_posture",
+                                                "rig_grip_pitch_deg", "rig_grip_yaw_deg", "rig_grip_roll_deg",
+                                                "rig_left_grip_pitch_deg", "rig_left_grip_yaw_deg", "rig_left_grip_roll_deg",
+                                                "rig_hand_offset_r_fwd_cm", "rig_hand_offset_r_up_cm", "rig_hand_offset_r_right_cm",
+                                                "rig_hand_offset_l_fwd_cm", "rig_hand_offset_l_up_cm", "rig_hand_offset_l_right_cm" };
         for (const char* k : kRigKeys) {
             if (strcmp(st.key, k) == 0) { return true; }
         }
@@ -2420,11 +2426,20 @@ void DrawComfortTab()
     }
     ImGui::Spacing();
     if (MenuSection("Hands & Arms", "hands_arms", true)) {   // closed by default, like Hand Steadiness
+        // 2026-11-16, Jay: "I also want those toggles to only show if advanced is on" (trace
+        // docs/traces/20261116_1830_hands_arms_advanced_only.md): the hand angle + hand position rows are drawn only on Advanced.
+        // Hidden rows keep their values, which still act.
+        const auto isHandTune = [](const Setting& st) {
+            return KeyHasPrefix(st.key, "rig_grip_") || KeyHasPrefix(st.key, "rig_left_grip_") ||
+                   KeyHasPrefix(st.key, "rig_hand_offset_");
+        };
+        const bool adv = OverlayAdvanced();
         int count = 0;
         const Setting* all = AllSettings(count);
         for (int i = 0; i < count; ++i) {
             const Setting& st = all[i];
             if (st.locked || TabForSetting(st) != Tab::Comfort || !isRig(st)) { continue; }
+            if (!adv && isHandTune(st)) { continue; }
             DrawOneSetting(st, i);
         }
         ImGui::TreePop();
@@ -2691,8 +2706,8 @@ void DrawButtonRow()
         }
     }
     ImGui::SameLine(0.0f, 20.0f);
-    // Basic / Advanced (overlay_advanced). No row is marked advanced yet, so this changes nothing in the lists until Jay names
-    // the advanced rows.
+    // Basic / Advanced (overlay_advanced). Advanced-only rows: the Wrist HUD section's advanced rows (DrawWristHud) and VR Comfort >
+    // Hands & Arms' hand angle + hand position rows (2026-11-16, trace 20261116_1830_hands_arms_advanced_only).
     {
         bool& adv = OverlayAdvanced();
         if (MenuButton(adv ? "Advanced -###advanced" : "Basic +###advanced", sz,

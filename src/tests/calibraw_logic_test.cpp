@@ -34,11 +34,14 @@ static float Dist(const float a[3], const float b[3])
     return std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
 }
 
+// post = identity: the fixture's solve (before trace 20261116_1126) stepped back with cq . grip alone.
+static const float kI[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+
 static void raw_t_matches_the_solve_on_every_fixture_sample()
 {
     for (const Fix& f : kFix) {
         float t[3];
-        RawT(f.ctl, f.headRep, f.q, f.grip, f.side, t);
+        RawT(f.ctl, f.headRep, f.q, f.grip, kI, f.side, t);
         const float mm = Dist(t, f.expT) * 1000.0f;
         if (mm >= 0.1f) { std::printf("  side %d: %.4f mm off\n", f.side, mm); }
         CHECK(mm < 0.1f);
@@ -49,8 +52,36 @@ static void the_side_matters_deliberate_miss()
     // A RIGHT sample fed as LEFT: the handholder offset and the out-axis sign both change - must be far off.
     const Fix& f = kFix[0];
     float t[3];
-    RawT(f.ctl, f.headRep, f.q, f.grip, 1, t);
+    RawT(f.ctl, f.headRep, f.q, f.grip, kI, 1, t);
     CHECK(Dist(t, f.expT) * 1000.0f > 1.0f);
+}
+// Trace 20261116_1126: with the authored rest as post, T moves by |post t - t| - 0.03955 m right (the archived [ACHIEVED] FIRST USE
+// 0.0395 / 0.0396 m), ~0.0378 m left (scratchpad palm_offset.py) - and identity reproduces the old T exactly.
+static void raw_t_with_the_rest_moves_by_the_drawn_offset()
+{
+    for (const Fix& f : kFix) {
+        float t0[3], t1[3];
+        RawT(f.ctl, f.headRep, f.q, f.grip, kI, f.side, t0);
+        RawT(f.ctl, f.headRep, f.q, f.grip, kRestAuthored[f.side], f.side, t1);
+        const float mm = Dist(t0, t1) * 1000.0f;
+        const float want = f.side ? 37.8f : 39.55f;
+        if (std::fabs(mm - want) >= 0.5f) { std::printf("  side %d: moved %.3f mm, want %.2f\n", f.side, mm, want); }
+        CHECK(std::fabs(mm - want) < 0.5f);
+    }
+}
+static void the_baked_rest_is_a_rotation()
+{
+    for (int s = 0; s < 2; ++s) {
+        const float* m = kRestAuthored[s];
+        for (int c = 0; c < 3; ++c) {
+            const float l = std::sqrt(m[c] * m[c] + m[3 + c] * m[3 + c] + m[6 + c] * m[6 + c]);
+            CHECK(std::fabs(l - 1.0f) < 5e-4f);
+        }
+        const float det = m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) + m[2] * (m[3] * m[7] - m[4] * m[6]);
+        CHECK(std::fabs(det - 1.0f) < 1e-3f);
+    }
+    // the two sides are mirrors (INV-150): same tilt column 0 x, opposite roll
+    CHECK(kRestAuthored[0][0] == kRestAuthored[1][0] && kRestAuthored[0][5] == -kRestAuthored[1][5]);
 }
 static void matches_against_the_standin()
 {
@@ -99,7 +130,7 @@ static void hand_basis_maps_like_raw_t()
     // RawT(ctl = headRep) = -(M . cq . grip . t), so -RawT == RawHandBasis . t.
     const Fix& f = kFix[1];
     float t[3], B[9];
-    RawT(f.headRep, f.headRep, f.q, f.grip, f.side, t);
+    RawT(f.headRep, f.headRep, f.q, f.grip, kI, f.side, t);
     RawHandBasis(f.q, f.grip, f.side, B);
     const float* h = kHhAuthored[f.side];
     const float bt[3] = { B[0] * h[0] + B[1] * h[1] + B[2] * h[2], B[3] * h[0] + B[4] * h[1] + B[5] * h[2],
@@ -116,6 +147,8 @@ int main()
 {
     raw_t_matches_the_solve_on_every_fixture_sample();
     the_side_matters_deliberate_miss();
+    raw_t_with_the_rest_moves_by_the_drawn_offset();
+    the_baked_rest_is_a_rotation();
     matches_against_the_standin();
     forearm_in_hand_is_basis_transpose_times_direction();
     hand_basis_maps_like_raw_t();

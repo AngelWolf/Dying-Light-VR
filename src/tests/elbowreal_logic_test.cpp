@@ -407,8 +407,154 @@ static void neutral_constants_present()
     CHECK(std::fabs(kNeutralDeg[1] - (-12.8f)) < 0.05f);
 }
 
+// The FINAL-ELBOW face limit (Jay 2026-11-16, "Elbow ... in view whilst grabbing holsters" -> "Yes"): TurnAbout + FaceClearTurnDeg.
+static float D3(const float a[3], const float b[3])
+{
+    const float x = a[0] - b[0], y = a[1] - b[1], z = a[2] - b[2];
+    return std::sqrt(x * x + y * y + z * z);
+}
+static void turn_about_keeps_length_and_angle()
+{
+    const float k[3] = { 0.0f, 0.6f, 0.8f };                 // unit
+    const float v[3] = { 0.3f, -0.5f, 0.81f };
+    for (float deg = -180.0f; deg <= 180.0f; deg += 15.0f) {
+        float o[3];
+        TurnAbout(v, k, deg, o);
+        const float lv = std::sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]), lo = std::sqrt(o[0]*o[0] + o[1]*o[1] + o[2]*o[2]);
+        CHECK(std::fabs(lv - lo) < 1e-5f);
+        CHECK(std::fabs((v[0]*k[0] + v[1]*k[1] + v[2]*k[2]) - (o[0]*k[0] + o[1]*k[1] + o[2]*k[2])) < 1e-5f);
+    }
+    float o0[3];
+    TurnAbout(v, k, 0.0f, o0);
+    CHECK(o0[0] == v[0] && o0[1] == v[1] && o0[2] == v[2]);   // 0 = bit-identical
+    const float x[3] = { 1.0f, 0.0f, 0.0f }, z[3] = { 0.0f, 0.0f, 1.0f };
+    float r[3];
+    TurnAbout(x, z, 90.0f, r);                                 // right-handed: x -> y about +z
+    CHECK(std::fabs(r[0]) < 1e-5f && std::fabs(r[1] - 1.0f) < 1e-5f);
+}
+static void face_clear_turn_zero_when_clear()
+{
+    const float S[3] = { 0.2f, 0.0f, 0.0f }, U[3] = { 0.0f, -1.0f, 0.0f }, dir[3] = { 0.0f, 0.0f, -1.0f }, cam[3] = { 0.0f, 0.25f, 0.0f };
+    float d = -1.0f;
+    CHECK(FaceClearTurnDeg(S, U, dir, 0.32f, cam, 0.20f, &d) == 0.0f);   // elbow 0.32 m below the shoulder - far from the camera
+    CHECK(d > 0.20f);
+    CHECK(FaceClearTurnDeg(S, U, dir, 0.32f, cam, 0.0f, &d) == 0.0f);    // limit off
+    const float nanCam[3] = { std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.0f };
+    CHECK(FaceClearTurnDeg(S, U, dir, 0.32f, nanCam, 0.20f, &d) == 0.0f); // not finite: no turn
+}
+static void face_clear_turn_is_smallest_that_clears()
+{
+    // Shoulder S, hand behind / beside the head; the upper arm points up-and-in at the camera: the elbow sits 4 cm from it.
+    const float S[3] = { 0.18f, 0.0f, 0.0f };
+    const float cam[3] = { 0.0f, 0.24f, -0.06f };
+    float dir[3] = { -0.2f, 0.9f, 0.4f };
+    const float dl = std::sqrt(dir[0]*dir[0] + dir[1]*dir[1] + dir[2]*dir[2]);
+    dir[0] /= dl; dir[1] /= dl; dir[2] /= dl;
+    float U[3] = { cam[0] - S[0], cam[1] - S[1], cam[2] - S[2] };
+    const float L1 = 0.30f;
+    const float ul = std::sqrt(U[0]*U[0] + U[1]*U[1] + U[2]*U[2]);
+    U[0] /= ul; U[1] /= ul; U[2] /= ul;
+    const float E0[3] = { S[0] + U[0]*L1, S[1] + U[1]*L1, S[2] + U[2]*L1 };
+    CHECK(D3(E0, cam) < 0.20f);
+    float d = -1.0f;
+    const float turn = FaceClearTurnDeg(S, U, dir, L1, cam, 0.20f, &d);
+    CHECK(turn != 0.0f);
+    float u2[3];
+    TurnAbout(U, dir, turn, u2);
+    const float E1[3] = { S[0] + u2[0]*L1, S[1] + u2[1]*L1, S[2] + u2[2]*L1 };
+    CHECK(D3(E1, cam) >= 0.20f - 1e-4f);
+    CHECK(std::fabs(d - D3(E1, cam)) < 1e-4f);
+    // one degree less (toward 0) does NOT clear - the turn is the smallest one
+    const float less = turn > 0.0f ? turn - 1.0f : turn + 1.0f;
+    float u3[3];
+    TurnAbout(U, dir, less, u3);
+    const float E2[3] = { S[0] + u3[0]*L1, S[1] + u3[1]*L1, S[2] + u3[2]*L1 };
+    CHECK(D3(E2, cam) < 0.20f);
+    // and the same size the other way does not clear further (+ before - at equal size, both checked)
+    CHECK(std::fabs(turn) <= 180.0f);
+}
+static void face_clear_turn_none_clears_takes_farthest()
+{
+    // The camera ON the shoulder-hand line close to S: every elbow on the circle is the same distance - no turn clears.
+    const float S[3] = { 0.0f, 0.0f, 0.0f }, dir[3] = { 0.0f, 1.0f, 0.0f }, U[3] = { 0.6f, 0.8f, 0.0f }, cam[3] = { 0.0f, 0.24f, 0.0f };
+    float d = -1.0f;
+    const float turn = FaceClearTurnDeg(S, U, dir, 0.30f, cam, 0.20f, &d);
+    CHECK(turn == 0.0f);                // all equal: the first (0) is the farthest - no needless turn
+    CHECK(d < 0.20f && d > 0.0f);
+}
+
+// The IN-LIMIT (Jay 2026-11-16: "Just stop the swing in to the torso ... bar two hand grips or the bow"): the elbow no further than
+// kElbowInMaxM inboard of its own shoulder, joined to the face limit in one turn.
+static void in_limit_constant_is_set()
+{
+    CHECK(std::fabs(kElbowInMaxM - 0.10f) < 1e-6f);
+}
+static void in_limit_clears_with_smallest_turn()
+{
+    // Right arm, body right = +x. Hand raised up and slightly in; the elbow swung IN across the chest (out -0.25 m).
+    const float S[3] = { 0.0f, 0.0f, 0.0f }, out[3] = { 1.0f, 0.0f, 0.0f }, cam[3] = { -0.18f, 0.25f, -0.05f };
+    float dir[3] = { -0.1f, 1.0f, -0.2f };
+    const float dl = std::sqrt(dir[0]*dir[0] + dir[1]*dir[1] + dir[2]*dir[2]);
+    dir[0] /= dl; dir[1] /= dl; dir[2] /= dl;
+    float U[3] = { -0.85f, 0.45f, -0.25f };
+    const float ul = std::sqrt(U[0]*U[0] + U[1]*U[1] + U[2]*U[2]);
+    U[0] /= ul; U[1] /= ul; U[2] /= ul;
+    const float L1 = 0.32f;
+    CHECK(U[0] * L1 < -kElbowInMaxM);                          // starts past the limit
+    float fd = -1.0f, ov = 0.0f;
+    const float turn = ElbowClearTurnDeg(S, U, dir, L1, cam, 0.0f, out, -kElbowInMaxM, true, &fd, &ov);
+    CHECK(turn != 0.0f);
+    float u2[3];
+    TurnAbout(U, dir, turn, u2);
+    CHECK(u2[0] * L1 >= -kElbowInMaxM - 1e-4f);
+    CHECK(std::fabs(ov - u2[0] * L1) < 1e-4f);
+    const float less = turn > 0.0f ? turn - 1.0f : turn + 1.0f;
+    float u3[3];
+    TurnAbout(U, dir, less, u3);
+    CHECK(u3[0] * L1 < -kElbowInMaxM);                         // one degree less still fails - the smallest turn
+}
+static void in_limit_off_and_inside_is_zero()
+{
+    const float S[3] = { 0.0f, 0.0f, 0.0f }, out[3] = { 1.0f, 0.0f, 0.0f }, cam[3] = { 0.0f, 0.3f, 0.0f };
+    const float dir[3] = { 0.0f, 0.0f, -1.0f }, U[3] = { 0.6f, -0.8f, 0.0f };   // elbow out and down: inside both
+    float fd = -1.0f, ov = 0.0f;
+    CHECK(ElbowClearTurnDeg(S, U, dir, 0.32f, cam, 0.20f, out, -kElbowInMaxM, true, &fd, &ov) == 0.0f);
+    const float Uin[3] = { -0.9f, -0.43589f, 0.0f };                            // far in, but the in-limit is OFF
+    CHECK(ElbowClearTurnDeg(S, Uin, dir, 0.32f, cam, 0.0f, out, -kElbowInMaxM, false, &fd, &ov) == 0.0f);
+}
+static void both_limits_satisfied_together()
+{
+    // The face limit's case from face_clear_turn_is_smallest_that_clears, with the in-limit on as well: the chosen turn meets BOTH.
+    const float S[3] = { 0.18f, 0.0f, 0.0f }, cam[3] = { 0.0f, 0.24f, -0.06f }, out[3] = { 1.0f, 0.0f, 0.0f };
+    float dir[3] = { -0.2f, 0.9f, 0.4f };
+    const float dl = std::sqrt(dir[0]*dir[0] + dir[1]*dir[1] + dir[2]*dir[2]);
+    dir[0] /= dl; dir[1] /= dl; dir[2] /= dl;
+    float U[3] = { cam[0] - S[0], cam[1] - S[1], cam[2] - S[2] };
+    const float ul = std::sqrt(U[0]*U[0] + U[1]*U[1] + U[2]*U[2]);
+    U[0] /= ul; U[1] /= ul; U[2] /= ul;
+    const float L1 = 0.30f;
+    float fd = -1.0f, ov = 0.0f;
+    const float turn = ElbowClearTurnDeg(S, U, dir, L1, cam, 0.20f, out, -kElbowInMaxM, true, &fd, &ov);
+    float u2[3];
+    TurnAbout(U, dir, turn, u2);
+    const float E[3] = { S[0] + u2[0]*L1, S[1] + u2[1]*L1, S[2] + u2[2]*L1 };
+    CHECK(D3(E, cam) >= 0.20f - 1e-4f);
+    CHECK((E[0] - S[0]) >= -kElbowInMaxM - 1e-4f);
+    // FaceClearTurnDeg = the same search with the in-limit off: unchanged results
+    float fd2 = -1.0f;
+    CHECK(FaceClearTurnDeg(S, U, dir, L1, cam, 0.20f, &fd2) == ElbowClearTurnDeg(S, U, dir, L1, cam, 0.20f, out, 0.0f, false, &fd, &ov));
+}
+
 int main()
 {
+    in_limit_constant_is_set();
+    in_limit_clears_with_smallest_turn();
+    in_limit_off_and_inside_is_zero();
+    both_limits_satisfied_together();
+    turn_about_keeps_length_and_angle();
+    face_clear_turn_zero_when_clear();
+    face_clear_turn_is_smallest_that_clears();
+    face_clear_turn_none_clears_takes_farthest();
     neutral_constants_present();
     nonfinite_input_refuses();
     golden_cases_match();

@@ -111,6 +111,18 @@ struct Facing {
     Vec3   prevL{ 0.0f, 0.0f, 0.0f }, prevR{ 0.0f, 0.0f, 0.0f };
     double prevAtS = -1.0;        // -1 = no speed reading yet
     float  speedL = 1e9f, speedR = 1e9f;   // unknown reads as too fast
+    // FacingStepV2 only (2026-11-16): the follow after a held, hands-confirmed turn, and the hands' snapshot taken while the head was
+    // last inside the dead band.
+    bool   following = false;
+    double outsideSince = -1.0;   // the head beyond the dead band since (-1 = inside)
+    bool   snapOk = false;
+    float  snapHead = 0.0f;
+    float  snapL[3] = {}, snapR[3] = {};   // HandSnapOf: bearing (rad), horizontal radius (m), height above the neck (m)
+    bool   lastConfirmed = false;          // the last step's body-turn confirmation (for the log)
+    // v2.1 (2026-11-16, trace 20261116_1545_standing_posture): the head beyond the band continuously since (whatever the freezes);
+    // standing + held kStandHoldS = a held turn.
+    double farSince = -1.0;
+    bool   lastLongHeld = false;
 };
 // Rest = squared up to the hand line; Drift = toward the head; Frozen = held for a hand in a zone / a placement; Limit = pulled
 // to within kFacingClampR of the head this step.
@@ -223,6 +235,243 @@ inline Vec3 VirtualHead(const Vec3& anchor, float yaw, const Latch& L)
 {
     const Vec3 o = ToWorldYaw(L.eyeFromAnchor, yaw);
     return { anchor.x + o.x, anchor.y + o.y, anchor.z + o.z };
+}
+
+// ===== THE FACING V2 + THE HIP POINT (2026-11-16; trace docs/traces/20261116_1450_hip_anchor_facing_v2.md) =====
+// Jay: "We want them to stay exactly where they are, regardless of lean, crouch, player position" / "bulletproof". Built from RUN HC1
+// (standing, backups/20261116_hipcap_run_hc1) and checked on 38 seated archive sessions + 48 gun sessions, offline (scratchpad hc1/:
+// hc_facing4.py facing_v5, hc_cv.py anchor_v3 - this is a line-for-line port). HC1: today's facing swung 41.7 deg with the body still;
+// v2 0.5 deg; hips within 150 mm of the belt on 48 / 49 grabs leave-one-step-out (today 31 / 49). Every constant below is the replay's.
+
+// The head's pitch, rad, + = looking up (asin of the forward (-Z) vector's height).
+inline float HeadPitch(float qx, float qy, float qz, float qw)
+{
+    float s = 2.0f * (qx * qw - qy * qz);
+    if (s > 1.0f) { s = 1.0f; }
+    if (s < -1.0f) { s = -1.0f; }
+    return std::asin(s);
+}
+
+// A hand seen from the neck, horizontally: [0] bearing (HeadYaw's convention: forward = 0, left +), [1] radius m, [2] height m.
+inline void HandSnapOf(const Vec3& neck, const Vec3& p, float out[3])
+{
+    const float dx = p.x - neck.x, dz = p.z - neck.z;
+    out[0] = std::atan2(-dx, -dz);
+    out[1] = std::sqrt(dx * dx + dz * dz);
+    out[2] = p.y - neck.y;
+}
+
+constexpr float  kBandR         = 30.0f * 0.0174532925f;   // the head moves this far from the facing without moving it
+constexpr double kBandHoldS     = 0.5;                     // ... and must stay beyond it this long before a confirmed turn is followed
+constexpr float  kFollowTauS    = 0.4f;                    // the follow's time constant
+constexpr float  kFollowDoneR   = 5.0f * 0.0174532925f;    // the follow ends this close to the head
+constexpr float  kPitchFreezeR  = 35.0f * 0.0174532925f;   // a head pitched below -this holds the facing (looking at the body)
+constexpr float  kConfirmShare  = 0.5f;                    // each hand turned round the neck by >= this x the head's turn
+constexpr float  kConfirmRigidM = 0.05f;                   // ... keeping its horizontal radius and height within this
+constexpr float  kConfirmAgreeR = 15.0f * 0.0174532925f;   // ... the two hands' turns within this of each other
+constexpr float  kConfirmMaxM   = 0.35f;                   // ... both hands within this of the neck (an extended, aiming arm never counts)
+constexpr float  kConfirmMinM   = 0.08f;                   // a hand nearer than this to the neck axis has no usable bearing
+
+// One step of the v2 facing. zoneFreeze = FreezeFacing(...) (a hand at the shoulder / exactly one hip); otherFreeze = a placement in
+// progress. Inside the band the facing holds; a head held beyond it for kBandHoldS is followed ONLY if both hands confirm a body turn
+// (a confirmed turn also lifts the zone freeze); a head pitched below -kPitchFreezeR holds it; the standing rest square-up is v1's;
+// there is no 70 deg clamp. Returns Rest / Drift (= following) / Frozen (= held).
+// v2.1 (RUN HA1, standing + roomscale: 13 turns made with the hands busy were never confirmed, 91 s with the zones behind the
+// player): STANDING, a head held beyond the band for kStandHoldS counts as a body turn with no hands needed. Seated it does not
+// (offline: 15 of 38 seated sessions would follow long glances). HA1 replay: 91 -> 9 s stuck.
+constexpr double kStandHoldS = 1.5;
+
+inline FacingWhy FacingStepV2(Facing& f, const Vec3& neck, const Vec3& l, const Vec3& r, bool lOk, bool rOk, float headYaw,
+                              float headPitch, bool zoneFreeze, bool otherFreeze, bool squeezed, double nowS, float dtS,
+                              bool standing = false)
+{
+    if (!f.have) {
+        f.have = true;
+        f.yaw = headYaw;
+        f.steadyRef = headYaw;
+        f.steadySince = nowS;
+    }
+    // the hands' speeds (v1's rule, for the rest square-up)
+    if (!lOk || !rOk) {
+        f.prevAtS = -1.0;
+        f.speedL = f.speedR = 1e9f;
+    } else if (f.prevAtS < 0.0) {
+        f.prevL = l; f.prevR = r; f.prevAtS = nowS;
+    } else if (nowS - f.prevAtS >= kSpeedWindowS) {
+        const float inv = static_cast<float>(1.0 / (nowS - f.prevAtS));
+        const float lx = l.x - f.prevL.x, ly = l.y - f.prevL.y, lz = l.z - f.prevL.z;
+        const float rx = r.x - f.prevR.x, ry = r.y - f.prevR.y, rz = r.z - f.prevR.z;
+        f.speedL = std::sqrt(lx * lx + ly * ly + lz * lz) * inv;
+        f.speedR = std::sqrt(rx * rx + ry * ry + rz * rz) * inv;
+        f.prevL = l; f.prevR = r; f.prevAtS = nowS;
+    }
+    const float off = std::fabs(WrapPi(headYaw - f.yaw));
+    float sl[3] = {}, sr[3] = {};
+    bool handsOk = lOk && rOk;
+    if (handsOk) {
+        HandSnapOf(neck, l, sl);
+        HandSnapOf(neck, r, sr);
+        handsOk = sl[1] > kConfirmMinM && sr[1] > kConfirmMinM;
+    }
+    if (off <= kBandR && handsOk) {
+        f.snapOk = true;
+        f.snapHead = headYaw;
+        for (int i = 0; i < 3; ++i) { f.snapL[i] = sl[i]; f.snapR[i] = sr[i]; }
+    }
+    bool confirmed = false;
+    if (f.snapOk && handsOk && off > kBandR) {
+        const float dh = WrapPi(headYaw - f.snapHead);
+        if (std::fabs(dh) > 1e-3f) {
+            const float dl = WrapPi(sl[0] - f.snapL[0]);
+            const float dr = WrapPi(sr[0] - f.snapR[0]);
+            confirmed = dl / dh >= kConfirmShare && dr / dh >= kConfirmShare;
+            if (confirmed) {
+                confirmed = sl[1] <= kConfirmMaxM && sr[1] <= kConfirmMaxM && f.snapL[1] <= kConfirmMaxM && f.snapR[1] <= kConfirmMaxM;
+            }
+            if (confirmed) {
+                confirmed = std::fabs(sl[1] - f.snapL[1]) <= kConfirmRigidM && std::fabs(sr[1] - f.snapR[1]) <= kConfirmRigidM &&
+                            std::fabs(sl[2] - f.snapL[2]) <= kConfirmRigidM && std::fabs(sr[2] - f.snapR[2]) <= kConfirmRigidM &&
+                            std::fabs(WrapPi(dl - dr)) <= kConfirmAgreeR;
+            }
+        }
+    }
+    f.lastConfirmed = confirmed;
+    if (off > kBandR) {
+        if (f.farSince < 0.0) { f.farSince = nowS; }
+    } else {
+        f.farSince = -1.0;
+    }
+    const bool longHeld = standing && f.farSince >= 0.0 && nowS - f.farSince >= kStandHoldS;
+    f.lastLongHeld = longHeld;
+    const bool rest = lOk && rOk && !squeezed && f.speedL <= kRestMaxSpeed && f.speedR <= kRestMaxSpeed &&
+                      RestPose(neck, headYaw, l, r);
+    if (!rest) { f.restSince = -1.0; } else if (f.restSince < 0.0) { f.restSince = nowS; }
+
+    const bool freeze = otherFreeze || headPitch < -kPitchFreezeR || (zoneFreeze && !(confirmed || longHeld));
+    FacingWhy why = FacingWhy::Frozen;
+    if (!freeze) {
+        const float dt = dtS > 0.0f ? dtS : 0.0f;
+        if (rest && nowS - f.restSince >= kRestHoldS) {
+            const float a = 1.0f - std::exp(-dt / kRestTauS);
+            f.yaw = WrapPi(f.yaw + a * WrapPi(HandLineYaw(l, r) - f.yaw));
+            why = FacingWhy::Rest;
+        } else if (f.following) {
+            const float a = 1.0f - std::exp(-dt / kFollowTauS);
+            f.yaw = WrapPi(f.yaw + a * WrapPi(headYaw - f.yaw));
+            why = FacingWhy::Drift;
+            if (off < kFollowDoneR) { f.following = false; f.outsideSince = -1.0; }
+        } else if (off > kBandR) {
+            if (f.outsideSince < 0.0) { f.outsideSince = nowS; }
+            if (nowS - f.outsideSince >= kBandHoldS && (confirmed || longHeld)) { f.following = true; }
+        } else {
+            f.outsideSince = -1.0;
+        }
+    }
+    if (std::fabs(WrapPi(f.yaw - f.steadyRef)) > kSteadyR) {
+        f.steadyRef = f.yaw;
+        f.steadySince = nowS;
+    }
+    return why;
+}
+
+// THE POSTURE (v2.1): STANDING once the eye has been above kStandEyeM for kPostureHoldS; SEATED once below kSeatEyeM for kPostureHoldS
+// (the gap and the hold stop it flickering; a crouch only switches the held turn off while it lasts). No floor -> SEATED (the safe
+// side: exactly the f365b5c0 facing). Eye height above the runtime's STAGE floor, metres.
+constexpr float  kStandEyeM    = 1.38f;
+constexpr float  kSeatEyeM     = 1.33f;
+constexpr double kPostureHoldS = 2.0;
+
+struct Posture {
+    bool   standing = false;
+    double aboveSince = -1.0, belowSince = -1.0;
+};
+
+// One step; returns true when the posture changed this step.
+inline bool PostureStep(Posture& p, bool floorOk, float eyeAboveFloorM, double nowS)
+{
+    const bool was = p.standing;
+    if (!floorOk) {
+        p.standing = false;
+        p.aboveSince = p.belowSince = -1.0;
+        return was;
+    }
+    if (eyeAboveFloorM > kStandEyeM) {
+        if (p.aboveSince < 0.0) { p.aboveSince = nowS; }
+        if (nowS - p.aboveSince >= kPostureHoldS) { p.standing = true; }
+    } else {
+        p.aboveSince = -1.0;
+    }
+    if (eyeAboveFloorM < kSeatEyeM) {
+        if (p.belowSince < 0.0) { p.belowSince = nowS; }
+        if (nowS - p.belowSince >= kPostureHoldS) { p.standing = false; }
+    } else {
+        p.belowSince = -1.0;
+    }
+    return p.standing != was;
+}
+
+// THE HIP POINT. RUN HC1 (feet still): a lean leaves the belt ~room-fixed and pushed slightly AGAINST the neck; a squat drops it ~0.6 x
+// the neck's drop and moves it back; sitting moves it with the neck, the neck ending BEHIND the body axis (a squat puts it ahead).
+// In the REFERENCE frame (appSpace shifts undone - holster.cpp passes the neck and the facing through GetAppBase):
+//   P   = the body axis (x/z): follows the neck (tau kHipCatchTauS) while the neck has not dropped more than kHipDipTolM below the
+//         standing reference, holds while it has, and is dragged when the neck is further than kHipDragM from it;
+//   ref = the standing neck height: rises with the neck at once; a drop past kHipSitDropM with the neck more than kHipSitBehindM
+//         BEHIND P = sat down -> ref and P move to the neck;
+//   resid = the drop a straight-torso lean of the neck's offset from P does not explain (a squat);
+//   anchor = the hips raised by kHipTorsoM = (P - counter-balance + squat back-shift, ref - kHipSquatDrop x resid) - which IS the neck
+//   point whenever the player stands upright with P caught up, so every stored hip centre keeps its meaning.
+constexpr float kHipCatchTauS   = 0.25f;
+constexpr float kHipDipTolM     = 0.04f;
+constexpr float kHipDragM       = 0.35f;
+constexpr float kHipSitDropM    = 0.15f;
+constexpr float kHipSitBehindM  = 0.10f;
+constexpr float kHipTorsoM      = 0.50f;   // HC1: neck -> belt 0.499 m upright (the rod in the lean's dip)
+constexpr float kHipSquatDrop   = 0.6f;
+constexpr float kHipSquatBack   = 0.2f;
+constexpr float kHipCounterFwd  = 0.55f;
+constexpr float kHipCounterSide = 0.75f;
+
+struct HipPoint {
+    bool  have = false;
+    float px = 0.0f, pz = 0.0f;   // the body axis, reference frame
+    float ref = 0.0f;             // the standing neck height, reference frame
+};
+
+inline Vec3 HipStep(HipPoint& h, const Vec3& neck, float facingYaw, float dtS)
+{
+    if (!h.have) {
+        h.have = true;
+        h.px = neck.x; h.pz = neck.z; h.ref = neck.y;
+    }
+    if (neck.y > h.ref) { h.ref = neck.y; }
+    const float dt = dtS > 0.0f ? dtS : 0.0f;
+    if (h.ref - neck.y <= kHipDipTolM && dt > 0.0f) {
+        const float a = 1.0f - std::exp(-dt / kHipCatchTauS);
+        h.px += (neck.x - h.px) * a;
+        h.pz += (neck.z - h.pz) * a;
+    }
+    {
+        const float ex = neck.x - h.px, ez = neck.z - h.pz;
+        const float d = std::sqrt(ex * ex + ez * ez);
+        if (d > kHipDragM) {
+            const float k = (d - kHipDragM) / d;
+            h.px += ex * k;
+            h.pz += ez * k;
+        }
+    }
+    Vec3 lb = LocalOffsetYaw({ h.px, 0.0f, h.pz }, facingYaw, neck);   // the neck in the body frame: x right, z behind
+    if (h.ref - neck.y > kHipSitDropM && lb.z > kHipSitBehindM) {
+        h.ref = neck.y;
+        h.px = neck.x; h.pz = neck.z;
+        lb = { 0.0f, 0.0f, 0.0f };
+    }
+    const float d = std::sqrt(lb.x * lb.x + lb.z * lb.z);
+    const float dc = d < 0.95f * kHipTorsoM ? d : 0.95f * kHipTorsoM;
+    const float dip = kHipTorsoM - std::sqrt(kHipTorsoM * kHipTorsoM - dc * dc);
+    float resid = (h.ref - neck.y) - dip;
+    if (resid < 0.0f) { resid = 0.0f; }
+    const Vec3 hw = ToWorldYaw({ -kHipCounterSide * lb.x, 0.0f, -kHipCounterFwd * lb.z + kHipSquatBack * resid }, facingYaw);
+    return { h.px + hw.x, h.ref - kHipSquatDrop * resid, h.pz + hw.z };
 }
 
 // Hip yield (spec 2026-10-26-roomscale-physical-crouch-design §2.4): a press starting in a hip zone with a body / severed limb under

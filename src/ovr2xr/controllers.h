@@ -106,6 +106,12 @@ extern bool DiagCtlInput;               // diag_ctl_input - the 2 s per-hand con
 bool GetControllerPoseMelee(Hand hand, XrPosef& outPose);
 bool GetControllerGripPoseMelee(Hand hand, XrPosef& outPose);
 extern int  ComfortMeleeSteady;         // comfort_melee_steady 0-100
+// The controller grip offset (rig_hand_offset_{r,l}_{fwd,up,right}_cm, -10..10, default 0; trace 20261116_1750_grip_offset_sliders):
+// every grip / aim getter above returns the SHIFTED position. RigHandOffsetLocalM = the offset in the grip frame (m; x right, y up,
+// z = -forward) for anything placed IN the raw grip space (wristquad's quads); false = all zero.
+extern float RigHandOffsetRFwdCm, RigHandOffsetRUpCm, RigHandOffsetRRightCm;
+extern float RigHandOffsetLFwdCm, RigHandOffsetLUpCm, RigHandOffsetLRightCm;
+bool RigHandOffsetLocalM(Hand hand, float out[3]);
 
 // Analog trigger pull, 0..1. False (outValue untouched) if the action isn't
 // active for this hand - e.g. no controller bound yet. Backed by the same

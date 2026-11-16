@@ -14,6 +14,7 @@
 #include "../common/log.h"
 #include "aimhook.h"      // FireAimFromBarrel - gates PublishBarrelBore
 #include "armfit.h"       // ArmFitWanted / ArmFitNote - the arm calibration (SPEC-ARM-FIT stage 1)
+#include "calibraw_logic.h"   // kRestAuthored - HandPostForSide's main-menu rest (trace 20261116_1126)
 #include "bodygrab.h"     // BodyGrabTick - grab bodies by hand, driven from HookTail (plan 2026-10-23-body-grab Task 3)
 #include "camogesture.h"  // CamoGestureTick - the camouflage gesture, right after BodyGrabTick (plan 2026-11-07-camouflage-gesture)
 #include "dlgview.h"      // DlgViewLookVtable - the scene stand-down's dialogue test (rig_cutscene_standdown, trace 20261115_1640)
@@ -348,6 +349,8 @@ float RigElbowOutDeg = 9.45f;
 //      20 cm, wrist cost nil. Does NOT act where mode 2 does not: mode 1 fallbacks (pinned / left bow / short arm / no forearm-in-
 //      hand) and the bow steer while the string is grabbed. (RigElbowFaceMinCm) tree=INERT below mode 2. HEADSET. Tier C - Jay
 //      2026-11-08 "ON (20 / 60)" as the compiled default, NOT verified then; Tier A since RUN EZ1 (Jay: "verified"). Read every solve - live.
+//      SECOND SITE (Jay 2026-11-16 "Yes"): SolveArmIk also applies it to the FINAL elbow on every mode-2 path - the short-arm / upper-
+//      arm hold and the mode-1 fallbacks included, not the bow-from-hand steer - by turning U about the shoulder-hand line ([ELBOWFACE]).
 float RigElbowFaceMinCm = 20.0f;
 // [DEP: rig_elbow_swing_max_deg] required-for=rig_elbow_pole_mode=2 - THE ELBOW ZONE, swing part (Jay 2026-11-08: "the elbow to
 //      flip or swing"). Mode 2's swivel may sit at most this far (degrees about the shoulder-wrist line) from its lifted target
@@ -9857,6 +9860,64 @@ void GunHandPublish(uintptr_t item, int holderId, const char* cls, const float* 
     InterlockedIncrement(&g_ghSeq);   // even: done
 }
 
+// ===== The HANDGAP probe - the drawn palm vs the controller's grip point (trace docs/traces/20261116_1245_handgap_probe.md) =====
+// [PROBE: HANDGAP] gate=the rig solving with a hand (the three master enables + a grip; no setting)  site=HEADSET  log-only=yes
+// Per solve with a hand: |achievedGrip - (controller grip point)|, where achievedGrip = the solve's drawn wrist + its drawn hand basis x
+// the authored handholder offset (the FK of what it writes - not the engine's cached world) and the controller grip point = T + wristBack
+// as T was built. Classed by what holds the hand: PIN (two-hand / bow / rack lock / buggy), MOVED (T shifted after it was built: hand
+// collision, the solid gun), REACH (the arm short of T), CLIPPED (the wrist clamp clipped this solve), else FREE - which the wristBack
+// fix (trace 20261116_1126) says reads ~0. Any solve thread: one SRW lock; each line is formatted under it and logged after release.
+enum { kHgFree = 0, kHgClipped, kHgReach, kHgMoved, kHgPin, kHgN };
+const char* const kHgName[kHgN] = { "FREE", "CLIPPED", "REACH", "MOVED", "PIN" };
+struct HgSide { bool said; ULONGLONG win; long n[kHgN]; double sum[kHgN]; float mx[kHgN]; long bucket[4]; };
+SRWLOCK g_hgLock = SRWLOCK_INIT;
+HgSide  g_hg[2] = {};
+long    g_hgLines = 0;
+constexpr long kHgMaxLines = 2000;   // INV-9: a cap with its own CAP line
+void HandGapNote(int side, float gapM, int why)
+{
+    if (side < 0 || side > 1 || why < 0 || why >= kHgN || !std::isfinite(gapM)) { return; }
+    const ULONGLONG now = GetTickCount64();
+    char first[256] = {}, line[640] = {};
+    AcquireSRWLockExclusive(&g_hgLock);
+    HgSide& h = g_hg[side];
+    if (!h.said) {
+        h.said = true;
+        h.win = now;
+        _snprintf_s(first, sizeof(first), _TRUNCATE, "boneblend: [HANDGAP %s] FIRST SAMPLE (logged unconditionally): the drawn palm "
+                    "%.1f mm from the controller's grip point, class %s | rig_weapon_pos_slew_max %.2f (0 = the drawn wrist unfiltered).",
+                    side ? "L" : "R", 1000.0 * gapM, kHgName[why], static_cast<double>(RigWeaponPosSlewMax));
+    }
+    ++h.n[why];
+    h.sum[why] += gapM;
+    if (gapM > h.mx[why]) { h.mx[why] = gapM; }
+    if (why == kHgFree) { ++h.bucket[gapM < 0.001f ? 0 : gapM < 0.005f ? 1 : gapM < 0.020f ? 2 : 3]; }
+    if (now - h.win >= 5000) {
+        if (g_hgLines < kHgMaxLines) {
+            int k = _snprintf_s(line, sizeof(line), _TRUNCATE, "boneblend: [HANDGAP %s] 5 s - drawn palm vs controller grip, mm (n / mean / "
+                                "max):", side ? "L" : "R");
+            for (int c = 0; c < kHgN && k > 0; ++c) {
+                const int w = _snprintf_s(line + k, sizeof(line) - k, _TRUNCATE, " %s %ld / %.1f / %.1f%s", kHgName[c], h.n[c],
+                                          h.n[c] ? 1000.0 * h.sum[c] / h.n[c] : 0.0, 1000.0 * h.mx[c], c + 1 < kHgN ? " |" : "");
+                if (w > 0) { k += w; }
+            }
+            if (k > 0) {
+                _snprintf_s(line + k, sizeof(line) - k, _TRUNCATE, " || FREE < 1 mm %ld, 1-5 %ld, 5-20 %ld, > 20 %ld.", h.bucket[0],
+                            h.bucket[1], h.bucket[2], h.bucket[3]);
+            }
+        } else if (g_hgLines == kHgMaxLines) {
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "boneblend: [HANDGAP] CAP - %ld lines logged; no more this session.", kHgMaxLines);
+        }
+        ++g_hgLines;
+        for (int c = 0; c < kHgN; ++c) { h.n[c] = 0; h.sum[c] = 0.0; h.mx[c] = 0.0f; }
+        for (long& b : h.bucket) { b = 0; }
+        h.win = now;
+    }
+    ReleaseSRWLockExclusive(&g_hgLock);
+    if (first[0]) { LOG("%s", first); }
+    if (line[0]) { LOG("%s", line); }
+}
+
 }  // namespace
 
 bool SolveArmIk(const ArmSide& side)
@@ -11206,16 +11267,32 @@ bool SolveArmIk(const ArmSide& side)
         // hw is the hand's world 3x3 with basis vectors in the COLUMNS, so this is
         // hw * t, written out.
         const int wbSide = side.isLeft ? 1 : 0;
+        // [LOADBEARING: wristBack drawn basis] (trace docs/traces/20261116_1126_wristback_drawn_basis.md; Jay 2026-11-16 "Yes"): the
+        // step-back is turned by the hand as DRAWN - hw x post, post = the authored rest (rig_grip_compose_rest) x CorrectHandLocal -
+        // exactly as the draw composes it (the hLocal x g_handRestLocal + CorrectHandLocal lines before g_driven[dBase+3]), so the DRAWN
+        // handholder (the palm's grip point) lands on the controller's grip point. With hw alone the drawn palm sat |post t - t| off it:
+        // 0.0395 / 0.0396 m in every archived [ACHIEVED] FIRST USE line (20 sessions, INV-164 correction), up to ~9 cm with the hand-angle
+        // dials. hw, handBasisW and handAxis are unchanged (the elbow, the published grip rotation, the hand collision's tip direction).
+        // T + wristBack is still the controller grip. D-347 made the same change for the buggy wheel pin. HandPostForSide builds the same
+        // post for the calibration screen. COST: one 3x3 copy + CorrectHandLocal + one Mat3Mul per solve.
+        float wbPost[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+        if (RigGripComposeRest && g_haveHandRest[wbSide]) {
+            for (int i = 0; i < 9; ++i) { wbPost[i] = g_handRestLocal[wbSide][i]; }
+        }
+        CorrectHandLocal(wbPost, gripRoll, side.isLeft ? RigLeftGripPitchDeg : RigGripPitchDeg,
+                         side.isLeft ? RigLeftGripYawDeg : RigGripYawDeg);
+        float hd[9];
+        Mat3Mul(hw, wbPost, hd);
         if (RigWristBackFromAsset && g_haveHandHolder[wbSide]) {
             const float* const t = g_handHolderLocal[wbSide];
             const float tx = t[3], ty = t[7], tz = t[11];
-            wristBack[0] = hw[0]*tx + hw[1]*ty + hw[2]*tz;
-            wristBack[1] = hw[3]*tx + hw[4]*ty + hw[5]*tz;
-            wristBack[2] = hw[6]*tx + hw[7]*ty + hw[8]*tz;
+            wristBack[0] = hd[0]*tx + hd[1]*ty + hd[2]*tz;
+            wristBack[1] = hd[3]*tx + hd[4]*ty + hd[5]*tz;
+            wristBack[2] = hd[6]*tx + hd[7]*ty + hd[8]*tz;
         } else {
-            wristBack[0] = hw[0] * RigHandLen;
-            wristBack[1] = hw[3] * RigHandLen;
-            wristBack[2] = hw[6] * RigHandLen;
+            wristBack[0] = hd[0] * RigHandLen;
+            wristBack[1] = hd[3] * RigHandLen;
+            wristBack[2] = hd[6] * RigHandLen;
         }
         // Same column, kept for the elbow. The bone-convention roll is applied
         // later and turns the matrix about this very axis, so it cannot change it.
@@ -11452,6 +11529,11 @@ bool SolveArmIk(const ArmSide& side)
         anchor[1] + oy                     - wristBack[1],
         anchor[2] + (-ox * sby + oz * cby) - wristBack[2],
     };
+    // The HANDGAP probe (trace docs/traces/20261116_1245_handgap_probe.md): the controller's grip point and T as built, before any pin / stop /
+    // reach moves T, and this solve's own wrist-clamp verdict (set after ClampWristSwing). Read-only; read by HandGapNote below.
+    const float hgCtl[3] = { T[0] + wristBack[0], T[1] + wristBack[1], T[2] + wristBack[2] };
+    const float hgT0[3] = { T[0], T[1], T[2] };
+    bool hgClipped = false;
     // [LOADBEARING: holster body-lock] docs/superpowers/specs/2026-10-20-holster-body-lock-design.md: the hip zones hang off the
     // `pelvis` bone. Its world position is carried into TRACKING space with the exact inverse of the map T was just built with
     // (same anchor, same headRep, same cby / sby), and published for holster.cpp. Read-only: no bone is written. Right side only.
@@ -14289,6 +14371,87 @@ bool SolveArmIk(const ArmSide& side)
     } else {
         s_uaHave[0] = s_uaHave[1] = false;
     }
+    // [LOADBEARING: rig_elbow_face_min_cm] THE FINAL-ELBOW FACE LIMIT (Jay 2026-11-16: "Elbow ... in view whilst grabbing holsters" ->
+    // "Yes"; trace docs/traces/20261116_1800_elbow_face_final.md). SolveSwivel's face limit is faded out by the short-arm hold (erWt,
+    // above) and absent from mode 1's fallbacks (STATE 2026-11-08 (4) "NOT COVERED"), so a hand parked at the shoulder (a held weapon
+    // wheel) kept the elbow wherever it came in. Here, on the elbow about to be placed: if S + U*armU is nearer the camera (eye, this
+    // solve's element 8, the zone's own camera) than rig_elbow_face_min_cm, U AND the roll normal turn about dir by the smallest angle
+    // that clears it - the hand, the reachable wrist and the arm triangle stay (every point on the S-T line keeps its distance). Mode 2
+    // only, as the zone; not while the bow-from-hand steer holds the drawing elbow (D-212's nock lock - as 11-08 left it).
+    // COST: mode 2 + face on - one distance per arm solve; on a solve whose elbow is within the limit, <= 361 turned points.
+    {
+        static LONG64 s_efEval[2] = {}, s_efAct[2] = {}, s_efNoClear[2] = {}, s_efHeldAct[2] = {};
+        static ULONGLONG s_efLastMs[2] = { 0, 0 };
+        static volatile LONG s_efFirst[2] = {}, s_efNoCam[2] = {};
+        // + THE IN-LIMIT (Jay 2026-11-16: "Just stop the swing in to the torso ... bar two hand grips or the bow"; trace
+        // docs/traces/20261116_1745_elbow_in_limit.md): the elbow no further than elbowreal::kElbowInMaxM inboard of its own shoulder,
+        // sideways in the body-facing frame (uaBR). Off while a two-hand grip holds (TwoHandGripping), a bow is held (ScLeftIsBow), the
+        // reload rack lock holds the left hand on the gun (ReloadLockOn), and - with the face limit - for the bow-from-hand steer.
+        // One turn about dir meets both limits (elbowreal::ElbowClearTurnDeg).
+        const bool efInOn = !TwoHandGripping() && !ScLeftIsBow() && !ReloadLockOn();
+        const bool efFaceOn = RigElbowFaceMinCm > 0.0f;
+        if (RigElbowPoleMode == 2 && !bfApplied && (efFaceOn || efInOn)) {
+            const float efCam[3] = { eye[3], eye[7], eye[11] };
+            const float efMin = efFaceOn ? RigElbowFaceMinCm * 0.01f : 0.0f;
+            const float efSo = side.isLeft ? -1.0f : 1.0f;
+            const float efOutAx[3] = { uaBR[0]*efSo, 0.0f, uaBR[2]*efSo };
+            const float efInMin = -elbowreal::kElbowInMaxM;
+            const bool efCamOk = Finite3(efCam);
+            if (efFaceOn && !efCamOk && !InterlockedExchange(&s_efNoCam[aidx], 1)) {
+                // [PROBE: ELBOWFACE] gate=rig_elbow_face_min_cm  site=HEADSET  log-only=no (the feature's own status)
+                LOG("boneblend: [ELBOWFACE %s] FACE LIMIT NOT ACTING (said once) - the camera (element 8's world this solve) is not "
+                    "finite; the in-limit still acts.", side.isLeft ? "L" : "R");
+            }
+            const float efFaceUse = efCamOk ? efMin : 0.0f;
+            // before the turn: the elbow's camera distance and own-side out, for the lines
+            const float e0[3] = { U[0]*armU, U[1]*armU, U[2]*armU };
+            const float efOut0 = e0[0]*efOutAx[0] + e0[2]*efOutAx[2];
+            const float efD0 = efCamOk ? VecLen(S[0] + e0[0] - efCam[0], S[1] + e0[1] - efCam[1], S[2] + e0[2] - efCam[2]) : -1.0f;
+            float efD = -1.0f, efOut = 0.0f;
+            const float efTurn = elbowreal::ElbowClearTurnDeg(S, U, dir, armU, efCam, efFaceUse, efOutAx, efInMin, efInOn, &efD, &efOut);
+            if (efTurn != 0.0f) {
+                float u2[3], a2[3];
+                elbowreal::TurnAbout(U, dir, efTurn, u2);
+                elbowreal::TurnAbout(axis, dir, efTurn, a2);
+                for (int c = 0; c < 3; ++c) { U[c] = u2[c]; axis[c] = a2[c]; }
+            }
+            ++s_efEval[aidx];
+            const bool efActed = efTurn != 0.0f;
+            const bool efFaceShort = efFaceUse > 0.0f && efD >= 0.0f && efD < efFaceUse;
+            const bool efInShort = efInOn && efOut < efInMin;
+            const bool efNoClear = efFaceShort || efInShort;
+            if (efActed) { ++s_efAct[aidx]; if (uaHeld || epShortW > 0.5f) { ++s_efHeldAct[aidx]; } }
+            if (efNoClear) { ++s_efNoClear[aidx]; }
+            const char* efWhy = (efFaceUse > 0.0f && efD0 >= 0.0f && efD0 < efFaceUse) ? ((efInOn && efOut0 < efInMin) ? "face + in" : "face")
+                                                                                    : ((efInOn && efOut0 < efInMin) ? "in" : "-");
+            if (!InterlockedExchange(&s_efFirst[aidx], 1)) {
+                // [PROBE: ELBOWFACE] gate=rig_elbow_face_min_cm  site=HEADSET  log-only=no (the feature's own status)
+                LOG("boneblend: [ELBOWFACE %s] FIRST EVALUATION (logged unconditionally) - the FINAL-elbow limits: face %.2f m (%s), in %.2f m "
+                    "inboard of the shoulder (%s) | this solve: elbow %.3f m from the camera, %+.3f m own-side out from the shoulder, turned "
+                    "%.0f deg -> %.3f m / %+.3f m | short-arm hold weight %.2f, upper-arm hold %s",
+                    side.isLeft ? "L" : "R", static_cast<double>(efMin), efFaceOn ? (efCamOk ? "on" : "NO CAMERA") : "off",
+                    static_cast<double>(elbowreal::kElbowInMaxM), efInOn ? "on" : "off (two-hand grip / bow / rack lock)",
+                    static_cast<double>(efD0), static_cast<double>(efOut0), static_cast<double>(efTurn), static_cast<double>(efD),
+                    static_cast<double>(efOut), static_cast<double>(epShortW), uaHeld ? "ON" : "off");
+            }
+            if (efActed || efNoClear) {
+                const ULONGLONG efNow = GetTickCount64();
+                if (efNow - s_efLastMs[aidx] >= 2000) {
+                    s_efLastMs[aidx] = efNow;
+                    // [PROBE: ELBOWFACE] gate=rig_elbow_face_min_cm  site=HEADSET  log-only=no (event line, at most one per 2 s per arm)
+                    LOG("boneblend: [ELBOWFACE %s] ACTED (%s) - the elbow was %.3f m from the camera and %+.3f m own-side out from the shoulder "
+                        "(limits: face %.2f, in -%.2f): turned %.0f deg about the shoulder-hand line -> %.3f m / %+.3f m%s | short-arm hold "
+                        "weight %.2f, upper-arm hold %s, |T - S| %.3f m | session: solves %lld, acted %lld (with a hold on %lld), no clear "
+                        "turn %lld",
+                        side.isLeft ? "L" : "R", efWhy, static_cast<double>(efD0), static_cast<double>(efOut0), static_cast<double>(efFaceUse),
+                        static_cast<double>(elbowreal::kElbowInMaxM), static_cast<double>(efTurn), static_cast<double>(efD),
+                        static_cast<double>(efOut), efNoClear ? " (NO turn clears both - the least shortfall taken)" : "",
+                        static_cast<double>(epShortW), uaHeld ? "ON" : "off", static_cast<double>(d), s_efEval[aidx], s_efAct[aidx],
+                        s_efHeldAct[aidx], s_efNoClear[aidx]);
+                }
+            }
+        }
+    }
     // Elbow, then the forearm direction that reaches the target from it.
     const float E[3] = { S[0] + U[0]*armU,   // rig_arm_fit: armU (= rig_upper_arm_len when off)
                          S[1] + U[1]*armU,
@@ -15165,6 +15328,7 @@ bool SolveArmIk(const ArmSide& side)
             const LONG64 twOv0 = g_wristOverflowUsed, twCl0 = g_wristClamped;
             float twExcess[4];   // INV-502 (b): how far past the overflowed limit the solve asked, per limit
             ClampWristSwing(swing, hLocal, &flexDeg, &devDeg, swapAxes, mirrorDev, twExcess, TwoHandWristOverflow());
+            hgClipped = twExcess[0] > 0.0f || twExcess[1] > 0.0f || twExcess[2] > 0.0f || twExcess[3] > 0.0f;   // HANDGAP probe: this call's own
             TwoHandNoteWrist(side.isLeft, g_wristOverflowUsed != twOv0, g_wristClamped != twCl0, twExcess);
 
             // Split the pronation between the forearm bone and the rig's own
@@ -15450,6 +15614,17 @@ bool SolveArmIk(const ArmSide& side)
                     achievedGrip[1] += drawnW[3]*tx + drawnW[4]*ty + drawnW[5]*tz;
                     achievedGrip[2] += drawnW[6]*tx + drawnW[7]*ty + drawnW[8]*tz;
                     haveAchieved = true;
+                }
+                // The HANDGAP probe (trace 20261116_1245): the drawn palm's grip point vs the controller's, classed by what holds the hand.
+                // COST: one VecLen + two squared distances + one SRW acquire per solve with a hand.
+                if (haveAchieved) {
+                    const float d1[3] = { T[0] - hgT0[0], T[1] - hgT0[1], T[2] - hgT0[2] };
+                    const float d2[3] = { T[0] - achievedWrist[0], T[1] - achievedWrist[1], T[2] - achievedWrist[2] };
+                    const int why = (pinned || bowPinT > 0.0f || rlPinT > 0.0f || bgPinned) ? kHgPin
+                                  : (d1[0]*d1[0] + d1[1]*d1[1] + d1[2]*d1[2] > 1e-6f) ? kHgMoved
+                                  : (d2[0]*d2[0] + d2[1]*d2[1] + d2[2]*d2[2] > 1e-6f) ? kHgReach
+                                  : hgClipped ? kHgClipped : kHgFree;
+                    HandGapNote(agSide, VecLen(achievedGrip[0] - hgCtl[0], achievedGrip[1] - hgCtl[1], achievedGrip[2] - hgCtl[2]), why);
                 }
                 // [PROBE: BUGGY] gate=buggy_hand_steer  site=HEADSET  log-only=yes
                 // RUN BK10 (Jay: "Yes, add it"): where the DRAWN palm's grip centre landed vs the wheel pin - buggywheel logs it once per
@@ -44531,6 +44706,23 @@ bool CalibGripEmptyHand(int side, float out[9])
         for (int i = 0; i < 9; ++i) { out[i] = g[i]; }
     }
     return true;
+}
+
+// [LOADBEARING: wristBack drawn basis] the calibration screen's copy of the solve's step-back turn (trace 20261116_1126): the same post
+// SolveArmIk builds before wristBack - the latched authored rest when rig_grip_compose_rest is on (else identity), then CorrectHandLocal
+// with this side's dials. The rest's latch is empty in the MAIN MENU (no player model): the baked authored rest stands in
+// (calibraw::kRestAuthored). g_handRestLocal is written once before g_haveHandRest is set (InterlockedExchange), so a reader that tests
+// the flag first sees a whole matrix. Any thread. COST: a 9-float copy + CorrectHandLocal.
+void HandPostForSide(int side, float post[9])
+{
+    const int s = side ? 1 : 0;
+    for (int i = 0; i < 9; ++i) { post[i] = (i % 4 == 0) ? 1.0f : 0.0f; }
+    if (RigGripComposeRest) {
+        const float* r = g_haveHandRest[s] ? g_handRestLocal[s] : ::dlvr::calibraw::kRestAuthored[s];
+        for (int i = 0; i < 9; ++i) { post[i] = r[i]; }
+    }
+    CorrectHandLocal(post, s ? RigLeftGripRollDeg : RigGripRollDeg, s ? RigLeftGripPitchDeg : RigGripPitchDeg,
+                     s ? RigLeftGripYawDeg : RigGripYawDeg);
 }
 
 uintptr_t RigGamePlayerObject(int* why)

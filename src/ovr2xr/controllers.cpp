@@ -38,6 +38,30 @@ int  ComfortHandSteadyResponse = 75;   // DEFAULT 75 2026-10-01 (Tier D: Jay's l
 //      the swing DETECTOR still reads raw. 0 = OFF (the melee copy IS the raw pose). tree=LOADBEARING while > 0 and melee
 //      is held. DEFAULT 15. Independent of comfort_hand_steady.
 int  ComfortMeleeSteady = 10;   // DEFAULT 10 2026-10-01 (Tier D: Jay's live tuning; steady::kMeleeDefaultStrength 15 is the unit-test reference)
+// [DEP: rig_hand_offset_r_fwd_cm] [DEP: rig_hand_offset_r_up_cm] [DEP: rig_hand_offset_r_right_cm] [DEP: rig_hand_offset_l_fwd_cm]
+// [DEP: rig_hand_offset_l_up_cm] [DEP: rig_hand_offset_l_right_cm] required-for=the controller grip offset (RigHandOffsetRFwdCm ..
+//      RigHandOffsetLRightCm), Jay 2026-11-16 (testers: "a grip offset slider would be very helpful"; "Move the controller"). Per hand,
+//      in the GRIP frame: right = grip +X (the player's right on both hands, INV-727), up = +Y, forward = -Z (INV-627). ControllersLocate
+//      adds the world delta to the RAW grip AND aim positions before the steadiness filters, so every getter reader sees the shifted
+//      point; wristquad adds the grip-local offset to quads it submits in the raw grip space. Trace
+//      docs/traces/20261116_1750_grip_offset_sliders.md. tree=FEATURE. 0 = the branch is skipped (poses exactly as the runtime's).
+//      DEFAULT 0 (Tier D: per-player tuning).
+float RigHandOffsetRFwdCm   = 0.0f;
+float RigHandOffsetRUpCm    = 0.0f;
+float RigHandOffsetRRightCm = 0.0f;
+float RigHandOffsetLFwdCm   = 0.0f;
+float RigHandOffsetLUpCm    = 0.0f;
+float RigHandOffsetLRightCm = 0.0f;
+
+// The grip-local offset in metres (x = right, y = up, z = -forward: the grip frame's own axes). False when it is all zero.
+bool RigHandOffsetLocalM(Hand hand, float out[3])
+{
+    const bool l = hand == kLeftHand;
+    out[0] = 0.01f * (l ? RigHandOffsetLRightCm : RigHandOffsetRRightCm);
+    out[1] = 0.01f * (l ? RigHandOffsetLUpCm : RigHandOffsetRUpCm);
+    out[2] = -0.01f * (l ? RigHandOffsetLFwdCm : RigHandOffsetRFwdCm);
+    return out[0] != 0.0f || out[1] != 0.0f || out[2] != 0.0f;
+}
 // [DEP: diag_steady] required-for=[STEADY] per-second windows per hand (DiagSteady) - raw vs steadied frame-to-frame
 //      change of the GRIP pose's forward axis on STILL frames, and the worst raw-to-steady angle (the lag).
 //      tree=PROBE-ONLY. Log-only; the window's sums are a few adds per frame, the LOG once a second. The [STEADY]
@@ -1410,6 +1434,17 @@ void SteadyReport()
 
 }  // namespace
 
+// v' = q v q* (unit quaternion): t = 2 (q.xyz x v); v' = v + w t + q.xyz x t.
+static void RotateByQuat(const XrQuaternionf& q, const float v[3], float out[3])
+{
+    const float tx = 2.0f * (q.y * v[2] - q.z * v[1]);
+    const float ty = 2.0f * (q.z * v[0] - q.x * v[2]);
+    const float tz = 2.0f * (q.x * v[1] - q.y * v[0]);
+    out[0] = v[0] + q.w * tx + (q.y * tz - q.z * ty);
+    out[1] = v[1] + q.w * ty + (q.z * tx - q.x * tz);
+    out[2] = v[2] + q.w * tz + (q.x * ty - q.y * tx);
+}
+
 void ControllersLocate(XrTime predictedDisplayTime, XrSpace appSpace)
 {
     if (appSpace == XR_NULL_HANDLE || !predictedDisplayTime) {
@@ -1428,9 +1463,27 @@ void ControllersLocate(XrTime predictedDisplayTime, XrSpace appSpace)
     const steady::Params steadyK = steady::FromSliders(ComfortHandSteadyStrength, ComfortHandSteadyResponse);
     const steady::Params meleeK = steady::MeleeFromSlider(ComfortMeleeSteady);
     const bool meleeOn = ComfortMeleeSteady > 0;
+    bool gripSeen = false;   // any grip located valid in this call - the HANDOFFSET line waits for one
     for (int h = 0; h < 2; ++h) {
         if (g_handSpace[h] == XR_NULL_HANDLE) {
             continue;
+        }
+        // The grip is located FIRST (same display time, same app space) so the hand offset's world delta - the grip-frame
+        // offset turned by THIS locate's grip orientation - can shift the aim pose too (trace 20261116_1750_grip_offset_sliders).
+        // Publishing order and every skip below are as before: a failed aim locate still skips the grip's publish.
+        XrSpaceLocation gloc{ XR_TYPE_SPACE_LOCATION };
+        const bool gripLocated = g_gripSpace[h] != XR_NULL_HANDLE &&
+                                 XR_SUCCEEDED(xrLocateSpace_(g_gripSpace[h], appSpace, predictedDisplayTime, &gloc));
+        // The hand offset: the shifted controller point every grip / aim getter returns. 0 = skipped (exact).
+        // COST: per hand with a non-zero offset, one quaternion rotate + 6 adds.
+        float hoD[3] = { 0.0f, 0.0f, 0.0f };
+        bool hoShift = false;
+        if (gripLocated && (gloc.locationFlags & kNeeded) == kNeeded) {
+            float off[3];
+            if (RigHandOffsetLocalM(static_cast<Hand>(h), off)) {
+                RotateByQuat(gloc.pose.orientation, off, hoD);
+                hoShift = true;
+            }
         }
         XrSpaceLocation loc{ XR_TYPE_SPACE_LOCATION };
         if (XR_FAILED(xrLocateSpace_(g_handSpace[h], appSpace, predictedDisplayTime, &loc))) {
@@ -1439,6 +1492,11 @@ void ControllersLocate(XrTime predictedDisplayTime, XrSpace appSpace)
         InterlockedIncrement64(&g_poseFrames[h]);
         InterlockedExchange(&g_aimFlags[h], static_cast<LONG>(loc.locationFlags));
         if ((loc.locationFlags & kNeeded) == kNeeded) {
+            if (hoShift) {
+                loc.pose.position.x += hoD[0];
+                loc.pose.position.y += hoD[1];
+                loc.pose.position.z += hoD[2];
+            }
             const XrPosef aimSteady = SteadyStep(g_steadyAim[h], loc.pose, steadyDt, steadyK, ComfortHandSteady);
             const XrPosef aimMelee = SteadyStep(g_meleeAim[h], loc.pose, steadyDt, meleeK, meleeOn);
             InterlockedIncrement(&g_poseSeq[h]);   // odd: write in progress
@@ -1474,12 +1532,17 @@ void ControllersLocate(XrTime predictedDisplayTime, XrSpace appSpace)
         if (g_gripSpace[h] == XR_NULL_HANDLE) {
             continue;
         }
-        XrSpaceLocation gloc{ XR_TYPE_SPACE_LOCATION };
-        if (XR_FAILED(xrLocateSpace_(g_gripSpace[h], appSpace, predictedDisplayTime, &gloc))) {
+        if (!gripLocated) {   // located above, before the aim block
             continue;
         }
         InterlockedExchange(&g_gripFlags[h], static_cast<LONG>(gloc.locationFlags));
         if ((gloc.locationFlags & kNeeded) == kNeeded) {
+            gripSeen = true;
+            if (hoShift) {
+                gloc.pose.position.x += hoD[0];
+                gloc.pose.position.y += hoD[1];
+                gloc.pose.position.z += hoD[2];
+            }
             const XrPosef gripSteady = SteadyStep(g_steadyGrip[h], gloc.pose, steadyDt, steadyK, ComfortHandSteady);
             const XrPosef gripMelee = SteadyStep(g_meleeGrip[h], gloc.pose, steadyDt, meleeK, meleeOn);
             InterlockedIncrement(&g_gripSeq[h]);   // odd: write in progress
@@ -1510,6 +1573,27 @@ void ControllersLocate(XrTime predictedDisplayTime, XrSpace appSpace)
             g_steadyGrip[h].Reset();
             g_meleeGrip[h].Reset();
             InterlockedIncrement64(&g_gripMissRun[h]);
+        }
+    }
+    // The HANDOFFSET line: logged unconditionally at the first located grip, then when a value changes (at most once a second; a value
+    // changed inside that second is logged by the next call after it). COST: a 6-float compare per call.
+    if (gripSeen) {
+        static bool      s_hoSaid = false;
+        static float     s_hoLast[6] = { 0, 0, 0, 0, 0, 0 };
+        static ULONGLONG s_hoMs = 0;
+        const float cur[6] = { RigHandOffsetRFwdCm, RigHandOffsetRUpCm, RigHandOffsetRRightCm,
+                               RigHandOffsetLFwdCm, RigHandOffsetLUpCm, RigHandOffsetLRightCm };
+        const bool changed = !s_hoSaid || memcmp(cur, s_hoLast, sizeof(cur)) != 0;
+        const ULONGLONG nowMs = GetTickCount64();
+        if (changed && (!s_hoSaid || nowMs - s_hoMs >= 1000)) {
+            // [PROBE: HANDOFFSET] gate=none (always)  site=HEADSET  log-only=yes
+            LOG("controllers: [HANDOFFSET] %s - controller grip offset (cm, grip frame) RIGHT fwd %+.1f up %+.1f right %+.1f | "
+                "LEFT fwd %+.1f up %+.1f right %+.1f | applied to the raw grip + aim positions before steadiness (0 = not applied)",
+                s_hoSaid ? "CHANGED" : "FIRST (logged unconditionally)", static_cast<double>(cur[0]), static_cast<double>(cur[1]),
+                static_cast<double>(cur[2]), static_cast<double>(cur[3]), static_cast<double>(cur[4]), static_cast<double>(cur[5]));
+            memcpy(s_hoLast, cur, sizeof(cur));
+            s_hoSaid = true;
+            s_hoMs = nowMs;
         }
     }
     SteadyReport();

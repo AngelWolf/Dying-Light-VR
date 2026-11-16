@@ -107,6 +107,10 @@ void RackGrabRadius()
     CHECK(RackGrabFor(Family::Smg, 0.08f) == 0.08f);
     CHECK(RackGrabFor(Family::Smg, 0.05f) == 0.05f);
     CHECK(RackGrabFor(Family::None, 0.08f) == 0.08f);
+    // trace 20261116_1126 (Jay: "Widen it"): the drawn palm now on the controller - +0.04 on the mag / rack / crossbow grabs
+    CHECK(Near(kGrabWidenM, 0.04f, 1e-6f));
+    CHECK(Near(kXbowRackGrabM + kGrabWidenM, 0.14f, 1e-6f));
+    CHECK(Near(RackGrabFor(Family::Pistol, 0.08f) + kGrabWidenM, 0.16f, 1e-6f));
 }
 
 void SmgRackPullScalesWithTheKey()

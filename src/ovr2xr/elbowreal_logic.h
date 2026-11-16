@@ -488,5 +488,96 @@ inline float FadeStep(float w, bool on, float dt, float seconds)
     return w;
 }
 
+// ===== THE FINAL-ELBOW FACE LIMIT (Jay 2026-11-16: "Elbow ... in view whilst grabbing holsters" -> "Yes"; trace
+// docs/traces/20261116_1800_elbow_face_final.md). SolveSwivel's face limit (INV-708) is faded out by the short-arm hold and absent from
+// the mode-1 fallbacks (STATE 2026-11-08 (4) "NOT COVERED"); SolveArmIk applies this to the elbow it is about to place, on every path.
+// v turned by deg about the UNIT axis k (Rodrigues, right-handed). deg 0 returns v bit-identical.
+inline void TurnAbout(const float v[3], const float k[3], float deg, float out[3])
+{
+    if (deg == 0.0f) { out[0] = v[0]; out[1] = v[1]; out[2] = v[2]; return; }
+    const double a = static_cast<double>(deg) * (3.14159265358979323846 / 180.0);
+    const double c = std::cos(a), s = std::sin(a);
+    const double kv = static_cast<double>(k[0])*v[0] + static_cast<double>(k[1])*v[1] + static_cast<double>(k[2])*v[2];
+    const double cx = static_cast<double>(k[1])*v[2] - static_cast<double>(k[2])*v[1];
+    const double cy = static_cast<double>(k[2])*v[0] - static_cast<double>(k[0])*v[2];
+    const double cz = static_cast<double>(k[0])*v[1] - static_cast<double>(k[1])*v[0];
+    out[0] = static_cast<float>(v[0]*c + cx*s + k[0]*kv*(1.0 - c));
+    out[1] = static_cast<float>(v[1]*c + cy*s + k[1]*kv*(1.0 - c));
+    out[2] = static_cast<float>(v[2]*c + cz*s + k[2]*kv*(1.0 - c));
+}
+
+// THE IN-LIMIT (Jay 2026-11-16: "Just stop the swing in to the torso. No ones going to intentionally try touch their elbows together, so
+// the elbow doesn't need to go that far in bar two hand grips or the bow"; trace docs/traces/20261116_1745_elbow_in_limit.md): the elbow
+// sits no further than this inboard of its OWN shoulder, sideways in the body frame. 0.10 m = Claude's pick (the shoulder is ~0.17-0.20 m
+// off the midline in the arm captures), not a measured preference - one constant.
+constexpr float kElbowInMaxM = 0.10f;
+
+// The smallest turn (degrees, 1-degree steps out to +-180, + before - at equal size) of the upper-arm direction U about the shoulder-hand
+// line dir (unit) that puts the elbow E = S + U*L1 inside BOTH optional limits: |E - cam| >= faceMinM (on when faceMinM > 0) and
+// outAxis . (E - S) >= outMinM (on when haveOut; outAxis = the arm's own-side out, unit). 0 when it already is inside, when neither limit
+// is on, or when an input is not finite. When no turn clears both, the turn of the least total shortfall (strictly less than no turn -
+// an all-equal circle keeps 0). *faceDistOut = that elbow's camera distance (-1 when the face limit is off / not evaluated); *outOut =
+// its outAxis . (E - S). COST: one evaluation when inside; at most 361 turned points when not.
+inline float ElbowClearTurnDeg(const float S[3], const float U[3], const float dir[3], float L1, const float cam[3], float faceMinM,
+                               const float outAxis[3], float outMinM, bool haveOut, float* faceDistOut, float* outOut)
+{
+    if (faceDistOut) { *faceDistOut = -1.0f; }
+    if (outOut) { *outOut = 0.0f; }
+    const bool faceOn = faceMinM > 0.0f && std::isfinite(faceMinM);
+    const bool outOn = haveOut && std::isfinite(outMinM);
+    if (!faceOn && !outOn) { return 0.0f; }
+    for (int i = 0; i < 3; ++i) {
+        if (!std::isfinite(S[i]) || !std::isfinite(U[i]) || !std::isfinite(dir[i])) { return 0.0f; }
+        if (faceOn && !std::isfinite(cam[i])) { return 0.0f; }
+        if (outOn && !std::isfinite(outAxis[i])) { return 0.0f; }
+    }
+    if (!(L1 > 0.0f) || !std::isfinite(L1)) { return 0.0f; }
+    struct Ev { double short_, face, out; };
+    auto at = [&](float deg) {
+        float u[3];
+        TurnAbout(U, dir, deg, u);
+        const double e[3] = { static_cast<double>(u[0])*L1, static_cast<double>(u[1])*L1, static_cast<double>(u[2])*L1 };   // E - S
+        Ev r{ 0.0, -1.0, 0.0 };
+        if (faceOn) {
+            const double ex = S[0] + e[0] - cam[0], ey = S[1] + e[1] - cam[1], ez = S[2] + e[2] - cam[2];
+            r.face = std::sqrt(ex*ex + ey*ey + ez*ez);
+            if (r.face < faceMinM) { r.short_ += static_cast<double>(faceMinM) - r.face; }
+        }
+        r.out = e[0]*outAxis[0] + e[1]*outAxis[1] + e[2]*outAxis[2];
+        if (outOn && r.out < outMinM) { r.short_ += static_cast<double>(outMinM) - r.out; }
+        return r;
+    };
+    auto put = [&](const Ev& r) {
+        if (faceDistOut) { *faceDistOut = faceOn ? static_cast<float>(r.face) : -1.0f; }
+        if (outOut) { *outOut = static_cast<float>(r.out); }
+    };
+    const Ev e0 = at(0.0f);
+    put(e0);
+    if (e0.short_ <= 0.0) { return 0.0f; }
+    float bestDeg = 0.0f;
+    Ev best = e0;
+    for (int k = 1; k <= 180; ++k) {
+        for (int sg = 0; sg < 2; ++sg) {
+            const float deg = sg == 0 ? static_cast<float>(k) : -static_cast<float>(k);
+            if (k == 180 && sg == 1) { continue; }   // +180 and -180 are the same turn
+            const Ev r = at(deg);
+            if (r.short_ <= 0.0) { put(r); return deg; }
+            if (r.short_ < best.short_ - 1e-6) { best = r; bestDeg = deg; }
+        }
+    }
+    put(best);
+    return bestDeg;
+}
+
+// The face limit alone (the in-limit off): kept for its callers / tests - the same search as ElbowClearTurnDeg with haveOut false.
+inline float FaceClearTurnDeg(const float S[3], const float U[3], const float dir[3], float L1, const float cam[3], float minM,
+                              float* distOut)
+{
+    if (!(minM > 0.0f)) { if (distOut) { *distOut = -1.0f; } return 0.0f; }
+    const float none[3] = { 0.0f, 0.0f, 0.0f };
+    float out = 0.0f;
+    return ElbowClearTurnDeg(S, U, dir, L1, cam, minM, none, 0.0f, false, distOut, &out);
+}
+
 }  // namespace elbowreal
 }  // namespace dlvr
