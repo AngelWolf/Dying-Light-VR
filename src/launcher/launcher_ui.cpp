@@ -497,13 +497,15 @@ void DrawPlay(App& a)
     ImGui::Text("Installed: %s", inst);
     ImGui::Text("Available: %s", s.releaseName.empty() ? "-" : s.releaseName.c_str());
     if (!s.releaseWhy.empty()) { Colored(kDim, s.releaseWhy); }
-    if (v.match == InstallMatch::Modified) { Colored(kWarn, std::to_string(s.differing.size()) + " file(s) differ from the installed version - Repair puts them right."); }
+    if (v.match == InstallMatch::Modified) {
+        Colored(kWarn, std::to_string(s.differing.size()) + " file(s) differ from the installed version - " +
+                           (v.newerRelease ? "Update" : "Repair") + " puts them right.");
+    }
     if (v.match == InstallMatch::Foreign) { Colored(kWarn, "Press Uninstall (Support tab), verify the game files in your store, then install with the launcher."); }
     const bool canInstall = CanWrite(v) && !a.busy &&
-                            ((v.match == InstallMatch::None && v.haveRelease) || (v.match == InstallMatch::Exact && v.newerRelease) ||
-                             v.match == InstallMatch::Modified);
+                            ((v.match == InstallMatch::None && v.haveRelease) || OffersUpdate(v) || v.match == InstallMatch::Modified);
     if (BigButton(InstallButtonLabel(v), canInstall)) {
-        if (v.match == InstallMatch::Modified) {
+        if (v.match == InstallMatch::Modified && !v.newerRelease) {
             StartJob(a, "Repairing", [&a]() { return a.model.Repair(); });
         } else if (v.match == InstallMatch::None) {
             StartJob(a, "Installing", [&a]() { return a.model.Install(); });

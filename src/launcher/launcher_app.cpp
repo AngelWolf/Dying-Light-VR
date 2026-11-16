@@ -335,6 +335,7 @@ Result LauncherApp::Update()
     in.presentLower = detected_.present;
     for (const auto& f : ListFiles(s_.game / L"dlvr" / L"flat_off")) { in.presentLower.insert(detail::LowerPath(std::string(kFlatDir) + f)); }
     in.flatMode = s_.view.mode == Mode::Flat;
+    in.differing = s_.differing;   // a modified install: the update repairs it too
     std::vector<LAction> plan = PlanUpdate(in);
     plan.push_back({LAct::WriteText, kLauncherRecord, "", "", RecordText(release_, s_.view.mode), true});
     plan.push_back({LAct::WriteText, kInstalledReleaseCopy, "", "", ReleaseManifestText(release_), true});

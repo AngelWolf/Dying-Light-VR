@@ -74,6 +74,23 @@ int main()
         CHECK(MatchInstalled(r, disk, true, &diff) == InstallMatch::Modified);
         CHECK(diff.size() == 1 && diff[0] == "DW/Data3.pak");
     }
+    {   // 2026-11-16: the four markers the in-game menu writes (dlss_preset.txt SHIPS) are the user's - changed or deleted is
+        // NOT damage; a real file beside them still is (the control)
+        Release rm;
+        std::string w;
+        ParseRelease(std::string("# release=x\n") + kA + "  LibOVRRT64_1.dll\n" + kB + "  dlvr/dlss_preset.txt\n" + kB +
+                         "  dlvr/aa_method.txt\n" + kB + "  dlvr/dlss_quality.txt\n" + kB + "  dlvr/dlss_sharpness.txt\n" + kB +
+                         "  dlvr/force_oculus.txt\n",
+                     "", &rm, &w);
+        std::vector<std::string> diff;
+        std::map<std::string, std::string> menu = {{"libovrrt64_1.dll", kA}, {"dlvr/dlss_preset.txt", kA},
+                                                   {"dlvr/aa_method.txt", kA}, {"dlvr/force_oculus.txt", kB}};   // quality / sharpness deleted
+        CHECK(MatchInstalled(rm, menu, true, &diff) == InstallMatch::Exact);
+        CHECK(diff.empty());
+        menu["dlvr/force_oculus.txt"] = kA;
+        CHECK(MatchInstalled(rm, menu, true, &diff) == InstallMatch::Modified);
+        CHECK(diff.size() == 1 && diff[0] == "dlvr/force_oculus.txt");
+    }
     {   // no mod files at all -> None
         std::map<std::string, std::string> disk;
         std::vector<std::string> diff;

@@ -130,6 +130,19 @@ int main()
         const int fm = Idx(f, LAct::Move, "dlvr/flat_off/LibOVRRT64_1.dll");
         const int fc = Idx(f, LAct::Copy, "LibOVRRT64_1.dll");
         CHECK(fm >= 0 && fc >= 0 && f[fc].dest == "dlvr/flat_off/LibOVRRT64_1.dll");
+        // 2026-11-16: a file both releases ship EQUAL but damaged on disk (MatchInstalled's list) is copied too - the update
+        // repairs; it is not moved to previous/ (the damaged copy is not kept). The control: without it in the list, no copy.
+        in.flatMode = false;
+        in.presentLower = {"libovrrt64_1.dll", "xinput1_3.dll", "dlvr/aa_method.txt", "dw/old_only.pak"};
+        in.differing = {"xinput1_3.dll"};
+        const auto r = PlanUpdate(in);
+        const int rc = Idx(r, LAct::Copy, "xinput1_3.dll");
+        CHECK(rc >= 0 && r[rc].dest == "xinput1_3.dll" && r[rc].md5 == "22222222222222222222222222222222");
+        CHECK(Idx(r, LAct::Move, "xinput1_3.dll") < 0);
+        in.differing = {"XINPUT1_3.DLL"};   // case-insensitive like every other path rule
+        CHECK(Idx(PlanUpdate(in), LAct::Copy, "xinput1_3.dll") >= 0);
+        in.differing.clear();
+        CHECK(Idx(PlanUpdate(in), LAct::Copy, "xinput1_3.dll") < 0);
     }
     {   // rollback: the previous files back, the new-only files deleted, the record rewritten
         const Release cur = MakeRel("R2", "99999999999999999999999999999999", false);

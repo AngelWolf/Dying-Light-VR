@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "setup_manifest.h"
+#include "setup_plan.h"
 
 namespace dlvr::launcher {
 
@@ -113,6 +114,9 @@ inline InstallMatch MatchInstalled(const Release& r, const std::map<std::string,
     differing->clear();
     bool any = false;
     for (const auto& f : r.files) {
+        // The four markers the in-game menu writes (setup's IsUserMarker; dlvr/dlss_preset.txt ships and the DLSS preset menu
+        // rewrites or deletes it) are the user's choice, never damage - 2026-11-16, a menu change read as "1 file differs".
+        if (setup::detail::IsUserMarker(detail::LowerPath(f.relPath))) { continue; }
         const auto it = diskMd5.find(detail::LowerPath(f.relPath));
         if (it == diskMd5.end()) {
             if (!f.dlssOnly) { differing->push_back(f.relPath); }

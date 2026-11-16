@@ -186,7 +186,8 @@ bool Draw(ID3D11Device* device, ID3D11Texture2D* mirror, ID3D11Texture2D* shown,
         ++g_noSource;
         if (!g_saidNoSource) {
             g_saidNoSource = true;
-            LOG("[DESKMIRROR] no view-0 image is held at this submit - the window keeps its last picture (counted in the 30 s line)");
+            LOG("[DESKMIRROR] no view-%d image is held at this submit - the window keeps its last picture (counted in the 30 s line)",
+                kMirrorView);
         }
         return false;
     }
@@ -256,10 +257,10 @@ bool Draw(ID3D11Device* device, ID3D11Texture2D* mirror, ID3D11Texture2D* shown,
         g_firstDraw = true;
         D3D11_TEXTURE2D_DESC md{};
         mirror->GetDesc(&md);
-        LOG("[DESKMIRROR] FIRST DRAW (%s): game eye %d, image %ux%u format %d viewed as %d, view-0 rect (%d,%d %dx%d) -> crop (%.1f,%.1f "
+        LOG("[DESKMIRROR] FIRST DRAW (%s): game eye %d, image %ux%u format %d viewed as %d, view-%d rect (%d,%d %dx%d) -> crop (%.1f,%.1f "
             "%.1fx%.1f), window shape %.4f, centre %.4f %.4f (%s) -> mirror %ux%u format %d; live at most %d / s",
             why == 1 ? "live" : "menu backdrop", eye, sd.Width, sd.Height, static_cast<int>(sd.Format), static_cast<int>(eyeFmt),
-            rect[0], rect[1], rect[2], rect[3], c.x, c.y, c.w, c.h, aspect, u, v,
+            kMirrorView, rect[0], rect[1], rect[2], rect[3], c.x, c.y, c.w, c.h, aspect, u, v,
             haveTan ? "the game frustum's forward point" : "rect centre - no frustum described yet", md.Width, md.Height,
             static_cast<int>(md.Format), kLivePerSec);
     }
@@ -286,7 +287,8 @@ void DrawPanel(ID3D11Device* device, ID3D11Texture2D* panelImage, int w, int h)
         ++g_panelFail;
         return;
     }
-    const double x = g_cropF[0] * w, y = g_cropF[1] * h, cw = g_cropF[2] * w, ch = g_cropF[3] * h;
+    // The panel image holds eye 0's pass at x 0 and eye 1's at x w (uipanel.cpp: the XR_EYE_VISIBILITY_RIGHT quad reads offset w).
+    const double x = kMirrorView * static_cast<double>(w) + g_cropF[0] * w, y = g_cropF[1] * h, cw = g_cropF[2] * w, ch = g_cropF[3] * h;
     const float uv[4] = { static_cast<float>(x / pd.Width), static_cast<float>(y / pd.Height),
                           static_cast<float>((x + cw) / pd.Width), static_cast<float>((y + ch) / pd.Height) };
     const int rc = OverlayDrawImageToTarget(rtv, g_mirW, g_mirH, srv, uv, true);
@@ -302,9 +304,9 @@ void DrawPanel(ID3D11Device* device, ID3D11Texture2D* panelImage, int w, int h)
     ++g_panelDraws;
     if (!g_firstPanel) {
         g_firstPanel = true;
-        LOG("[DESKMIRROR] FIRST MENU PANEL DRAW: panel image %ux%u format %d viewed as %d, eye-0 pass %dx%d, crop (%.1f,%.1f %.1fx%.1f) "
+        LOG("[DESKMIRROR] FIRST MENU PANEL DRAW: panel image %ux%u format %d viewed as %d, eye-%d pass %dx%d, crop (%.1f,%.1f %.1fx%.1f) "
             "-> over the window, premultiplied", pd.Width, pd.Height, static_cast<int>(pd.Format),
-            static_cast<int>(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB), w, h, x, y, cw, ch);
+            static_cast<int>(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB), kMirrorView, w, h, x, y, cw, ch);
     }
 }
 
