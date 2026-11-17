@@ -420,6 +420,123 @@ void StraightArmHoldsLastDirection()
     NEAR(pole[0], 0.0f, 1e-5f); NEAR(pole[2], -1.0f, 1e-5f);   // +X turned 90 deg by the solve's Ry = -Z
 }
 
+// ===== trace 20261117_1905_coop_full_ik =====
+void Compose34(const float R[9], float x, float y, float z, float m[12])
+{
+    m[0] = R[0]; m[1] = R[1]; m[2] = R[2];  m[3] = x;
+    m[4] = R[3]; m[5] = R[4]; m[6] = R[5];  m[7] = y;
+    m[8] = R[6]; m[9] = R[7]; m[10] = R[8]; m[11] = z;
+}
+float PosDist(const float a[12], const float b[12])
+{
+    const float p[3] = { a[3], a[7], a[11] }, q[3] = { b[3], b[7], b[11] };
+    return Dist(p, q);
+}
+
+// The cap and the wrap: a gap past +-180 is taken the short way, then clamped; the miss on purpose - a gap under the cap is untouched.
+void TorsoYawWrapsAndClamps()
+{
+    const float d = 0.0174532925f;
+    bool c = true;
+    NEAR(TorsoYaw(20.0f * d, 60.0f * d, &c), 20.0f * d, 1e-6f);
+    CHECK(!c);
+    NEAR(TorsoYaw(90.0f * d, 60.0f * d, &c), 60.0f * d, 1e-6f);
+    CHECK(c);
+    NEAR(TorsoYaw(-170.0f * d, 60.0f * d, &c), -60.0f * d, 1e-6f);
+    CHECK(c);
+    NEAR(TorsoYaw(350.0f * d, 60.0f * d, &c), -10.0f * d, 1e-5f);   // 350 = -10 the short way
+    CHECK(!c);
+}
+
+// TurnWorldY raises the receiver's yaw formula by exactly the turn, keeps the position and the rotation orthonormal.
+void TurnWorldYRaisesYaw()
+{
+    const float ax[3] = { 0.2672612f, 0.5345225f, 0.8017837f };
+    float R[9], W[12], o[12];
+    AxisAngle(ax, 0.7f, R);
+    Compose34(R, 1.5f, 2.5f, -3.5f, W);
+    for (float g : { 0.3f, -1.1f, 2.0f }) {
+        TurnWorldY(g, W, o);
+        NEAR(WrapPi(YawOf(o) - YawOf(W)), WrapPi(g), 1e-5f);
+        NEAR(o[3], 1.5f, 0.0f); NEAR(o[7], 2.5f, 0.0f); NEAR(o[11], -3.5f, 0.0f);
+        float r9[9];
+        Rot34(o, r9);
+        for (int r = 0; r < 3; ++r) { NEAR(r9[r * 3] * r9[r * 3] + r9[r * 3 + 1] * r9[r * 3 + 1] + r9[r * 3 + 2] * r9[r * 3 + 2], 1.0f, 1e-5f); }
+        NEAR(o[4], W[4], 1e-6f); NEAR(o[5], W[5], 1e-6f); NEAR(o[6], W[6], 1e-6f);   // the Y row is untouched by a turn about +Y
+    }
+}
+
+// The torso turn: the neck keeps its world (head stays the game's); hspine1's yaw rises by the turn; spine3 / hspine1 locals are not
+// written (carried). The miss on purpose: without the neck restore the neck WOULD move.
+void TorsoTurnKeepsNeckTurnsChest()
+{
+    const float ax1[3] = { 0.0f, 0.0f, 1.0f }, ax2[3] = { 1.0f, 0.0f, 0.0f }, ax3[3] = { 0.5773503f, 0.5773503f, 0.5773503f };
+    float R0[9], Whs[12];
+    AxisAngle(ax3, 0.4f, R0);
+    Compose34(R0, 10.0f, 100.0f, -20.0f, Whs);
+    float L[5][12], Ln[12];
+    for (int i = 0; i < 5; ++i) {
+        float Ri[9];
+        AxisAngle(i % 2 ? ax1 : ax2, 0.1f * static_cast<float>(i + 1), Ri);
+        Compose34(Ri, 0.12f, 0.02f * static_cast<float>(i), 0.0f, L[i]);
+    }
+    float Rn[9];
+    AxisAngle(ax1, -0.2f, Rn);
+    Compose34(Rn, 0.15f, 0.0f, 0.01f, Ln);
+    // the game's chain
+    float hs1Old[12], neckOld[12];
+    std::memcpy(hs1Old, Whs, sizeof(hs1Old));
+    for (int i = 0; i < 5; ++i) { WorldFromLocal(hs1Old, L[i], hs1Old); }
+    WorldFromLocal(hs1Old, Ln, neckOld);
+    const float g = 0.6f;
+    float nL[3][12], nNeck[12], hs1New[12];
+    CHECK(TorsoTurn(Whs, L, Ln, g, nL, nNeck, hs1New));
+    // rebuild the chain from the written locals, exactly as the engine would
+    float P[12];
+    std::memcpy(P, Whs, sizeof(P));
+    for (int i = 0; i < 3; ++i) { WorldFromLocal(P, nL[i], P); }
+    WorldFromLocal(P, L[3], P);
+    WorldFromLocal(P, L[4], P);
+    NEAR(PosDist(P, hs1New), 0.0f, 1e-4f);
+    NEAR(RotAngleDeg(P, hs1New), 0.0f, 0.05f);
+    NEAR(WrapPi(YawOf(hs1New) - YawOf(hs1Old)), g, 1e-4f);   // the chest turned by the whole turn
+    float neckNew[12];
+    WorldFromLocal(P, nNeck, neckNew);
+    NEAR(PosDist(neckNew, neckOld), 0.0f, 1e-4f);
+    NEAR(RotAngleDeg(neckNew, neckOld), 0.0f, 0.05f);
+    float neckIfNotRestored[12];
+    WorldFromLocal(P, Ln, neckIfNotRestored);
+    CHECK(RotAngleDeg(neckIfNotRestored, neckOld) > 10.0f);   // the miss: the old neck local would have turned the head ~34 deg
+    // no turn: the locals come back as the game's
+    CHECK(TorsoTurn(Whs, L, Ln, 0.0f, nL, nNeck, hs1New));
+    NEAR(RotAngleDeg(nL[1], L[1]), 0.0f, 0.05f);
+    NEAR(PosDist(hs1New, hs1Old), 0.0f, 1e-4f);
+}
+
+// A sent rotation + the game's translation; RotSane passes a rotation and refuses a stale / scaled / NaN matrix.
+void LocalFromQAndRotSane()
+{
+    const float q[4] = { 0.0f, std::sin(0.25f), 0.0f, std::cos(0.25f) };   // 0.5 rad about +Y
+    float keep[12] = { 1, 0, 0, 0.1718f, 0, 1, 0, -0.002f, 0, 0, 1, 0.003f };
+    float o[12];
+    LocalFromQ(q, keep, o);
+    NEAR(o[3], 0.1718f, 0.0f); NEAR(o[7], -0.002f, 0.0f); NEAR(o[11], 0.003f, 0.0f);
+    NEAR(o[0], std::cos(0.5f), 1e-6f); NEAR(o[2], std::sin(0.5f), 1e-6f);   // Ry: [c 0 s; 0 1 0; -s 0 c]
+    CHECK(RotSane(o));
+    float bad[12];
+    std::memcpy(bad, o, sizeof(bad));
+    bad[0] *= 2.0f; bad[1] *= 2.0f; bad[2] *= 2.0f;   // a scaled row
+    CHECK(!RotSane(bad));
+    std::memcpy(bad, o, sizeof(bad));
+    bad[5] = std::nanf("");
+    CHECK(!RotSane(bad));
+    float zero[12] = {};
+    CHECK(!RotSane(zero));                            // a freed / zeroed model
+    const float a3[3] = { 1, 0, 0 }, b3[3] = { 0, 1, 0 }, z3[3] = { 0, 0, 0 };
+    NEAR(VecAngleDeg(a3, b3), 90.0f, 1e-3f);
+    NEAR(VecAngleDeg(a3, z3), 0.0f, 0.0f);
+}
+
 }  // namespace
 
 int main()
@@ -442,6 +559,10 @@ int main()
     RUN(SentYawRebuildsSenderWrist);
     RUN(BentArmBendsTheSameWay);
     RUN(StraightArmHoldsLastDirection);
+    RUN(TorsoYawWrapsAndClamps);
+    RUN(TurnWorldYRaisesYaw);
+    RUN(TorsoTurnKeepsNeckTurnsChest);
+    RUN(LocalFromQAndRotSane);
     std::printf("%d failure(s)\n", g_fail);
     return g_fail;
 }

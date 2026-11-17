@@ -24,10 +24,19 @@ void CoopPosePublishElbow(bool isLeft, float rootYaw, const float S[3], const fl
 // publishes + finger weights + hand state + netId and queues it (CoopNetQueueSend, latest wins).
 void CoopPoseCaptureLocal();
 
+// Protocol 5 (trace docs/traces/20261117_1905_coop_full_ik.md): at the very END of boneblend's HookTail - after every arm / finger write
+// of the player update - read the sender's FINISHED local rotation of the 25 arm bones per side (coop::kArmBoneSuffix) from the captured
+// player model (GetElementLocalMatrix, read only) and store them for the next CoopPoseCaptureLocal. A side is stored only when all 25
+// resolve by name on this model and every matrix is sane (coopik::RotSane). OFF = one bool test. Game thread.
+void CoopPoseCaptureArmBones();
+
 // THE RECEIVER (spec 8.3; trace docs/traces/20261113_2045_coop_receiver.md): at the EXIT of PlayerTppVis slot 129 (+C532D0 - a
 // partner's body; co-op only), after the original. Poses that body's arms (both, INV-736 build) and hands on the SENDER's yaw, with the
 // sender's elbow bend (trace 20261115_1735), and re-places its held items (CorrectItemPosition x2), from the buffered sample of the peer
 // bound by position. The head is left to the game (rx::PoseHead has no caller). OFF = one bool test.
+// Protocol 5 (trace 20261117_1905): first turns the body's spine / spine1 / spine2 toward the sender's yaw (capped), restores the
+// neck's world (the head stays the game's), then a side whose sample carries the sender's bones gets all 25 of them and its wrist
+// landed on the target; a side without bones keeps the old solve.
 void CoopPoseApplyRemote(void* vis);
 
 }  // namespace dlvr

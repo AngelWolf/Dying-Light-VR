@@ -33,6 +33,7 @@
 #include "reload_hands.h"          // reload::PumpAnimFrame (inline kPumpAnim) - PumpFingersApply, the pump's C13 fingers (pump plan Task 4)
 #include "dbarrel_hands.h"         // reload::DbFrameAt (inline kDbOpen / kDbPull / kDbLoad) - DbFingersApply, the double-barrel (2026-11-07)
 #include "roomscale.h"    // RoomscaleProbeTick - roomscale Task 7a's log-only probe, driven from HookTail (plan 2026-10-27)
+#include "rootyaw_logic.h"   // walk root + spine-top yaw hold math (trace 20261117_1730_root_yaw_hold; BETA port 20261117_1600)
 #include "physcrouch.h"   // physical crouch (plan 2026-10-27 Task 9): EyePointApply publishes the duck factor
 #include "bownock.h"      // BowNockTick / BowNockNoBow - the bow's manual nock (bow_manual_nock), called from BowDrawTick
 #include "grappleaim.h"   // BowReticle3d - gates PublishBowRay
@@ -19847,8 +19848,304 @@ void Tick(void* entV)
 
 }  // namespace itemhide
 
+// ===== WALK ROOT + SPINE-TOP YAW HOLD (trace docs/traces/20261117_1730_root_yaw_hold.md; spec
+// docs/superpowers/specs/2026-11-17-walk-root-yaw-hold-design.md; Jay 2026-11-17: "No swing, it just walks straight, like real life"
+// -> "A" (the standing yaw) -> hold the spine top too). OUR walk / run clips (m_fpp_unarmed.scr:59-102) turn bip01 4.5-19 deg side to
+// side per stride (pelvis has no track - it rides bip01), and C08100 keeps HSPINE1's ANIMATED world basis (ida/h0_2 :321-326), so
+// the root alone would leave the spine top swinging 3-11 deg the other way. Runs at HookTail's ENTRY, before BFC170's original:
+// nothing poses a bone between BFC170's entry and slot 341 (ida/rh1_bfc170 / rh2_c5fd10), so the stabiliser (C07C70), C08100, the
+// camera base and the rig all see the held pose. Writes through IModelObject::SetElementLocalMatrix (engine +142C30 marks the
+// element's SUBTREE world dirty - nk3, see EyePaAfterBff080), the root first, then HSPINE1 from worlds read AFTER the root write.
+// COST per player update: GetTickCount64 + one stick read; on foot and moving: 2 local + 3 world reads, 2 local writes, two 3x3 ops.
+// BETA PORT 2026-11-17 (trace 20261117_1600_beta_port_roomscale_walk): identical to DEV 53460cfb / aef7b502 (BUILDS GOOD).
+namespace rootyawhold {
+
+using SetLocalFn = void (*)(void* model, int index, const float* m12);
+SetLocalFn  g_set = nullptr;
+bool        g_resolved = false;
+bool        g_latched = false;
+int         g_rootCol = -1, g_hsCol = -1;
+float       g_rootH = 0.0f;    // standing: bip01's LOCAL heading (column g_rootCol)
+float       g_hsOff = 0.0f;    // standing: the CHEST's (spine3) object-space heading (column g_hsCol), from local reads (since ROOT3)
+float       g_lastPos[3] = {};
+bool        g_havePos = false, g_slow = false;
+ULONGLONG   g_lastMs = 0, g_stillSinceMs = 0, g_winMs = 0;
+LONG64      g_hold = 0, g_standing = 0, g_noLatch = 0, g_groupUnread = 0, g_offFoot = 0, g_pause = 0, g_notArmed = 0, g_fault = 0,
+            g_bigTurn = 0, g_modelDiff = 0;
+double      g_sumRoot = 0.0, g_sumHs = 0.0;
+float       g_maxRoot = 0.0f, g_maxHs = 0.0f;
+const char* g_said = nullptr;
+bool        g_saidFirst = false, g_saidLatch = false;
+constexpr float     kStillMps = 0.10f;        // root world speed below this = still
+constexpr ULONGLONG kStillHoldMs = 800;       // ... and the stick idle, for this long, before the standing yaw is taken
+constexpr ULONGLONG kLatchAgeMs = 300;        // the latch takes a sample at least this old (RUN ROOT1: the first step was latched)
+constexpr float     kPoseStillRad = 0.0087266f;   // 0.5 deg: the root / chest headings' spread over the still window (RUN ROOT4)
+// (A) of trace 20261117_1600: on foot and NOT standing this update - EyePointApply holds the face offset while it is set (same game
+// thread, written at HookTail's entry, read later in the same player update).
+volatile bool g_walking = false;
+// (B) of trace 20261117_1600: the C07C70 dead-zone threshold (gamedll +0x1BAF4BC, one xref, -45.0 file bytes; INVARIANTS.md:12292).
+constexpr uintptr_t kStabThreshRva = 0x1BAF4BC;
+constexpr uint32_t  kStabThreshWas = 0xC2340000u;   // -45.0f
+constexpr float     kStabThreshNew = -1000.0f;      // dead zone (v + 1000) / 1000 x 0.1 w >= 0.091 w m at any look pitch
+bool                g_stabTried = false;
+LONG64      g_poseMoving = 0;                 // still by speed, but the pose moved - not latched (window count)
+constexpr float     kStick = 0.20f;           // stick dead zone (the rig's own, controllers.h)
+constexpr float     kMaxRemoveRad = 0.7853982f;   // 45 deg: more than this is a turn animation, not a step - passed through
+constexpr int       kRing = 256;              // standing samples (~1.8 s at 140 Hz), game thread only
+ULONGLONG   g_ringMs[kRing] = {};
+float       g_ringRootH[kRing] = {}, g_ringHsOff[kRing] = {};
+int         g_ringHead = 0, g_ringN = 0;
+
+void Refuse(const char* why)
+{
+    if (why == g_said) { return; }
+    g_said = why;
+    // [PROBE: ROOTYAW] gate=roomscale_enable  site=HEADSET  log-only=no
+    LOG("boneblend: [ROOTYAW] NOT HOLDING - %s (this reason is not repeated; the clip's own yaw passes through)", why);
+}
+
+bool SetLocalSafe(void* model, int id, const float* m12)
+{
+    __try { g_set(model, id, m12); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+void* VisModel(void* ent)
+{
+    __try {
+        void* iface = reinterpret_cast<char*>(ent) + 64;
+        void** vt = *reinterpret_cast<void***>(iface);
+        typedef void* (__fastcall* GetModelFn)(void*);
+        return reinterpret_cast<GetModelFn>(vt[2])(iface);   // vfunc +16 - the model C5FD10 / C08100 / BFF080 take
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+void Window(ULONGLONG now)
+{
+    if (g_winMs == 0) { g_winMs = now; return; }
+    if (now - g_winMs < 5000) { return; }
+    g_winMs = now;
+    const double mr = g_hold ? g_sumRoot / static_cast<double>(g_hold) : 0.0, mh = g_hold ? g_sumHs / static_cast<double>(g_hold) : 0.0;
+    // [PROBE: ROOTYAW] gate=roomscale_enable,diag_periodic_logs  site=HEADSET  log-only=no
+    LOG_PERIODIC("boneblend: [ROOTYAW] 5 s | held %lld (|yaw removed| root mean %.2f max %.2f deg; chest (spine3) mean %.2f max %.2f "
+                 "deg) | "
+                 "standing (latching) %lld | stood down: no latch %lld, group not read %lld, not on foot %lld, paused %lld, rig not "
+                 "armed %lld, > 45 deg (held) %lld, model differs %lld, faults %lld | still but pose moving (not latched) %lld",
+                 static_cast<long long>(g_hold), mr * 57.29578,
+                 static_cast<double>(g_maxRoot) * 57.29578, mh * 57.29578, static_cast<double>(g_maxHs) * 57.29578,
+                 static_cast<long long>(g_standing), static_cast<long long>(g_noLatch), static_cast<long long>(g_groupUnread),
+                 static_cast<long long>(g_offFoot), static_cast<long long>(g_pause), static_cast<long long>(g_notArmed),
+                 static_cast<long long>(g_bigTurn), static_cast<long long>(g_modelDiff), static_cast<long long>(g_fault),
+                 static_cast<long long>(g_poseMoving));
+    g_hold = g_standing = g_noLatch = g_groupUnread = g_offFoot = g_pause = g_notArmed = g_fault = g_bigTurn = g_modelDiff = 0;
+    g_poseMoving = 0;
+    g_sumRoot = g_sumHs = 0.0;
+    g_maxRoot = g_maxHs = 0.0f;
+}
+
+void Hold(void* ent)
+{
+    namespace ry = ::dlvr::rootyaw;
+    const ULONGLONG now = GetTickCount64();
+    Window(now);
+    if (!g_resolved) {
+        g_resolved = true;
+        HMODULE eng = GetModuleHandleA(kEngine);
+        g_set = eng ? reinterpret_cast<SetLocalFn>(GetProcAddress(eng, "?SetElementLocalMatrix@IModelObject@@QEAAXHAEBVmtx34@@@Z"))
+                    : nullptr;
+    }
+    g_walking = false;
+    if (!g_stabTried) {
+        g_stabTried = true;
+        const char* why = nullptr;
+        HMODULE gdm = GetModuleHandleA("gamedll_x64_rwdi.dll");
+        uint32_t* p = gdm ? reinterpret_cast<uint32_t*>(reinterpret_cast<uintptr_t>(gdm) + kStabThreshRva) : nullptr;
+        uint32_t was = 0;
+        bool readOk = false;
+        if (p) { __try { was = *p; readOk = true; } __except (EXCEPTION_EXECUTE_HANDLER) { readOk = false; } }
+        if (!p) { why = "the gamedll is not loaded"; }
+        else if (!readOk) { why = "the address faulted on read"; }
+        else if (was != kStabThreshWas) { why = "it does not hold -45.0f (another gamedll build?)"; }
+        else {
+            DWORD old = 0;
+            if (!VirtualProtect(p, sizeof(uint32_t), PAGE_READWRITE, &old)) {
+                why = "VirtualProtect failed";
+            } else {
+                float nv = kStabThreshNew;
+                uint32_t bits = 0;
+                memcpy(&bits, &nv, sizeof(bits));
+                InterlockedExchange(reinterpret_cast<volatile LONG*>(p), static_cast<LONG>(bits));
+                DWORD tmp = 0;
+                VirtualProtect(p, sizeof(uint32_t), old, &tmp);
+                if (*p != bits) { why = "the value did not read back after the write"; }
+            }
+        }
+        // [LOADBEARING: stabiliser threshold] the C07C70 dead zone kept open when looking down (trace 20261117_1600 (B))
+        // [PROBE: STABTHRESH] gate=roomscale_enable  site=FLAT  log-only=no
+        LOG("boneblend: [STABTHRESH] gamedll+0x1BAF4BC (C07C70's dead-zone threshold, one xref) %s%s%s", why ? "REFUSED - " : "LIVE: -45.0 -> ",
+            why ? why : "-1000.0 (the walk's spine motion stays out of the view when looking down, as when level)",
+            why ? " - nothing written, the engine's own -45 stays" : "");
+    }
+    if (!g_set) { Refuse("the engine export IModelObject::SetElementLocalMatrix is not resolved"); return; }
+    if (!g_armed) { ++g_notArmed; return; }
+    if (PauseFreezeOn()) { ++g_pause; return; }
+    const int group = RoomscaleGroup();
+    if (group == -99) { ++g_groupUnread; return; }
+    if (!RoomscaleOnFoot(group)) { ++g_offFoot; return; }
+    const uintptr_t model = g_emModel;
+    const int eR = E6(0), eS3 = E6(6), eH = E6(7);   // [ELEMMAP] bip01, spine3, hspine1
+    if (!model || eR < 0 || eS3 < 0 || eH < 0 || !g_getLocal || !g_getWorld) {
+        ++g_fault;
+        Refuse("the rig's element map or accessors are not ready (bip01 / spine3 / hspine1)");
+        return;
+    }
+    if (reinterpret_cast<uintptr_t>(VisModel(ent)) != model) {
+        ++g_modelDiff;
+        Refuse("the vis model (vis+64 vfunc +16) is not the rig's captured model");
+        return;
+    }
+    float rl[12], rw[12];
+    if (!ReadAccessorMtx(g_getLocal, model, eR, rl) || !ReadAccessorMtx(g_getWorld, model, eR, rw)) {
+        ++g_fault;
+        Refuse("bip01's local / world read failed");
+        return;
+    }
+    // still = the root's world speed under kStillMps (measured over >= 100 ms) and the left stick idle, for kStillHoldMs
+    if (!g_havePos || now - g_lastMs >= 100) {
+        if (g_havePos) {
+            const float dx = rw[3] - g_lastPos[0], dy = rw[7] - g_lastPos[1], dz = rw[11] - g_lastPos[2];
+            g_slow = std::sqrt(dx * dx + dy * dy + dz * dz) / (static_cast<float>(now - g_lastMs) / 1000.0f) < kStillMps;
+        }
+        g_lastPos[0] = rw[3]; g_lastPos[1] = rw[7]; g_lastPos[2] = rw[11];
+        g_lastMs = now;
+        g_havePos = true;
+    }
+    // Every read BEFORE any write (RUN ROOT1: world reads after the root write came back STALE - the spine top's |removed| equalled
+    // the root's to 2 dp in every window, i.e. it was turned twice).
+    // CHEST (RUN ROOT3 -> Jay "it's the body"): spine3 in OBJECT space from LOCAL reads only (C08100 world-writes SPINE_0..3 + HSPINE1
+    // every frame - HSPINE1's world read here never moved in ROOT3; the locals are this frame's - the root's moved in every run).
+    // O = bip01 local x pelvis x hspine x spine x spine1 x spine2 (= O2) x spine3 (= O3). g_hsCol / g_hsOff now = the chest's column /
+    // latched object-space heading.
+    const int eChain[5] = { E6(1), E6(2), E6(3), E6(4), E6(5) };   // [ELEMMAP] pelvis, hspine, spine, spine1, spine2
+    float O2[12], O3[12], s3l[12];
+    {
+        float acc[12], loc[12], tmp[12];
+        for (int i = 0; i < 12; ++i) { acc[i] = rl[i]; }
+        for (int k = 0; k < 5; ++k) {
+            if (eChain[k] < 0 || !ReadAccessorMtx(g_getLocal, model, eChain[k], loc)) {
+                ++g_fault;
+                Refuse("a pelvis..spine2 local read failed (or the element map lacks it)");
+                return;
+            }
+            ry::ComposeRT(acc, loc, tmp);
+            for (int i = 0; i < 12; ++i) { acc[i] = tmp[i]; }
+        }
+        for (int i = 0; i < 12; ++i) { O2[i] = acc[i]; }
+        if (!ReadAccessorMtx(g_getLocal, model, eS3, s3l)) { ++g_fault; Refuse("spine3 local read failed"); return; }
+        ry::ComposeRT(O2, s3l, O3);
+    }
+    if (g_rootCol < 0 || g_hsCol < 0) {   // the heading columns, chosen once from the first good pose and kept
+        g_rootCol = ry::MostHorizontalCol(rl);
+        g_hsCol = ry::MostHorizontalCol(O3);
+        if (g_rootCol < 0 || g_hsCol < 0) { g_rootCol = g_hsCol = -1; ++g_fault; Refuse("no horizontal column on bip01 / spine3"); return; }
+    }
+    float hRl = 0.0f, hRw = 0.0f, hS3 = 0.0f;
+    if (!ry::HeadingOfCol(rl, g_rootCol, &hRl) || !ry::HeadingOfCol(rw, g_rootCol, &hRw) || !ry::HeadingOfCol(O3, g_hsCol, &hS3)) {
+        ++g_fault;
+        Refuse("a latched heading column has no horizontal length");
+        return;
+    }
+    const float objH = ry::WrapPi(hRw - hRl);           // the object's (the follow fold's) heading - log only
+    const float hsOffNow = hS3;                          // the chest's object-space heading as the clip has it (latched while standing)
+    // STANDING: record samples; the latch takes one >= kLatchAgeMs old once still for kStillHoldMs (never the first step's)
+    float sx = 0.0f, sy = 0.0f;
+    const bool stickIdle = !GetControllerStick(kLeftHand, sx, sy) || (sx * sx + sy * sy < kStick * kStick);
+    if (g_slow && stickIdle) { if (!g_stillSinceMs) { g_stillSinceMs = now; g_ringN = 0; } } else { g_stillSinceMs = 0; g_ringN = 0; }
+    if (!g_stillSinceMs) { g_walking = true; }   // moving (speed or stick) - EyePointApply holds the face offset
+    if (g_stillSinceMs) {
+        g_ringMs[g_ringHead] = now; g_ringRootH[g_ringHead] = hRl; g_ringHsOff[g_ringHead] = hsOffNow;
+        g_ringHead = (g_ringHead + 1) % kRing;
+        if (g_ringN < kRing) { ++g_ringN; }
+        // RUN ROOT4: slow walking passed the speed test and re-latched mid-stride from the walk clip. The standing clip is STATIC, so
+        // latch only when every sample in the still window has the root AND chest headings within kPoseStillRad of each other.
+        bool poseStill = true;
+        if (now - g_stillSinceMs >= kStillHoldMs) {
+            float rMin = 1e9f, rMax = -1e9f, cMin = 1e9f, cMax = -1e9f;
+            for (int k = 1; k <= g_ringN; ++k) {
+                const int i = (g_ringHead - k + kRing) % kRing;
+                const float r = ry::WrapPi(g_ringRootH[i] - g_ringRootH[(g_ringHead - 1 + kRing) % kRing]);
+                const float c = ry::WrapPi(g_ringHsOff[i] - g_ringHsOff[(g_ringHead - 1 + kRing) % kRing]);
+                rMin = std::fmin(rMin, r); rMax = std::fmax(rMax, r);
+                cMin = std::fmin(cMin, c); cMax = std::fmax(cMax, c);
+            }
+            poseStill = (rMax - rMin) <= kPoseStillRad && (cMax - cMin) <= kPoseStillRad;
+            if (!poseStill) { ++g_poseMoving; }
+        }
+        g_walking = !(now - g_stillSinceMs >= kStillHoldMs);   // still by speed but not yet confirmed = still moving
+        if (poseStill && now - g_stillSinceMs >= kStillHoldMs) {
+            for (int k = 1; k <= g_ringN; ++k) {   // newest sample that is old enough
+                const int i = (g_ringHead - k + kRing) % kRing;
+                if (now - g_ringMs[i] >= kLatchAgeMs) {
+                    g_rootH = g_ringRootH[i];
+                    g_hsOff = g_ringHsOff[i];
+                    g_latched = true;
+                    if (!g_saidLatch) {
+                        g_saidLatch = true;
+                        // [PROBE: ROOTYAW] gate=roomscale_enable  site=HEADSET  log-only=no
+                        LOG("boneblend: [ROOTYAW] STANDING LATCH (logged unconditionally, first) - bip01 local heading %+.2f deg (column "
+                            "%d), chest (spine3) object-space heading %+.2f deg (column %d) | a sample >= %llu ms old, re-taken while "
+                            "standing", g_rootH * 57.29578f, g_rootCol, g_hsOff * 57.29578f, g_hsCol,
+                            static_cast<unsigned long long>(kLatchAgeMs));
+                    }
+                    break;
+                }
+            }
+        }
+        ++g_standing;
+    }
+    if (!g_latched) { ++g_noLatch; return; }
+    const float dRoot = ry::WrapPi(g_rootH - hRl);
+    // RUN ROOT3: releasing the hold above 45 deg drew the turn clip for 82 frames and re-grabbed = a snap each side. Counted, HELD.
+    if (std::fabs(dRoot) > kMaxRemoveRad) { ++g_bigTurn; }
+    // the chest's correction: latched object-space heading - (clip heading + dRoot); the root's Ry(dRoot) cancels in the local
+    const float dHs = ry::WrapPi(g_hsOff - ry::WrapPi(hsOffNow + dRoot));
+    float wantC[12], nc[12];
+    for (int i = 0; i < 12; ++i) { wantC[i] = O3[i]; nc[i] = s3l[i]; }
+    ry::PreRotY(dHs, wantC);
+    const bool chestOk = ry::LocalRotFromWorld(O2, wantC, nc);
+    // [LOADBEARING: root yaw hold] bip01's local yaw back to the standing yaw (pitch / roll / translation kept) - every descendant
+    // (pelvis, legs, spine, HSPINE1, the eye camera, the clavicles) follows through the subtree-dirty mark.
+    float nl[12];
+    for (int i = 0; i < 12; ++i) { nl[i] = rl[i]; }
+    ry::PreRotY(dRoot, nl);
+    if (!SetLocalSafe(reinterpret_cast<void*>(model), eR, nl)) { ++g_fault; Refuse("SetElementLocalMatrix faulted on bip01"); return; }
+    // [LOADBEARING: root yaw hold] the chest (spine3) local so its object-space heading = its standing heading (the walk clips hold it
+    // 8-12 deg off the idle, faded in over 0.5 s = the first-step turn). After the root; a failure leaves the root held, counted.
+    if (!chestOk) { ++g_fault; Refuse("spine2's object-space rotation is singular (the root IS held)"); }
+    else if (!SetLocalSafe(reinterpret_cast<void*>(model), eS3, nc)) { ++g_fault; Refuse("SetElementLocalMatrix faulted on spine3 (the root IS held)"); }
+    ++g_hold;
+    const float ar = std::fabs(dRoot), ah = std::fabs(dHs);
+    g_sumRoot += ar;
+    g_sumHs += ah;
+    if (ar > g_maxRoot) { g_maxRoot = ar; }
+    if (ah > g_maxHs) { g_maxHs = ah; }
+    g_said = nullptr;
+    if (!g_saidFirst) {
+        g_saidFirst = true;
+        // [PROBE: ROOTYAW] gate=roomscale_enable  site=HEADSET  log-only=no
+        LOG("boneblend: [ROOTYAW] FIRST HOLD (logged unconditionally) - root yaw removed %+.2f deg, chest (spine3) %+.2f deg | object "
+            "heading %+.1f deg | group %d | elements bip01 %d spine3 %d hspine1 %d (hspine1 not written since RUN ROOT2)",
+            dRoot * 57.29578f, dHs * 57.29578f, objH * 57.29578f, group, eR, eS3, eH);
+    }
+}
+
+}  // namespace rootyawhold
+
 void __fastcall HookTail(void* ent)
 {
+    // [LOADBEARING: root yaw hold] BEFORE the engine's player update (BFC170 -> C5FD10 -> slots 341-344) - trace 20261117_1730
+    rootyawhold::Hold(ent);
     g_trueTail(ent);
 
     // [ITEMPLACE] - FIRST, immediately after the engine's whole player update,
@@ -20189,6 +20486,9 @@ void __fastcall HookTail(void* ent)
             InterlockedIncrement64(&g_tailWrites);
         }
     }
+    // coop_pose sender, protocol 5 (trace 20261117_1905): the finished arm bones, after every arm / finger write above - read only.
+    // OFF = one bool test.
+    CoopPoseCaptureArmBones();
 }
 
 void Install()
@@ -31928,6 +32228,8 @@ float           g_epHoldLocal[3] = {};   // (mid - eye bone 8), unscaled, in the
 constexpr ULONGLONG kEpSwingTailMs = 400;
 ULONGLONG       g_epAttackMs = 0;         // last call that saw an attack / throw / charge state (game thread)
 volatile LONG64 g_epSwingHeld = 0;        // standing calls that used the remembered offset because of a swing (run total)
+volatile LONG64 g_epWalkHeld = 0;         // calls that used it because the player is walking (trace 20261117_1600 (A); run total)
+volatile LONG   g_epSaidWalk = 0;
 volatile LONG   g_epSaidSwing = 0;
 float           g_epSwingDiffMaxMm = 0.0f;   // largest |live - held| face offset seen while held (unscaled, game thread)
 bool            g_epHaveHold = false;    // game thread only (EpHook), like the rest of EyePointApply's own state
@@ -32066,7 +32368,19 @@ void EyePointApply(__int64 a1)
                     // game's grab / escape animation moves the face bones too. breakout.cpp g_grabbed (game thread, as this).
                     if (BreakoutPlayerGrabbed()) { g_epAttackMs = nowEp; meleeState = 1000; }   // 1000 = "the player is grabbed" in the log
                     const bool swingQuiet = g_epAttackMs == 0 || nowEp - g_epAttackMs >= kEpSwingTailMs;
-                    if (!swingQuiet && g_epHaveHold) {
+                    // [LOADBEARING: walk eye hold] WALKING (trace 20261117_1600 (A)): the neck / head walk animation swung this offset
+                    // sideways (EYEOFF H 42.8 mm / s, ROOT5) - hold the standing value while rootyawhold says on foot and not standing.
+                    const bool walkHold = playertail::rootyawhold::g_walking;
+                    if (walkHold && swingQuiet && g_epHaveHold) {
+                        InterlockedIncrement64(&g_epWalkHeld);
+                        if (!InterlockedExchange(&g_epSaidWalk, 1)) {
+                            // [PROBE: EYEPOINT] gate=cam_eye_forward|cam_eye_arc  site=HEADSET  log-only=no
+                            LOG("boneblend: [EYEPOINT] WALK HOLD FIRST (logged once) - face offset from the eye bone: live %.1f mm, held "
+                                "%.1f mm (before cam_eye_forward %.2f) | held while on foot and not standing; refreshed only standing",
+                                rawMm, 1000.0f * VecLen(g_epHoldLocal[0], g_epHoldLocal[1], g_epHoldLocal[2]), f);
+                        }
+                    }
+                    if ((!swingQuiet || walkHold) && g_epHaveHold) {
                         float held[3];
                         for (int r = 0; r < 3; ++r) {
                             held[r] = rn[3 * r] * g_epHoldLocal[0] + rn[3 * r + 1] * g_epHoldLocal[1] + rn[3 * r + 2] * g_epHoldLocal[2];
@@ -32085,8 +32399,9 @@ void EyePointApply(__int64 a1)
                                 1000.0f * VecLen(held[0], held[1], held[2]), diffMm, f,
                                 static_cast<unsigned long long>(kEpSwingTailMs));
                         }
-                    } else if (!swingQuiet) {
-                        // an attack before any remembered value: the live offset (as before this fix) - counted with the crouch case
+                    } else if (!swingQuiet || walkHold) {
+                        // an attack / walking before any remembered value: the live offset (as before this fix) - counted with the
+                        // crouch case
                         InterlockedIncrement64(&g_epCrouchNoHold);
                     } else if (g_epClimbMs != 0 && nowEp - g_epClimbMs < kEpClimbTailMs) {
                         InterlockedIncrement64(&g_epRefClimb);
@@ -32370,14 +32685,15 @@ void EyePointReport()
         "(cam_eye_arc %d, cam_eye_arc_drop %.2f, drop taken off the view %.1f mm), last body-local add %+.1f %+.1f %+.1f mm | "
         "crouch hold: held %lld, waiting for a standing value %lld, not used (unreadable) %lld, last crouched face offset live "
         "%.1f mm vs used %.1f mm, crouch starts %lld, standing frames refused: climb / tail %lld, over %.0f mm %lld (largest "
-        "%.1f mm) | swing hold: held %lld, largest |live - held| %.1f mm. applied 0 while on = NOT ACTING (the counters say why).",
+        "%.1f mm) | swing hold: held %lld, largest |live - held| %.1f mm | walk hold: held %lld. applied 0 while on = NOT ACTING (the "
+        "counters say why).",
         g_epCalls, g_epApplied, g_epOff, g_epNotPlayer, g_epNoLatch, g_epNoBones, g_epNoYaw, g_epArcZero, g_epFault,
         g_epAnchor[0], g_epAnchor[1], g_epAnchorStale[0], g_epAnchorStale[1],
         1000.0f * VecLen(d1[0], d1[1], d1[2]), CamEyeForward, CamEyeUpMm, 1000.0f * VecLen(d2[0], d2[1], d2[2]),
         1000.0f * d2[1], CamEyeArc ? 1 : 0, CamEyeArcDrop, 1000.0f * extraY,
         1000.0f * loc[0], 1000.0f * loc[1], 1000.0f * loc[2],
         g_epCrouchHeld, g_epCrouchNoHold, g_epDuckUnread, g_epHoldLiveMm, g_epHoldHeldMm, g_epCrouchStarts, g_epRefClimb,
-        kEpHoldMaxMm, g_epRefSize, g_epRefMaxMm, g_epSwingHeld, g_epSwingDiffMaxMm);
+        kEpHoldMaxMm, g_epRefSize, g_epRefMaxMm, g_epSwingHeld, g_epSwingDiffMaxMm, g_epWalkHeld);
 }
 
 // Tick thread: latch the drawn slots ([BODYVIEW]'s DcLatch) and the authored upper-arm lengths, once.

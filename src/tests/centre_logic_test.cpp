@@ -118,8 +118,22 @@ static void compose_matches_game_recentre()
     CHECK(Near(out[2], 2.0f, 1e-4f));
 }
 
+// Trace 20261117_1627: height only at the session start, only with a floor, only above the STANDING line (strictly).
+static void height_only_when_standing_at_start()
+{
+    static_assert(kStandEyeM == 1.38f, "mirrors holster_logic.h kStandEyeM");
+    CHECK(HeightDue(Reason::SessionStart, true, 1.65f));
+    CHECK(!HeightDue(Reason::SessionStart, true, 1.20f));    // seated
+    CHECK(!HeightDue(Reason::SessionStart, true, 1.38f));    // on the line - not above it
+    CHECK(HeightDue(Reason::SessionStart, true, 1.381f));
+    CHECK(!HeightDue(Reason::SessionStart, false, 1.65f));   // no floor
+    CHECK(!HeightDue(Reason::Refocus, true, 1.65f));         // headset back on: height kept
+    CHECK(!HeightDue(Reason::None, true, 1.65f));
+}
+
 int main()
 {
+    height_only_when_standing_at_start();
     session_start_centres_once();
     refocus_after_dropout();
     no_centre_without_dropout();

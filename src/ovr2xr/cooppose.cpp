@@ -59,6 +59,10 @@ struct Store {
     float     elbow[2][3];   // item 5 (trace 20261115_1735): the bend direction, body frame; valid when elbowOk
     bool      elbowOk[2];    // false = the last solve's arm was straight (< kStraightM off its shoulder->wrist line)
     ULONGLONG elbowMs[2];    // GetTickCount64 of the elbow's last publish, 0 = never
+    // protocol 5 (trace 20261117_1905): the FINISHED arm-bone local rotations (x y z w), stored by CoopPoseCaptureArmBones at HookTail's
+    // end; boneMs 0 = never / refused on the last capture
+    float     bone[2][coop::kArmBones][4];
+    ULONGLONG boneMs[2];
 };
 constexpr float kStraightM = 0.01f;   // item 5: an elbow closer than this to the shoulder->wrist line has no bend side (my value)
 SRWLOCK g_lock = SRWLOCK_INIT;
@@ -248,6 +252,13 @@ void CoopPoseCaptureLocal()
         } else {
             ps.handState[h] |= coopik::kNoElbow;
         }
+        // protocol 5: the finished arm bones, under the same freshness rule (one player update older than the hands - the capture runs
+        // at HookTail's end, after this call; trace 20261117_1905 CHANGE 2)
+        const bool boneFresh = s.boneMs[h] != 0 && (paused || now - s.boneMs[h] <= kStaleMs);
+        if (boneFresh) {
+            std::memcpy(ps.bone[h], s.bone[h], sizeof(ps.bone[h]));
+            ps.boneOk = static_cast<uint8_t>(ps.boneOk | (1u << h));
+        }
     }
     ps.netId = s_net;
     ps.build = CoopNetBuildId();
@@ -259,13 +270,13 @@ void CoopPoseCaptureLocal()
         // [PROBE: COOPPOSE] gate=coop_pose  site=HEADSET  log-only=yes
         LOG("cooppose: [COOPPOSE] FIRST LOCAL SAMPLE (logged unconditionally) - netId %llu, player %p, root yaw %+.1f deg, head rel root "
             "%+.3f %+.3f %+.3f m, left hand %+.3f %+.3f %+.3f state 0x%02X, right hand %+.3f %+.3f %+.3f state 0x%02X, elbow bend (body "
-            "frame) L %+.2f %+.2f %+.2f%s R %+.2f %+.2f %+.2f%s, protocol %u, build %08X",
+            "frame) L %+.2f %+.2f %+.2f%s R %+.2f %+.2f %+.2f%s, finished arm bones sent L %d R %d, protocol %u, build %08X",
             static_cast<unsigned long long>(ps.netId), reinterpret_cast<void*>(pd), s.rootYaw * 57.2957795f,
             ps.head[0], ps.head[1], ps.head[2], ps.hand[0][0], ps.hand[0][1], ps.hand[0][2], ps.handState[0],
             ps.hand[1][0], ps.hand[1][1], ps.hand[1][2], ps.handState[1], ps.elbow[0][0], ps.elbow[0][1], ps.elbow[0][2],
             (ps.handState[0] & coopik::kNoElbow) ? " (NONE - straight / not published)" : "", ps.elbow[1][0], ps.elbow[1][1],
             ps.elbow[1][2], (ps.handState[1] & coopik::kNoElbow) ? " (NONE - straight / not published)" : "",
-            static_cast<unsigned>(coop::kCoopProto), ps.build);
+            (ps.boneOk & 1) ? 1 : 0, (ps.boneOk & 2) ? 1 : 0, static_cast<unsigned>(coop::kCoopProto), ps.build);
     }
 }
 
@@ -345,6 +356,26 @@ uintptr_t SafePtr(uintptr_t a)
 {
     __try { return *reinterpret_cast<const uintptr_t*>(a); } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
+// trace 20261117_1905 item 4: a model's mesh name, the [AFWCAT] read (boneblend.cpp ReadMeshName: model+8 -> +976 -> the name), mirrored
+// read-only. Printable ASCII up to cap-1; anything else names why.
+void SafeMeshName(uintptr_t model, char* out, size_t cap)
+{
+    const uintptr_t hier = model ? SafePtr(model + 8) : 0;
+    const uintptr_t name = hier ? SafePtr(hier + 976) : 0;
+    if (!name) { strcpy_s(out, cap, hier ? "NULL / UNREADABLE (model+8 -> +976)" : "NULL / UNREADABLE (model+8)"); return; }
+    size_t i = 0;
+    __try {
+        const char* s = reinterpret_cast<const char*>(name);
+        for (; i + 1 < cap; ++i) {
+            const char c = s[i];
+            if (c == 0) { break; }
+            if (c < 0x20 || c > 0x7E) { i = 0; break; }
+            out[i] = c;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { i = 0; }
+    out[i] = 0;
+    if (i == 0) { strcpy_s(out, cap, "UNREADABLE / NOT PRINTABLE"); }
+}
 
 enum { kRoot, kClavL, kUpL, kForeL, kHandL, kClavR, kUpR, kForeR, kHandR, kNeck, kNeck1, kHead, kElCount };
 const char* const kElName[kElCount] = { "bip01", "l_clavicle", "l_upperarm", "l_forearm", "l_hand",
@@ -382,7 +413,27 @@ struct Body {
     long long reachOver[2] = {};                                               // measured frames with reach > 1 (target out of reach)
     long long elbowSrc[3] = {};                                                // pole from: sent / held / rule (both arms)
     long long bendN = 0; float bendSum = 0.0f, bendMax = 0.0f;                 // achieved bend vs the pole given, deg
+    // ---- trace 20261117_1905_coop_full_ik (protocol 5; all reset by Bind's `b = Body{}`) ----
+    int       sp[7] = { -1, -1, -1, -1, -1, -1, -1 };   // pelvis, hspine, spine, spine1, spine2, spine3, hspine1
+    bool      spineOk = false;     // that chain parent-linked, and neck + both clavicles under hspine1 (GetElementParent)
+    int       ab[2][coop::kArmBones] = {};   // [0] left, [1] right: kArmBoneSuffix elements
+    bool      abOk[2] = {};        // all 25 resolved by name on this model
+    char      mesh[96] = {};       // the model's mesh name (model+8 -> +976, the [AFWCAT] read)
+    long long upd = 0;             // updates while bound (every kChkEvery-th runs the sampled checks)
+    long long torsoN = 0, torsoCapped = 0; float torsoGapSum = 0.0f, torsoAppSum = 0.0f, torsoAppMax = 0.0f;   // deg
+    long long fullN[2] = {}, oldN[2] = {};                 // arm updates on the sender's bones / on the old solve
+    float     corrSum[2] = {}, corrMax[2] = {};            // wrist correction (upper + forearm swing), deg
+    long long chkN = 0;                                    // sampled checks run (weight 1, full path, both reads ok)
+    float     rbMax[4] = {}, rbLast[4] = {};               // rebuild: engine world vs our FK, clav / up / fore / hand, mm
+    long long rbFirst[5] = {};                             // first bone over kRbBadMm (clav / up / fore / hand), [4] = none
+    float     swMax = 0.0f;                                // sent vs written: engine local read back vs the local we wrote, deg
+    long long headN = 0; float headMmMax = 0.0f, headDegMax = 0.0f;   // head world before vs after our writes
 };
+constexpr float kTorsoCapRad = 1.0471976f;   // 60 deg: the most of the drawn-body lag the torso takes out (my value, logged at bind)
+constexpr int   kChkEvery    = 16;           // the sampled checks: every 16th update of a body (my value, logged at bind)
+constexpr float kRbBadMm     = 5.0f;         // the per-bone rebuild "first bad bone" threshold (my value)
+enum { kSpPelvis, kSpHspine, kSpSpine, kSpSpine1, kSpSpine2, kSpSpine3, kSpHspine1, kSpCount };
+const char* const kSpName[kSpCount] = { "pelvis", "hspine", "spine", "spine1", "spine2", "spine3", "hspine1" };
 constexpr float kBindM = 2.0f;        // bind: a peer's sent root within this of the body's root (my value - logged at bind)
 constexpr float kSwapMarginM = 1.0f;  // item 2: release a bound peer to an UNBOUND body this much nearer (my value - logged at use)
 SRWLOCK g_rxLock = SRWLOCK_INIT;
@@ -461,6 +512,42 @@ void Bind(Body& b, uintptr_t model, const Api& a)
         LOG("cooppose: [COOPPOSE] REST %s el %d local | %+.4f %+.4f %+.4f %+.4f | %+.4f %+.4f %+.4f %+.4f | %+.4f %+.4f %+.4f %+.4f",
             kElName[k], b.el[k], m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11]);
     }
+    // ---- trace 20261117_1905: the spine chain, the 50 arm bones, the mesh name ----
+    bool chain = true;
+    for (int i = 0; i < kSpCount; ++i) {
+        const int e = SafeId(a.id, model, kSpName[i]);
+        const char* back = e >= 0 ? SafeName(a.name, model, e) : nullptr;
+        b.sp[i] = (e >= 0 && back && _stricmp(back, kSpName[i]) == 0) ? e : -1;
+        if (b.sp[i] < 0) { chain = false; }
+        else if (i > 0 && SafeParent(a.parent, model, b.sp[i]) != b.sp[i - 1]) { chain = false; }
+    }
+    const int hs1 = b.sp[kSpHspine1];
+    b.spineOk = chain && b.el[kNeck] >= 0 && b.el[kClavL] >= 0 && b.el[kClavR] >= 0 &&
+                SafeParent(a.parent, model, b.el[kNeck]) == hs1 && SafeParent(a.parent, model, b.el[kClavL]) == hs1 &&
+                SafeParent(a.parent, model, b.el[kClavR]) == hs1;
+    int found[2] = {};
+    char abMiss[200] = {};
+    size_t abUsed = 0;
+    for (int s = 0; s < 2; ++s) {
+        for (int j = 0; j < coop::kArmBones; ++j) {
+            char nm[40];
+            sprintf_s(nm, "%s%s", s ? "r_" : "l_", coop::kArmBoneSuffix[j]);
+            const int e = SafeId(a.id, model, nm);
+            const char* back = e >= 0 ? SafeName(a.name, model, e) : nullptr;
+            b.ab[s][j] = (e >= 0 && back && _stricmp(back, nm) == 0) ? e : -1;
+            if (b.ab[s][j] >= 0) { ++found[s]; }
+            else if (abUsed + 24 < sizeof(abMiss)) { abUsed += _snprintf_s(abMiss + abUsed, sizeof(abMiss) - abUsed, _TRUNCATE, " %s", nm); }
+        }
+        b.abOk[s] = found[s] == coop::kArmBones;
+    }
+    SafeMeshName(model, b.mesh, sizeof(b.mesh));
+    // [PROBE: COOPPOSE] gate=coop_pose  site=HEADSET  log-only=yes
+    LOG("cooppose: [COOPPOSE] BODY model %p mesh '%s' (trace 20261117_1905) - spine chain pelvis..hspine1 %s (elements %d %d %d %d %d %d %d), "
+        "neck + clavicles under hspine1 %s -> torso turn %s | sender's arm bones resolved L %d / %d R %d / %d%s%s | torso cap %.0f deg over "
+        "spine / spine1 / spine2, checks every %d updates",
+        reinterpret_cast<void*>(model), b.mesh, chain ? "ok" : "NOT a chain", b.sp[0], b.sp[1], b.sp[2], b.sp[3], b.sp[4], b.sp[5], b.sp[6],
+        b.spineOk ? "yes" : "NO", b.spineOk ? "ON" : "OFF (this body keeps the game's torso)", found[0], coop::kArmBones, found[1],
+        coop::kArmBones, abUsed ? " - missing:" : "", abUsed ? abMiss : "", kTorsoCapRad * 57.2957795f, kChkEvery);
 }
 
 // One arm. s = 0 left / 1 right (the sample's index). Returns true when it wrote.
@@ -572,6 +659,160 @@ bool PoseArm(Body& b, const Api& a, const coop::PoseSample& ps, int s, float w, 
     return true;
 }
 
+// ===== trace 20261117_1905_coop_full_ik CHANGE 3 (a) + (b): the torso turn and the kept head =====
+// gap = the sent yaw - this body's drawn yaw (already measured as the drawn-body lag). Clamped to +-kTorsoCapRad, x w (the buffer
+// weight). FK from hspine's WORLD, read once here BEFORE any write of ours this update, with the game's own locals of spine..hspine1:
+// spine / spine1 / spine2 each turned gap / 3 about world +Y through its own origin (coopik::TurnWorldY), written as locals against
+// the already-turned parent; spine3 / hspine1 carried. The neck's world BEFORE is then restored against hspine1 AFTER, so neck1 / head
+// (carried) keep the game's world (Jay: "Keep the head where the game puts it"). *hs1Out = hspine1's world after (= before when no turn).
+// False = a read / write failed (nothing more of this body is posed on the full path this update).
+bool PoseTorso(Body& b, const Api& a, float gapRaw, float w, float hs1Out[12], float* gapDeg, float* appliedDeg, bool* capped)
+{
+    float Whs[12], L[5][12], Ln[12];
+    if (!SafeMtx(a.world, b.model, b.sp[kSpHspine], Whs)) { InterlockedIncrement64(&g_readFail); return false; }
+    for (int i = 0; i < 5; ++i) {
+        if (!SafeMtx(a.local, b.model, b.sp[kSpSpine + i], L[i])) { InterlockedIncrement64(&g_readFail); return false; }
+    }
+    if (!SafeMtx(a.local, b.model, b.el[kNeck], Ln)) { InterlockedIncrement64(&g_readFail); return false; }
+    bool cap = false;
+    const float g = coopik::TorsoYaw(gapRaw, kTorsoCapRad, &cap) * (w > 1.0f ? 1.0f : (w < 0.0f ? 0.0f : w));
+    *gapDeg = coopik::WrapPi(gapRaw) * 57.2957795f;
+    *appliedDeg = g * 57.2957795f;
+    *capped = cap;
+    float nL[3][12], nNeck[12], P[12];
+    if (!coopik::TorsoTurn(Whs, L, Ln, g, nL, nNeck, P)) { InterlockedIncrement64(&g_ikFail); return false; }
+    std::memcpy(hs1Out, P, sizeof(P));   // g ~ 0: the game's own hspine1 world
+    if (!(std::fabs(g) > 1e-5f)) { return true; }   // nothing to turn: no write
+    // [LOADBEARING: coop_pose receiver] the partner's torso turn + kept neck (trace 20261117_1905) - locals only, re-animated by the game
+    // every update (never accumulates).
+    for (int i = 0; i < 3; ++i) {
+        if (!SafeSet(a.set, b.model, b.sp[kSpSpine + i], nL[i])) { InterlockedIncrement64(&g_readFail); return false; }
+    }
+    if (!SafeSet(a.set, b.model, b.el[kNeck], nNeck)) { InterlockedIncrement64(&g_readFail); return false; }
+    return true;
+}
+
+// ===== trace 20261117_1905 CHANGE 3 (c): one arm on the SENDER's finished bones =====
+// Every one of the 25 bones' local = the sent rotation + the game's own translation (TPP rest translations == FPP, INV-736 addendum).
+// FK from hspine1's world (after the torso turn): clavicle -> upperarm -> forearm -> hand. Then the wrist lands on the target T exactly
+// as PoseArm aims it (TargetWorld on the sent yaw, the sender's elbow pole): TwoBoneIk, the upper arm swung (SwingTo, minimal), the
+// forearm carried then swung - so the SENT forearm roll is kept and the twist bones (its children) still match the hand. The hand's world
+// rotation = the sample's (HandWorldRot, as PoseArm) unless kNoRot (then the sent hand local). Every local blended with the game's by w.
+// Outputs for the sampled checks: our FK worlds of clavicle / upperarm / forearm / hand (fk[4][12]) and the locals written (wrote[25]).
+bool PoseArmFull(Body& b, const Api& a, const coop::PoseSample& ps, int s, float w, const float rootPos[3], float rootYaw,
+                 const float hs1[12], float* reachOut, float* corrDeg, int* elbowSrc, float fk[4][12], float wrote[coop::kArmBones][12])
+{
+    const int* E = b.ab[s];
+    float Lg[coop::kArmBones][12], Lo[coop::kArmBones][12];
+    for (int j = 0; j < coop::kArmBones; ++j) {
+        if (!SafeMtx(a.local, b.model, E[j], Lg[j])) { InterlockedIncrement64(&g_readFail); return false; }
+        coopik::LocalFromQ(ps.bone[s][j], Lg[j], Lo[j]);
+    }
+    float Wc[12], Wu[12], Wf[12], Wh[12];
+    coopik::WorldFromLocal(hs1, Lo[coop::kAbClav], Wc);
+    coopik::WorldFromLocal(Wc, Lo[coop::kAbUp], Wu);
+    coopik::WorldFromLocal(Wu, Lo[coop::kAbFore], Wf);
+    coopik::WorldFromLocal(Wf, Lo[coop::kAbHand], Wh);
+    float S[3], F[3], H[3], T[3];
+    Pos(Wu, S); Pos(Wf, F); Pos(Wh, H);
+    coopik::TargetWorld(rootPos, rootYaw, ps.head, ps.hand[s], T);
+    float uv[3], fv[3];
+    Sub3(F, S, uv); Sub3(H, F, fv);
+    const float lu = coopik::Len3(uv), lf = coopik::Len3(fv);
+    // the pole: the sender's bend (sent / held), else down and out from the chest (hspine1) - PoseArm's rule with this body's own centre
+    float pole[3] = { 0.0f, -1.0f, 0.0f };
+    {
+        float out[3] = { S[0] - hs1[3], 0.0f, S[2] - hs1[11] };
+        if (coopik::Norm3(out)) { for (int i = 0; i < 3; ++i) { pole[i] += 0.6f * out[i]; } }
+    }
+    *elbowSrc = coopik::ChooseElbowPole((ps.handState[s] & coopik::kNoElbow) == 0, ps.elbow[s], rootYaw, &b.heldOk[s], b.held[s], pole);
+    float Eo[3], Hn[3];
+    if (!coopik::TwoBoneIk(S, lu, lf, T, pole, Eo, Hn)) { InterlockedIncrement64(&g_ikFail); return false; }
+    float Ur[9], nUr[9], toE[3];
+    coopik::Rot34(Wu, Ur);
+    Sub3(Eo, S, toE);
+    if (!coopik::SwingTo(Ur, uv, toE, nUr)) { InterlockedIncrement64(&g_ikFail); return false; }
+    float nU[12];
+    Compose(nUr, S, nU);
+    float nF0[12], nH0[12];
+    if (!Follow(Wu, nU, Wf, nF0) || !Follow(Wf, nF0, Wh, nH0)) { InterlockedIncrement64(&g_ikFail); return false; }
+    float Fr[9], nFr[9], fp[3], hp[3], cur[3], want[3];
+    coopik::Rot34(nF0, Fr);
+    Pos(nF0, fp); Pos(nH0, hp);
+    Sub3(hp, fp, cur); Sub3(Hn, fp, want);
+    if (!coopik::SwingTo(Fr, cur, want, nFr)) { InterlockedIncrement64(&g_ikFail); return false; }
+    float nF[12];
+    Compose(nFr, fp, nF);
+    float nH1[12];
+    if (!Follow(Wf, nF, Wh, nH1)) { InterlockedIncrement64(&g_ikFail); return false; }
+    float nHw[12];
+    if ((ps.handState[s] & coopik::kNoRot) == 0) {
+        float Hr[9], hp2[3];
+        coopik::HandWorldRot(rootYaw, ps.hand[s] + 3, Hr);
+        Pos(nH1, hp2);
+        Compose(Hr, hp2, nHw);
+    } else {
+        std::memcpy(nHw, nH1, sizeof(nHw));
+    }
+    // the three re-swung locals (translations: the game's, carried through the FK)
+    if (!coopik::LocalFromWorld(Wc, nU, Lo[coop::kAbUp]) || !coopik::LocalFromWorld(nU, nF, Lo[coop::kAbFore]) ||
+        !coopik::LocalFromWorld(nF, nHw, Lo[coop::kAbHand])) {
+        InterlockedIncrement64(&g_ikFail);
+        return false;
+    }
+    Lo[coop::kAbHand][3] = Lg[coop::kAbHand][3]; Lo[coop::kAbHand][7] = Lg[coop::kAbHand][7]; Lo[coop::kAbHand][11] = Lg[coop::kAbHand][11];
+    // [LOADBEARING: coop_pose receiver] the partner's 25 arm bones from the sender's finished arm (trace 20261117_1905)
+    for (int j = 0; j < coop::kArmBones; ++j) {
+        coopik::BlendLocal(Lg[j], Lo[j], w, wrote[j]);
+        if (!SafeSet(a.set, b.model, E[j], wrote[j])) { InterlockedIncrement64(&g_readFail); return false; }
+    }
+    std::memcpy(fk[0], Wc, sizeof(Wc));
+    std::memcpy(fk[1], nU, sizeof(nU));
+    std::memcpy(fk[2], nF, sizeof(nF));
+    std::memcpy(fk[3], nHw, sizeof(nHw));
+    *corrDeg = coopik::VecAngleDeg(uv, toE) + coopik::VecAngleDeg(cur, want);
+    float st[3];
+    Sub3(T, S, st);
+    *reachOut = (lu + lf) > 1e-6f ? coopik::Len3(st) / (lu + lf) : -1.0f;
+    return true;
+}
+
+// trace 20261117_1905 CHANGE 4: the sampled checks after the full path wrote (weight 1 only - our FK is the written pose then).
+// Rebuild per bone (engine world position vs our FK), sent vs written (engine local read back vs the local we wrote), hand to target.
+void CheckArmFull(Body& b, const Api& a, int s, const float fk[4][12], const float wrote[coop::kArmBones][12], const float T[3],
+                  float* hwErr, float* h2t)
+{
+    static const int kIdx[4] = { coop::kAbClav, coop::kAbUp, coop::kAbFore, coop::kAbHand };
+    float rb[4];
+    for (int k = 0; k < 4; ++k) {
+        float m[12];
+        if (!SafeMtx(a.world, b.model, b.ab[s][kIdx[k]], m)) { return; }
+        float d[3] = { m[3] - fk[k][3], m[7] - fk[k][7], m[11] - fk[k][11] };
+        rb[k] = coopik::Len3(d) * 1000.0f;
+        if (k == 3) {
+            float t[3] = { m[3] - T[0], m[7] - T[1], m[11] - T[2] };
+            *h2t = coopik::Len3(t) * 1000.0f;
+        }
+    }
+    float sw = 0.0f;
+    for (int j = 0; j < coop::kArmBones; ++j) {
+        float m[12];
+        if (!SafeMtx(a.local, b.model, b.ab[s][j], m)) { return; }
+        const float d = coopik::RotAngleDeg(m, wrote[j]);
+        if (d > sw) { sw = d; }
+    }
+    ++b.chkN;
+    int first = 4;
+    for (int k = 0; k < 4; ++k) {
+        b.rbLast[k] = rb[k];
+        if (rb[k] > b.rbMax[k]) { b.rbMax[k] = rb[k]; }
+        if (first == 4 && rb[k] > kRbBadMm) { first = k; }
+    }
+    ++b.rbFirst[first];
+    if (sw > b.swMax) { b.swMax = sw; }
+    *hwErr = rb[3];
+}
+
 // INV-736 (b): CorrectItemPosition(vis, hand) - our gamedll +C62AC0 (EGL rva via buildrva), `void __fastcall(void* entity, int hand)`
 // (boneblend.cpp kCorrectItemRva's disassembly note). Resolved once; nullptr = gamedll not loaded.
 typedef void(__fastcall* CorrectItemFn)(void* entity, int hand);
@@ -628,6 +869,19 @@ void CheckLines(double now)
             b.h2tN[0], h2tMean[0], b.h2tN[0] ? b.h2tMax[0] : -1.0f, b.reachOver[0], b.h2tN[1], h2tMean[1],
             b.h2tN[1] ? b.h2tMax[1] : -1.0f, b.reachOver[1], b.elbowSrc[0], b.elbowSrc[1], b.elbowSrc[2], b.bendN,
             b.bendN ? b.bendSum / static_cast<float>(b.bendN) : -1.0f, b.bendN ? b.bendMax : -1.0f);
+        // trace 20261117_1905 CHANGE 4: the full-rig line for the same body
+        // [PROBE: COOPPOSE] gate=coop_pose  site=HEADSET  log-only=yes
+        LOG("cooppose: [COOPPOSE] CHECK body %d FULL (trace 20261117_1905) - mesh '%s', torso turn %s | arms on the SENDER's bones L %lld "
+            "R %lld, on the old solve L %lld R %lld | torso: n %lld, |gap| mean %.1f, applied mean %.1f max %.1f deg, capped %lld (cap %.0f) "
+            "| wrist correction L mean %.1f max %.1f, R mean %.1f max %.1f deg | sampled checks %lld: rebuild max clav %.1f up %.1f fore %.1f "
+            "hand %.1f mm, first bone over %.0f mm: clav %lld up %lld fore %lld hand %lld none %lld | sent vs written max %.2f deg | head "
+            "moved (n %lld) max %.1f mm %.2f deg",
+            i, b.mesh, b.spineOk ? "ON" : "OFF", b.fullN[0], b.fullN[1], b.oldN[0], b.oldN[1], b.torsoN,
+            b.torsoN ? b.torsoGapSum / static_cast<float>(b.torsoN) : 0.0f, b.torsoN ? b.torsoAppSum / static_cast<float>(b.torsoN) : 0.0f,
+            b.torsoAppMax, b.torsoCapped, kTorsoCapRad * 57.2957795f, b.fullN[0] ? b.corrSum[0] / static_cast<float>(b.fullN[0]) : 0.0f,
+            b.corrMax[0], b.fullN[1] ? b.corrSum[1] / static_cast<float>(b.fullN[1]) : 0.0f, b.corrMax[1], b.chkN, b.rbMax[0], b.rbMax[1],
+            b.rbMax[2], b.rbMax[3], kRbBadMm, b.rbFirst[0], b.rbFirst[1], b.rbFirst[2], b.rbFirst[3], b.rbFirst[4], b.swMax, b.headN,
+            b.headMmMax, b.headDegMax);
     }
 }
 
@@ -674,6 +928,79 @@ bool PoseHead(const Body& b, const Api& a, const coop::PoseSample& ps, float w, 
 
 }  // namespace rx
 }  // namespace
+
+// [LOADBEARING: coop_pose sender] protocol 5 (trace 20261117_1905 CHANGE 2): the sender's FINISHED arm bones, at boneblend's HookTail END
+// (after every arm / finger write of the player update). READ ONLY: GetElementLocalMatrix (dl_LocalResolver - passive while flag bit 0
+// is clear, ENGINE_ARCHITECTURE.md:4566). COST: OFF = one bool test; ON = 50 local reads + 50 matrix -> quaternion per player update;
+// 50 GetElementID once per model pointer.
+void CoopPoseCaptureArmBones()
+{
+    if (!CoopPose) { return; }
+    const rx::Api& a = rx::ApiGet();
+    if (!a.ok) { return; }   // the receiver's REFUSED line names the missing export (logged once there)
+    const uintptr_t model = reinterpret_cast<uintptr_t>(BoneProbeCapturedModel());
+    if (!model) { return; }
+    static uintptr_t s_model = 0;
+    static int  s_el[2][coop::kArmBones] = {};
+    static bool s_sideOk[2] = {};
+    static volatile LONG s_saidBad = 0;
+    if (model != s_model) {   // once per model pointer (a death / outfit change gives a new one): resolve by name, checked back
+        s_model = model;
+        int found[2] = {};
+        char miss[200] = {};
+        size_t used = 0;
+        for (int s = 0; s < 2; ++s) {
+            for (int j = 0; j < coop::kArmBones; ++j) {
+                char nm[40];
+                sprintf_s(nm, "%s%s", s ? "r_" : "l_", coop::kArmBoneSuffix[j]);
+                const int e = rx::SafeId(a.id, model, nm);
+                const char* back = e >= 0 ? rx::SafeName(a.name, model, e) : nullptr;
+                s_el[s][j] = (e >= 0 && back && _stricmp(back, nm) == 0) ? e : -1;
+                if (s_el[s][j] >= 0) { ++found[s]; }
+                else if (used + 24 < sizeof(miss)) { used += _snprintf_s(miss + used, sizeof(miss) - used, _TRUNCATE, " %s", nm); }
+            }
+            s_sideOk[s] = found[s] == coop::kArmBones;
+        }
+        // [PROBE: COOPPOSE] gate=coop_pose  site=HEADSET  log-only=yes
+        LOG("cooppose: [COOPPOSE] ARM BONES - sender model %p: resolved L %d / %d R %d / %d%s%s; a side is sent only when all %d resolve "
+            "and every matrix is sane (logged once per model)",
+            reinterpret_cast<void*>(model), found[0], coop::kArmBones, found[1], coop::kArmBones, used ? " - missing:" : "",
+            used ? miss : "", coop::kArmBones);
+    }
+    float q[2][coop::kArmBones][4];
+    bool ok[2] = {};
+    for (int s = 0; s < 2; ++s) {
+        if (!s_sideOk[s]) { continue; }
+        ok[s] = true;
+        for (int j = 0; j < coop::kArmBones && ok[s]; ++j) {
+            float m[12];
+            if (!rx::SafeMtx(a.local, model, s_el[s][j], m) || !coopik::RotSane(m)) {
+                ok[s] = false;
+                if (InterlockedCompareExchange(&s_saidBad, 1, 0) == 0) {
+                    // [PROBE: COOPPOSE] gate=coop_pose  site=HEADSET  log-only=yes
+                    LOG("cooppose: [COOPPOSE] ARM BONES REFUSED %s %s%s on model %p - the local read faulted or is not a rotation (U-50: a "
+                        "stale model); that side is not sent until a capture reads clean (logged once)",
+                        s ? "RIGHT" : "LEFT", s ? "r_" : "l_", coop::kArmBoneSuffix[j], reinterpret_cast<void*>(model));
+                }
+                break;
+            }
+            float r9[9];
+            coopik::Rot34(m, r9);
+            coopik::QFromMat(r9, q[s][j]);
+        }
+    }
+    const ULONGLONG now = GetTickCount64();
+    AcquireSRWLockExclusive(&g_lock);
+    for (int s = 0; s < 2; ++s) {
+        if (ok[s]) {
+            std::memcpy(g_store.bone[s], q[s], sizeof(q[s]));
+            g_store.boneMs[s] = now ? now : 1;
+        } else {
+            g_store.boneMs[s] = 0;   // refused / unresolved: not sent from the next sample on
+        }
+    }
+    ReleaseSRWLockExclusive(&g_lock);
+}
 
 // [LOADBEARING: coop_pose receiver] the only writer of a partner's arm / head pose (spec 8.3). COST: OFF = one bool test (and
 // +C532D0 runs only in co-op); ON = the trace's COST line.
@@ -815,13 +1142,65 @@ void CoopPoseApplyRemote(void* vis)
     int elbowSrc[2] = { -1, -1 };
     bool handRot[2] = {};
     bool wrote = false, armWrote = false;
+    // trace 20261117_1905_coop_full_ik: the TORSO first (from hspine's world, read before any write of ours this update), then each arm -
+    // on the sender's finished bones when the sample carries them for that side, else the old solve (PoseArm).
+    ++b.upd;
+    const bool doChk = (b.upd % rx::kChkEvery) == 0;
+    float headBefore[12];
+    const bool haveHeadBefore = doChk && b.headOk && rx::SafeMtx(a.world, model, b.el[rx::kHead], headBefore);
+    float hs1[12];
+    bool haveHs1 = false;
+    if (b.spineOk && wBuf > 0.0f) {
+        float gapDeg = 0.0f, appDeg = 0.0f;
+        bool capped = false;
+        haveHs1 = rx::PoseTorso(b, a, ps.rootYaw - drawnYaw, wBuf, hs1, &gapDeg, &appDeg, &capped);
+        if (haveHs1) {
+            ++b.torsoN;
+            b.torsoGapSum += std::fabs(gapDeg);
+            b.torsoAppSum += std::fabs(appDeg);
+            if (std::fabs(appDeg) > b.torsoAppMax) { b.torsoAppMax = std::fabs(appDeg); }
+            if (capped) { ++b.torsoCapped; }
+            armWrote = true;   // the turn moves the hands too: the held items are re-placed below
+        }
+    }
     for (int s = 0; s < 2; ++s) {
         const float w = wBuf * b.wHand[s];
-        if (!(w > 0.0f) || !b.armOk[s]) { continue; }
-        const bool ok = rx::PoseArm(b, a, ps, s, w, rootPos, placeYaw, &reach[s], &handRot[s], &hwErr[s], &elbowSrc[s], &h2t[s], &bend[s]);
-        wrote |= ok;
-        armWrote |= ok;
+        if (!(w > 0.0f)) { continue; }
+        const bool full = haveHs1 && b.abOk[s] && (ps.boneOk & (1u << s)) != 0;
+        if (full) {
+            float fk[4][12], wr[coop::kArmBones][12], corr = 0.0f;
+            const bool ok = rx::PoseArmFull(b, a, ps, s, w, rootPos, placeYaw, hs1, &reach[s], &corr, &elbowSrc[s], fk, wr);
+            wrote |= ok;
+            armWrote |= ok;
+            if (ok) {
+                ++b.fullN[s];
+                b.corrSum[s] += corr;
+                if (corr > b.corrMax[s]) { b.corrMax[s] = corr; }
+                handRot[s] = (ps.handState[s] & coopik::kNoRot) == 0;
+                if (doChk && w >= 1.0f) {
+                    float T[3];
+                    coopik::TargetWorld(rootPos, placeYaw, ps.head, ps.hand[s], T);
+                    rx::CheckArmFull(b, a, s, fk, wr, T, &hwErr[s], &h2t[s]);
+                }
+            }
+        } else if (b.armOk[s]) {
+            const bool ok = rx::PoseArm(b, a, ps, s, w, rootPos, placeYaw, &reach[s], &handRot[s], &hwErr[s], &elbowSrc[s], &h2t[s], &bend[s]);
+            wrote |= ok;
+            armWrote |= ok;
+            if (ok) { ++b.oldN[s]; }
+        }
         if (handRot[s]) { InterlockedIncrement64(&rx::g_handRot); }
+    }
+    // the kept head: the game's head world before our writes vs after (sampled)
+    if (haveHeadBefore) {
+        float hAfter[12];
+        if (rx::SafeMtx(a.world, model, b.el[rx::kHead], hAfter)) {
+            const float d[3] = { hAfter[3] - headBefore[3], hAfter[7] - headBefore[7], hAfter[11] - headBefore[11] };
+            const float mm = coopik::Len3(d) * 1000.0f, deg = coopik::RotAngleDeg(hAfter, headBefore);
+            ++b.headN;
+            if (mm > b.headMmMax) { b.headMmMax = mm; }
+            if (deg > b.headDegMax) { b.headDegMax = deg; }
+        }
     }
     // item 3: this body's numbers - the drawn-body lag (sent yaw - drawn yaw; was "root yaw sent - here"), the rebuild check, hand to
     // target (reach > 1 counted apart), the elbow source and the bend check

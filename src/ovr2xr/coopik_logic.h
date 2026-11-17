@@ -369,5 +369,108 @@ inline void HeadBeyondLook(const float real[4], const float reported[4], float d
     QMul(t, qdi, out);
 }
 
+// ===== protocol 5 / trace 20261117_1905_coop_full_ik: the partner's torso turn and the sent arm bones =====
+
+// An angle wrapped to (-pi, pi].
+inline float WrapPi(float a)
+{
+    constexpr float kPi = 3.14159265358979f, k2Pi = 6.28318530717959f;
+    a = std::fmod(a, k2Pi);
+    if (a > kPi) { a -= k2Pi; }
+    if (a <= -kPi) { a += k2Pi; }
+    return a;
+}
+// The torso's turn: the gap wrapped, then clamped to +-capRad (*capped = it was beyond the cap).
+inline float TorsoYaw(float gap, float capRad, bool* capped)
+{
+    float g = WrapPi(gap);
+    bool c = false;
+    if (g > capRad) { g = capRad; c = true; }
+    if (g < -capRad) { g = -capRad; c = true; }
+    if (capped) { *capped = c; }
+    return g;
+}
+// A 3x4 world turned by `yaw` about WORLD +Y through its own origin: rotation Ry(yaw) x R (Ry = coop::RotYVec's matrix
+// [c 0 s; 0 1 0; -s 0 c]), position kept. Raises atan2(col0.x, col0.z) - the receiver's drawn-yaw formula - by +yaw.
+inline void TurnWorldY(float yaw, const float W[12], float out[12])
+{
+    const float c = std::cos(yaw), s = std::sin(yaw);
+    float o[12];
+    for (int col = 0; col < 3; ++col) {
+        o[col]     = c * W[col] + s * W[8 + col];
+        o[4 + col] = W[4 + col];
+        o[8 + col] = -s * W[col] + c * W[8 + col];
+    }
+    o[3] = W[3]; o[7] = W[7]; o[11] = W[11];
+    std::memcpy(out, o, sizeof(o));
+}
+// The receiver's drawn-yaw formula (cooppose.cpp: atan2 of element 0's column 0, x / z).
+inline float YawOf(const float W[12]) { return std::atan2(W[0], W[8]); }
+// The torso turn's pure part (cooppose.cpp PoseTorso; trace 20261117_1905 CHANGE 3 (a) + (b)). Whs = hspine's world; L[0..4] = the
+// game's locals of spine, spine1, spine2, spine3, hspine1; Ln = the neck's local; g = the turn (rad). Out: nL[0..2] = the new locals of
+// spine / spine1 / spine2 (each turned g / 3 about world +Y through its own origin, against its already-turned parent); nNeck = the
+// neck local that keeps the neck's world as it was; hs1New = hspine1's world after. False = a singular parent (nothing usable).
+inline bool TorsoTurn(const float Whs[12], const float L[5][12], const float Ln[12], float g, float nL[3][12], float nNeck[12],
+                      float hs1New[12])
+{
+    float Wold[12];
+    std::memcpy(Wold, Whs, sizeof(Wold));
+    for (int i = 0; i < 5; ++i) { WorldFromLocal(Wold, L[i], Wold); }   // hspine1, the game's
+    float WneckOld[12];
+    WorldFromLocal(Wold, Ln, WneckOld);
+    float P[12];
+    std::memcpy(P, Whs, sizeof(P));
+    for (int i = 0; i < 3; ++i) {
+        float W[12], Wt[12];
+        WorldFromLocal(P, L[i], W);
+        TurnWorldY(g / 3.0f, W, Wt);
+        if (!LocalFromWorld(P, Wt, nL[i])) { return false; }
+        std::memcpy(P, Wt, sizeof(P));
+    }
+    WorldFromLocal(P, L[3], P);   // spine3, carried
+    WorldFromLocal(P, L[4], P);   // hspine1, carried
+    if (!LocalFromWorld(P, WneckOld, nNeck)) { return false; }
+    std::memcpy(hs1New, P, sizeof(P));
+    return true;
+}
+// A local from a rotation (x y z w) and the translation of `keepT` (the game's own local - TPP rest translations == FPP, INV-736).
+inline void LocalFromQ(const float q[4], const float keepT[12], float out[12])
+{
+    float m[9];
+    MatFromQ(q, m);
+    out[0] = m[0]; out[1] = m[1]; out[2]  = m[2];  out[3]  = keepT[3];
+    out[4] = m[3]; out[5] = m[4]; out[6]  = m[5];  out[7]  = keepT[7];
+    out[8] = m[6]; out[9] = m[7]; out[10] = m[8];  out[11] = keepT[11];
+}
+// A local / world whose rotation can be sent: every value finite, each row of length 0.95..1.05 (the sender refuses anything else -
+// U-50's stale model must not reach a partner as a pose).
+inline bool RotSane(const float m[12])
+{
+    for (int i = 0; i < 12; ++i) { if (!std::isfinite(m[i])) { return false; } }
+    for (int r = 0; r < 3; ++r) {
+        const float l = std::sqrt(m[r * 4] * m[r * 4] + m[r * 4 + 1] * m[r * 4 + 1] + m[r * 4 + 2] * m[r * 4 + 2]);
+        if (!(l >= 0.95f && l <= 1.05f)) { return false; }
+    }
+    return true;
+}
+// The angle (deg) between two 3x4s' rotations.
+inline float RotAngleDeg(const float a[12], const float b[12])
+{
+    float tr = 0.0f;
+    for (int r = 0; r < 3; ++r) { for (int c = 0; c < 3; ++c) { tr += a[r * 4 + c] * b[r * 4 + c]; } }
+    float x = 0.5f * (tr - 1.0f);
+    x = x > 1.0f ? 1.0f : (x < -1.0f ? -1.0f : x);
+    return std::acos(x) * 57.2957795f;
+}
+// The angle (deg) between two vectors (0 when either is ~zero).
+inline float VecAngleDeg(const float a[3], const float b[3])
+{
+    const float la = Len3(a), lb = Len3(b);
+    if (!(la > 1e-8f) || !(lb > 1e-8f)) { return 0.0f; }
+    float x = Dot3(a, b) / (la * lb);
+    x = x > 1.0f ? 1.0f : (x < -1.0f ? -1.0f : x);
+    return std::acos(x) * 57.2957795f;
+}
+
 }  // namespace coopik
 }  // namespace dlvr
