@@ -129,6 +129,7 @@ Quest / Touch layout, default buttons. Valve Index: X = left A, Y = left B, Menu
 | --- | --- |
 | Right shoulder + right grip | Switch weapon. Hold: weapon wheel |
 | Right hip + right grip | Swap item. Hold: throwables wheel |
+| Right hip + right trigger | Use Throwable. Hold & Release to throw |
 | Left hip + left grip | Ammo for manual reload |
 | Left chest + left grip | Heal |
 | Left side of your head + left grip | Flashlight |
