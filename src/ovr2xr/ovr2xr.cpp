@@ -83,6 +83,7 @@
 #include "watchwrite.h"   // WatchExecSayOrphans - the U-26 orphan-trap count on the 600-frame line
 #include "settings.h"
 #include "snap_logic.h"
+#include "menutap_logic.h"  // the left menu button's tap / hold machine + the co-op teleport latch (INV-745)
 #include "fovtable_logic.h"   // first-launch FOV rows (no hmd_cache.txt yet)
 #include "eyefov_logic.h"     // one frustum for both eyes (INV-597)
 #include "videoforce_logic.h" // vr_force_vsync_off's bring-up stub
@@ -826,7 +827,9 @@ bool  g_verticalExtend = false;  // never touch the FOV the game renders with
 //
 // The same figure was arrived at independently on another Quest 3 mod, so treat
 // it as a property of this headset and runtime, not of this code.
-bool  g_autoPitch = true;
+// SHIPPED OFF (2026-11-17, Jay: "Verified for now. As well as the auto_pitch=0"; trace 20261117_1545): rotating ONLY the declared pose
+// rolled the horizon with head yaw (INV-664; testers' 1.02 wobble). Reference mods submit the located pose unrotated.
+bool  g_autoPitch = false;
 float g_pitchOffsetDeg = 0.0f;   // 0 with auto_pitch=1 means "use the computed value"
 
 // Rotates a pose about its own X axis. Positive tilts the declared view up,
@@ -7644,9 +7647,12 @@ static bool ShiftAppSpaceTo(Session* s, const XrVector3f& newBasePos, XrResult* 
 }
 
 // Centre (D-284): runs in BeginFrameIfNeeded after the absorb, before the frame's first locate, only while a centre is pending.
-// The head's x/z is taken AFTER the neck pivot, so the x/z we REPORT read 0 once it is done. Height and yaw are untouched.
+// The head's x/z is taken AFTER the neck pivot, so the x/z we REPORT read 0 once it is done. Yaw is untouched. Height: only at the
+// SESSION START and only when the STAGE floor says STANDING (centre::HeightDue; trace 20261117_1627_centre_height_standing, Jay
+// 2026-11-17 option B - players loaded in "extremely tall") the origin moves to the head's raw height, as ovr_RecenterTrackingOrigin
+// does; otherwise height is kept.
 // COST: one xrLocateSpace per frame while a centre is pending (at most kGiveUpNs = 5 s per session-state change), then
-// ShiftAppSpaceTo's create + destroy once. Nothing at all while none is pending.
+// ShiftAppSpaceTo's create + destroy once, plus one xrLocateSpace(VIEW, STAGE) at a session-start centre. Nothing while none is pending.
 static void ApplyCentre(Session* s)
 {
     ::dlvr::centre::Tracker& c = s->centre;
@@ -7681,17 +7687,36 @@ static void ApplyCentre(Session* s)
     const float base[3] = { s->appBasePos.x, s->appBasePos.y, s->appBasePos.z };
     float out[3];
     ::dlvr::centre::ComposeBasePos(s->appBaseYawDeg, base, rep.x, rep.z, out);
+    // Height (trace 20261117_1627): the eye above the STAGE floor, located once, only at the session start.
+    const bool atStart = c.pending == ::dlvr::centre::Reason::SessionStart;
+    XrSpaceLocation fl{ XR_TYPE_SPACE_LOCATION };
+    const bool floorOk = atStart && s->stageSpace != XR_NULL_HANDLE &&
+                         XR_SUCCEEDED(xrLocateSpace_(s->viewSpace, s->stageSpace, t, &fl)) &&
+                         (fl.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0;
+    const float eyeFloor = floorOk ? fl.pose.position.y : -1.0f;
+    const bool height = ::dlvr::centre::HeightDue(c.pending, floorOk, eyeFloor);
+    if (height) {
+        out[1] = base[1] + loc.pose.position.y;   // the raw head height, as ovr_RecenterTrackingOrigin composes it
+    }
     XrResult cr = XR_SUCCESS;
     const bool ok = ShiftAppSpaceTo(s, XrVector3f{ out[0], out[1], out[2] }, &cr);
     if (ok) {
         ::dlvr::HolsterBodyReset();        // holster body-lock: its facing + latches were in the old appSpace
         ::dlvr::uipanel::HudRecentre();    // the HUD panel is fixed in appSpace - latch it in front of the head again
+        if (height) {
+            s->floorTick = 0;              // appFloorY changed with the origin - re-locate it at the next locate
+        }
     }
+    const char* heightWhy = height    ? "HEIGHT SET to the head (standing)"
+                            : !atStart ? "height kept (headset back on)"
+                            : !floorOk ? "height kept (no floor located)"
+                                       : "height kept (seated: eye not above 1.38 m)";
     // [PROBE: CENTRE] gate=none  site=HEADSET  log-only=no
-    LOG("[CENTRE] DONE %s: head was (%+.3f, %+.3f) m from the origin (%.3f m, after the neck pivot), base pos now (%+.3f, %+.3f, "
-        "%+.3f), base yaw %+.2f deg unchanged, waited %.0f ms (absorb %d frames, untracked %d frames) | appSpace recreated %s "
-        "(result %d)",
+    LOG("[CENTRE] DONE %s: head was (%+.3f, %+.3f) m from the origin (%.3f m, after the neck pivot), head y %+.3f m, eye %.3f m above "
+        "the floor (-1 = not located) - %s, base pos now (%+.3f, %+.3f, %+.3f), base yaw %+.2f deg unchanged, waited %.0f ms (absorb "
+        "%d frames, untracked %d frames) | appSpace recreated %s (result %d)",
         ::dlvr::centre::ReasonName(c.pending), rep.x, rep.z, std::sqrt(rep.x * rep.x + rep.z * rep.z),
+        static_cast<double>(loc.pose.position.y), static_cast<double>(eyeFloor), heightWhy,
         ok ? out[0] : s->appBasePos.x, ok ? out[1] : s->appBasePos.y, ok ? out[2] : s->appBasePos.z, s->appBaseYawDeg,
         static_cast<double>(now - c.armedAt) / 1.0e6, s->centreAbsorbWait, s->centreUntracked,
         ok ? "OK" : "FAILED - kept the old one", static_cast<int>(cr));
@@ -9277,6 +9302,12 @@ ovr_GetTrackingState(ovrSession session, double absTime, ovrBool latencyMarker)
     g_lastStrippedHeadYaw = stripped;
 
     ts.HeadPose.ThePose = ToOvr(head);
+    {
+        // FIX 1 (trace docs/traces/20261117_1316_rscam_fix1.md; BETA port 20261117_1600): record the position the engine's slot 7 may
+        // store (as (-x, y, -z)), with the share the appSpace shift had taken - both only change inside BeginFrameIfNeeded under this lock.
+        const float rep[3] = { ts.HeadPose.ThePose.Position.x, ts.HeadPose.ThePose.Position.y, ts.HeadPose.ThePose.Position.z };
+        ::dlvr::RoomscaleNoteReported(rep);
+    }
     ts.HeadPose.TimeInSeconds = XrTimeToSeconds(s->frameState.predictedDisplayTime);
     ts.StatusFlags = s->posesValid
                          ? (ovrStatus_OrientationTracked | ovrStatus_PositionTracked)
@@ -12028,6 +12059,48 @@ static bool SnapLockpickRunning(int* ctrlActive, int* playerBlocks)
     return *ctrlActive == 1 && *playerBlocks > 0;
 }
 
+// CO-OP WAITING-PLACE TELEPORT OFFER (INV-745; trace docs/traces/20261117_2045_coop_teleport_menu_latch.md). The game's hold
+// progress for "appear in waiting place" is a float at PlayerDI+10340 (+BCF600 = PlayerDI+440's slot 1 writes a1+9900): -1.0 when
+// no teleport is on offer, [0, 1] while it is. Read ONLY when the menu-button machine asks (menutap::NeedsOffer: the 500 ms hold
+// decision and the latch) - never on an idle poll. COST when read: buildrva's cached build test, RigGamePlayerObject's four guarded
+// loads, one guarded float load. *why: 0 read, 1..5 no local player (1 + RigGamePlayerObject's why), 6 the float load faulted,
+// 10 the gamedll build is not STEAM / EGL (BETA only - the offset was checked on those two), 13 the gamedll is not loaded.
+static bool CoopTpLoadFloat(uintptr_t addr, float* out)
+{
+    __try {
+        *out = *reinterpret_cast<const volatile float*>(addr);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static float CoopTpProgress(int* why, uintptr_t* player)
+{
+    *player = 0;
+#if __has_include("../common/buildrva.h")
+    const ::dlvr::buildrva::Build b = ::dlvr::buildrva::ModuleBuild(::dlvr::buildrva::kGamedll);
+    if (b != ::dlvr::buildrva::kSteam && b != ::dlvr::buildrva::kEgl) {
+        *why = b == ::dlvr::buildrva::kNotLoaded ? 13 : 10;
+        return -1.0f;
+    }
+#endif
+    int pw = 0;
+    const uintptr_t pl = dlvr::RigGamePlayerObject(&pw);
+    if (!pl) {
+        *why = 1 + pw;
+        return -1.0f;
+    }
+    *player = pl;
+    float v = -1.0f;
+    if (!CoopTpLoadFloat(pl + 10340, &v)) {
+        *why = 6;
+        return -1.0f;
+    }
+    *why = 0;
+    return v;
+}
+
 static bool SnapTurnFilter(unsigned char* p, float rx)
 {
     static dlvr::snapturn::Edge s_edge;
@@ -12616,47 +12689,63 @@ extern "C" __declspec(dllexport) void dlvr_FilterScePad(void* pData)
     // A press cannot be told from the start of a hold until it is released or reaches kMenuHoldMs, so SELECT
     // is sent on a release before kMenuHoldMs (a 100 ms pulse, the length INV-299 measured working), and START
     // from kMenuHoldMs for as long as the button stays held. SELECT itself can therefore never be HELD -
-    // inputs_pad.scr:91's 0.5 s TOUCHPAD hold action (_ACTION_APPEAR_IN_WAITING_PLACE) is unreachable here.
+    // inputs_pad.scr:91's 0.5 s TOUCHPAD hold action (_ACTION_APPEAR_IN_WAITING_PLACE) was unreachable here - until:
+    // CO-OP TELEPORT LATCH (2026-11-17, Jay: "Yes, build it that way"; INV-745; trace 20261117_2045_coop_teleport_menu_latch): when the
+    // 0.5 s hold lands while the game OFFERS the waiting-place teleport (CoopTpProgress in [0, 1]) and no in-game menu is up, the hold
+    // LATCHES a held TOUCH_PAD instead of START - the game needs >= 1.0 s of held input, past VD's ~1 s menu-hold shortcut (D-175), so
+    // the player lets go and the latch holds it until the teleport fires, the offer ends, an in-game menu opens, the button is pressed
+    // again, or 3 s pass (menutap_logic.h, unit-tested). Not on offer = SELECT / START exactly as before. The offer is read only at
+    // the hold decision and during the latch.
     if (g_vrMenuButton) {
-        constexpr ULONGLONG kMenuHoldMs = 500;
-        constexpr ULONGLONG kMenuPulseMs = 100;
         constexpr uint32_t kSelectBit = 0x100000u;  // TOUCH_PAD
         constexpr uint32_t kStartBit = 0x8u;        // OPTIONS
-        enum class MenuTap { Idle, Down, SelectPulse, StartHeld };
-        static MenuTap s_tap = MenuTap::Idle;
-        static ULONGLONG s_tapT = 0;   // time the current state was entered
+        static dlvr::menutap::Machine s_tap;
         bool pressed = false;
         const bool down = dlvr::GetControllerMenuButton(pressed) && pressed;
         const ULONGLONG now = GetTickCount64();
-        const ULONGLONG age = now - s_tapT;
-        const MenuTap before = s_tap;
-        switch (s_tap) {
-        case MenuTap::Idle:
-            if (down) { s_tap = MenuTap::Down; s_tapT = now; }
-            break;
-        case MenuTap::Down:
-            if (!down) { s_tap = MenuTap::SelectPulse; s_tapT = now; }
-            else if (age >= kMenuHoldMs) { s_tap = MenuTap::StartHeld; s_tapT = now; }
-            break;
-        case MenuTap::SelectPulse:
-            if (age >= kMenuPulseMs) { s_tap = MenuTap::Idle; s_tapT = now; }
-            break;
-        case MenuTap::StartHeld:
-            if (!down && age >= kMenuPulseMs) { s_tap = MenuTap::Idle; s_tapT = now; }
-            break;
+        const dlvr::menutap::State before = s_tap.st;
+        bool offer = false;
+        float prog = -1.0f;
+        int tpWhy = -1;
+        uintptr_t tpPlayer = 0;
+        if (dlvr::menutap::NeedsOffer(s_tap, down, now)) {
+            prog = CoopTpProgress(&tpWhy, &tpPlayer);
+            offer = tpWhy == 0 && dlvr::menutap::OfferFromProgress(prog);
+            static bool s_tpFirst = true;
+            if (s_tpFirst) {
+                s_tpFirst = false;
+                // [PROBE: COOPTP] gate=vr_menu_button  site=HEADSET  log-only=no
+                LOG("vr_menu_button (scepad): [COOPTP] first teleport-offer read (logged unconditionally) - read %d (0 read, 1-5 no local "
+                    "player, 6 the float faulted, 10 gamedll build not STEAM / EGL, 13 gamedll not loaded), player %p, progress %.3f -> %s",
+                    tpWhy, reinterpret_cast<void*>(tpPlayer), prog, offer ? "ON OFFER" : "not on offer");
+            }
+            static bool s_tpBuildSaid = false;
+            if (tpWhy == 10 && !s_tpBuildSaid) {
+                s_tpBuildSaid = true;
+                // [PROBE: COOPTP] gate=vr_menu_button  site=HEADSET  log-only=no
+                LOG("vr_menu_button (scepad): [COOPTP] REFUSED - this gamedll build is not STEAM or EGL (the PlayerDI+10340 offset was "
+                    "checked on those two only); the co-op teleport latch never engages, the 0.5 s hold is START as before");
+            }
         }
+        const dlvr::menutap::Out o = dlvr::menutap::Step(s_tap, down, now, offer, prog, gameMenu);
         auto* buttons = reinterpret_cast<uint32_t*>(p);
-        if (s_tap == MenuTap::SelectPulse) {
+        if (o.touchpad) {
             *buttons |= kSelectBit;
-        } else if (s_tap == MenuTap::StartHeld) {
+        } else if (o.start) {
             *buttons |= kStartBit;
         }
         // Logged on each state change only - unthrottled, since a tap lasts a few polls and a %-counter
         // throttle could miss it entirely.
-        if (s_tap != before) {
-            static const char* const kTapName[] = { "idle", "down", "SELECT pulse", "START held" };
-            LOG("vr_menu_button (scepad): %s -> %s, buttons=0x%08X", kTapName[static_cast<int>(before)],
-                kTapName[static_cast<int>(s_tap)], *buttons);
+        if (s_tap.st != before) {
+            if (s_tap.st == dlvr::menutap::State::TeleportLatch || o.ended != dlvr::menutap::EndWhy::None) {
+                // [PROBE: COOPTP] gate=vr_menu_button  site=HEADSET  log-only=no
+                LOG("vr_menu_button (scepad): [COOPTP] %s -> %s, progress %.3f (read %d), ended: %s, buttons=0x%08X",
+                    dlvr::menutap::StateName(before), dlvr::menutap::StateName(s_tap.st), prog, tpWhy,
+                    dlvr::menutap::EndName(o.ended), *buttons);
+            } else {
+                LOG("vr_menu_button (scepad): %s -> %s, buttons=0x%08X", dlvr::menutap::StateName(before),
+                    dlvr::menutap::StateName(s_tap.st), *buttons);
+            }
         }
     }
 

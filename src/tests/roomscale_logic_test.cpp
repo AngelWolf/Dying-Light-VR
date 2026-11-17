@@ -124,8 +124,64 @@ static void dead_zone_shortens_along_itself()
     CHECK(Near(x, -0.30f) && z == 0.0f);
 }
 
+// FIX 1: ShareAlong must equal PreStepDetour's own arithmetic (roomscale.cpp, copied here verbatim as the reference).
+static void ref_prestep_share(float dx, float dz, float gx, float gz, float dt, float ex, float ez, float& sx, float& sz)
+{
+    sx = 0.0f; sz = 0.0f;
+    const float elen = std::sqrt(ex * ex + ez * ez);
+    if (elen > 1e-4f && dt > 0.0f) {
+        const float rx = dx - gx * dt;
+        const float rz = dz - gz * dt;
+        float along = (rx * ex + rz * ez) / elen;
+        const float maxAlong = elen * dt;
+        along = along < 0.0f ? 0.0f : (along > maxAlong ? maxAlong : along);
+        sx = ex / elen * along;
+        sz = ez / elen * along;
+    }
+}
+static void share_along_equals_prestep()
+{
+    const float cases[][7] = {
+        { 0.006f, 0.0f, 0.0f, 0.0f, 0.02f, 0.3f, 0.0f },     // roomscale only, the full step
+        { 0.004f, 0.0f, 0.0f, 0.0f, 0.02f, 0.3f, 0.0f },     // a wall cut the step short
+        { 0.020f, 0.010f, 0.5f, 0.5f, 0.02f, 0.2f, -0.1f },  // stick + roomscale
+        { -0.010f, 0.0f, 0.0f, 0.0f, 0.02f, 0.3f, 0.0f },    // moved against the extra: clamped to 0
+        { 0.050f, 0.0f, 0.0f, 0.0f, 0.02f, 0.3f, 0.0f },     // more than |extra| x dt: clamped to it
+        { 0.006f, 0.0f, 0.0f, 0.0f, 0.02f, 0.0f, 0.0f },     // no extra: 0
+        { 0.006f, 0.0f, 0.0f, 0.0f, 0.0f, 0.3f, 0.0f },      // dt 0: 0
+    };
+    for (const auto& c : cases) {
+        float ax, az, bx, bz;
+        ShareAlong(c[0], c[1], c[2], c[3], c[4], c[5], c[6], ax, az);
+        ref_prestep_share(c[0], c[1], c[2], c[3], c[4], c[5], c[6], bx, bz);
+        CHECK(ax == bx && az == bz);   // bit-identical to the pre-step
+    }
+    float sx, sz;
+    ShareAlong(0.05f, 0.0f, 0.0f, 0.0f, 0.02f, 0.3f, 0.0f, sx, sz);
+    CHECK(Near(sx, 0.006f) && sz == 0.0f);                 // |extra| x dt = 0.3 x 0.02
+}
+static void intraframe_time_recovers_t()
+{
+    CHECK(Near(IntraframeTime(0.003f, 0.004f, 0.3f, 0.4f), 0.01f));   // vt = v x 10 ms
+    CHECK(IntraframeTime(0.003f, 0.0f, 0.0f, 0.0f) == 0.0f);           // a still body: 0
+    CHECK(IntraframeTime(-0.003f, 0.0f, 0.3f, 0.0f) == 0.0f);          // backwards: not believed -> 0
+    CHECK(Near(IntraframeTime(0.3f, 0.0f, 0.3f, 0.0f), kMaxIntraS));   // 1 s: clamped
+}
+static void reported_match_is_exact()
+{
+    const float ring[3][3] = { { 0.1f, 1.6f, -0.2f }, { 0.11f, 1.6f, -0.21f }, { -0.0f, 1.5f, 0.0f } };
+    CHECK(MatchReported(ring, 3, -0.11f, 1.6f, 0.21f) == 1);           // the store is (-x, y, -z)
+    CHECK(MatchReported(ring, 3, -0.1f, 1.6f, 0.2f) == 0);
+    CHECK(MatchReported(ring, 3, 0.11f, 1.6f, -0.21f) == -1);          // NOT negated: must miss
+    CHECK(MatchReported(ring, 3, -0.110001f, 1.6f, 0.21f) == -1);      // one ulp-ish off: must miss
+    CHECK(MatchReported(ring, 0, -0.1f, 1.6f, 0.2f) == -1);            // empty ring
+}
+
 int main()
 {
+    share_along_equals_prestep();
+    intraframe_time_recovers_t();
+    reported_match_is_exact();
     dead_zone_drops_small_commands();
     dead_zone_shortens_along_itself();
     bleed_moves_toward_origin();

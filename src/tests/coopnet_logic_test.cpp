@@ -50,7 +50,40 @@ PoseSample MakeSample(uint32_t seq, double sendMs, float base)
     // protocol 4: unit bend directions (handState 3 / 4 leave bit 0x20 clear)
     s.elbow[0][0] = 0.0f; s.elbow[0][1] = -1.0f; s.elbow[0][2] = 0.0f;
     s.elbow[1][0] = 0.6f; s.elbow[1][1] = -0.8f; s.elbow[1][2] = 0.0f;
+    // protocol 5: every bone a distinct unit quaternion (a turn of 0.05 * (j + 1) + 0.01 * base rad about a per-side axis)
+    s.boneOk = 3;
+    for (int h = 0; h < 2; ++h) {
+        const float ax[3] = { h ? 0.267f : 0.0f, 0.535f, h ? 0.802f : 0.845f };
+        const float al = std::sqrt(ax[0] * ax[0] + ax[1] * ax[1] + ax[2] * ax[2]);
+        for (int j = 0; j < kArmBones; ++j) {
+            const float ang = 0.05f * static_cast<float>(j + 1) + 0.01f * base, sn = std::sin(0.5f * ang);
+            s.bone[h][j][0] = ax[0] / al * sn; s.bone[h][j][1] = ax[1] / al * sn; s.bone[h][j][2] = ax[2] / al * sn;
+            s.bone[h][j][3] = std::cos(0.5f * ang);
+        }
+    }
     return s;
+}
+
+// The angle (deg) between two unit quaternions (x y z w), double cover folded. In DOUBLE on the relative rotation r = conj(a) b:
+// 2 atan2(|r.xyz|, |r.w|) - a float acos(dot) cannot resolve small angles (one float step at dot ~1 is ~0.04 deg).
+float QuatAngleDeg(const float* a, const float* b)
+{
+    const double ax = -a[0], ay = -a[1], az = -a[2], aw = a[3];
+    const double bx = b[0], by = b[1], bz = b[2], bw = b[3];
+    const double x = aw * bx + ax * bw + ay * bz - az * by;
+    const double y = aw * by - ax * bz + ay * bw + az * bx;
+    const double z = aw * bz + ax * by - ay * bx + az * bw;
+    const double w = aw * bw - ax * bx - ay * by - az * bz;
+    return static_cast<float>(2.0 * std::atan2(std::sqrt(x * x + y * y + z * z), std::fabs(w)) * 57.29577951308232);
+}
+
+bool BonesClose(const PoseSample& a, const PoseSample& b, float tolDeg)
+{
+    if (a.boneOk != b.boneOk) { return false; }
+    for (int h = 0; h < 2; ++h) {
+        for (int j = 0; j < kArmBones; ++j) { if (QuatAngleDeg(a.bone[h][j], b.bone[h][j]) > tolDeg) { return false; } }
+    }
+    return true;
 }
 
 bool SameSample(const PoseSample& a, const PoseSample& b)
@@ -59,6 +92,7 @@ bool SameSample(const PoseSample& a, const PoseSample& b)
     if (std::memcmp(a.head, b.head, sizeof(a.head)) != 0 || std::memcmp(a.hand, b.hand, sizeof(a.hand)) != 0) { return false; }
     if (std::memcmp(a.rootPos, b.rootPos, sizeof(a.rootPos)) != 0 || a.rootYaw != b.rootYaw) { return false; }
     if (std::memcmp(a.elbow, b.elbow, sizeof(a.elbow)) != 0) { return false; }
+    if (!BonesClose(a, b, 0.01f)) { return false; }   // protocol 5: the smallest-three pack error (QuatPackError)
     for (int h = 0; h < 2; ++h) {
         if (a.finger[h].index != b.finger[h].index || a.finger[h].thumb != b.finger[h].thumb ||
             a.finger[h].lower != b.finger[h].lower || a.handState[h] != b.handState[h]) {
@@ -284,7 +318,7 @@ void DataReturnEasesBackIn()
 // After RUN CO1 (trace 20261113_2035): the sender's world root travels in the packet and is interpolated like the pose positions.
 void RootPosTravels()
 {
-    static_assert(kCoopProto == 4, "protocol 4 carries rootPos + rootYaw + elbow (trace 20261115_1735)");
+    static_assert(kCoopProto == 5, "protocol 5 carries rootPos + rootYaw + elbow + the arm bones (trace 20261117_1905)");
     PoseSample a = MakeSample(1, 1000.0, 0.0f), b = MakeSample(2, 1010.0, 10.0f);
     uint8_t buf[kMaxPacket] = {};
     PoseSample r{};
@@ -297,6 +331,8 @@ void RootPosTravels()
     old[0] = 2;                                      // a protocol-2 peer = no data
     CHECK(!Unpack(old, sizeof(old), &r));
     old[0] = 3;                                      // ... and a protocol-3 one (the CO3 package)
+    CHECK(!Unpack(old, sizeof(old), &r));
+    old[0] = 4;                                      // ... and a protocol-4 one (RELEASE 1.02)
     CHECK(!Unpack(old, sizeof(old), &r));
     JitterBuffer jb;
     jb.SetParams(500.0f, 150.0f, 0.0f);
@@ -361,6 +397,80 @@ void ElbowTravelsAndLerps()
     // ... after it, b (no direction, the bit set) - never a blend toward a direction the sender did not have
     CHECK(jb2.SampleAtSenderTime(1007.0, &m));
     CHECK((m.handState[0] & kHandNoElbowBit) != 0);
+}
+
+// Protocol 5: smallest-three packing - worst angle over many unit quaternions (incl. each axis dominant, both signs, near-identity).
+void QuatPackError()
+{
+    float worst = 0.0f;
+    uint32_t r = 12345u;
+    auto rnd = [&r]() { r = r * 1664525u + 1013904223u; return static_cast<float>((r >> 8) & 0xFFFF) / 32767.5f - 1.0f; };
+    for (int i = 0; i < 20000; ++i) {
+        float q[4] = { rnd(), rnd(), rnd(), rnd() };
+        if (i < 8) { for (float& v : q) { v = 0.0f; } q[i % 4] = (i < 4) ? 1.0f : -1.0f; }   // each axis dominant, both signs
+        const float l = std::sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+        if (!(l > 1e-3f)) { continue; }
+        for (float& v : q) { v /= l; }
+        uint8_t idx = 9;
+        int16_t c[3] = {};
+        PackQuat(q, &idx, c);
+        CHECK(idx <= 3);
+        float o[4] = {};
+        CHECK(UnpackQuat(idx, c, o));
+        NEAR(o[0] * o[0] + o[1] * o[1] + o[2] * o[2] + o[3] * o[3], 1.0f, 1e-5f);
+        const float d = QuatAngleDeg(q, o);
+        if (d > worst) { worst = d; }
+    }
+    std::printf("  QuatPackError worst %.5f deg\n", worst);
+    CHECK(worst <= 0.01f);
+    int16_t c[3] = {};
+    float o[4] = { 9.0f, 9.0f, 9.0f, 9.0f };
+    CHECK(!UnpackQuat(4, c, o));                     // an index byte outside 0..3: refused, untouched
+    NEAR(o[0], 9.0f, 0.0f);
+}
+
+// Protocol 5: the bones travel; slerped when both samples carry a side, the nearer sample's when one does not; a bad index byte
+// refuses the packet with a named reason; the packet fits one EOS packet.
+void BonesTravelAndLerp()
+{
+    static_assert(detail::kPacketSize <= kMaxPacket, "protocol 5 fits");
+    std::printf("  packet size %u bytes\n", static_cast<unsigned>(detail::kPacketSize));
+    PoseSample a = MakeSample(1, 1000.0, 0.0f), b = MakeSample(2, 1010.0, 10.0f);
+    JitterBuffer jb;
+    jb.SetParams(500.0f, 150.0f, 0.0f);
+    jb.Push(a, 1000.0);
+    jb.Push(b, 1010.0);
+    PoseSample m{};
+    CHECK(jb.SampleAtSenderTime(1005.0, &m));
+    CHECK(m.boneOk == 3);
+    // bone j of side h turns 0.05 (j + 1) + 0.01 base about one axis: the midpoint of base 0 and 10 = base 5
+    const PoseSample mid = MakeSample(3, 1005.0, 5.0f);
+    for (int h = 0; h < 2; ++h) { for (int j = 0; j < kArmBones; ++j) { NEAR(QuatAngleDeg(m.bone[h][j], mid.bone[h][j]), 0.0f, 0.01f); } }
+    // b without the right side: before the midpoint a's bones + bit, after it b's (bit clear) - never a blend toward nothing
+    b.boneOk = 1;
+    JitterBuffer jb2;
+    jb2.SetParams(500.0f, 150.0f, 0.0f);
+    jb2.Push(a, 1000.0);
+    jb2.Push(b, 1010.0);
+    CHECK(jb2.SampleAtSenderTime(1003.0, &m));
+    CHECK((m.boneOk & 2) != 0);
+    NEAR(QuatAngleDeg(m.bone[1][4], a.bone[1][4]), 0.0f, 1e-4f);
+    NEAR(QuatAngleDeg(m.bone[0][4], MakeSample(4, 1003.0, 3.0f).bone[0][4]), 0.0f, 0.01f);   // the left still slerps
+    CHECK(jb2.SampleAtSenderTime(1007.0, &m));
+    CHECK((m.boneOk & 2) == 0);
+    // a corrupt index byte (the first bone's, right after boneOk) refuses the packet and says why
+    uint8_t buf[kMaxPacket] = {};
+    const size_t n = Pack(a, buf, sizeof(buf));
+    CHECK(n == detail::kPacketSize);
+    buf[detail::kPacketSize - detail::kBoneBytes + 1] = 7;
+    PoseSample r{};
+    const char* why = nullptr;
+    CHECK(!Unpack(buf, n, &r, &why));
+    CHECK(why != nullptr && std::strcmp(why, "a bone index byte out of range") == 0);
+    // boneOk 0 travels as 0 (the receiver keeps the old solve for both arms)
+    a.boneOk = 0;
+    CHECK(Unpack(buf, Pack(a, buf, sizeof(buf)), &r));
+    CHECK(r.boneOk == 0);
 }
 
 // Item 2: no keep distance; released only when stale, taken, or an unbound body is a clearly nearer match.
@@ -471,6 +581,8 @@ int main()
     RUN(RootPosTravels);
     RUN(YawLerpsShortestArc);
     RUN(ElbowTravelsAndLerps);
+    RUN(QuatPackError);
+    RUN(BonesTravelAndLerp);
     RUN(KeepBoundPeerRules);
     RUN(NearestPeerPicksClosestFree);
     RUN(ToBodyFrameRoundTrip);

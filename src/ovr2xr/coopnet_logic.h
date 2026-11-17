@@ -19,13 +19,25 @@
 namespace dlvr {
 namespace coop {
 
-constexpr uint8_t kCoopProto = 4;     // first byte of every packet; another value = another protocol = no data
+constexpr uint8_t kCoopProto = 5;     // first byte of every packet; another value = another protocol = no data
                                       // 2 (2026-11-13, after RUN CO1): + rootPos (the position key, INV-734)
                                       // 3 (2026-11-13, INV-736; trace 20261113_2150): + rootYaw; hand[0..2] = the WRIST target,
                                       //   hand[3..6] = the hand BONE's rotation (unless handState bit 0x40)
                                       // 4 (2026-11-15, trace 20261115_1735_coop_arms_world): + elbow[2][3], the sender's elbow bend
                                       //   direction per arm (unless handState bit 0x20); rootYaw now PLACES the arms (receiver)
+                                      // 5 (2026-11-17, trace 20261117_1905_coop_full_ik): + boneOk + bone[2][25][4], the sender's
+                                      //   FINISHED arm-bone local rotations (smallest-three, 7 B each)
 constexpr size_t  kMaxPacket = 1170;  // the EOS P2P maximum packet size
+
+// Protocol 5 (trace 20261117_1905): the arm bones sent per side, in this order, each "l_" / "r_" + the suffix. FPP and TPP rests are
+// identical for every one (INV-736 addendum 2026-11-17), so a sender's FPP local means the same on a partner's TPP body.
+constexpr int kArmBones = 25;
+constexpr const char* kArmBoneSuffix[kArmBones] = {
+    "clavicle", "upperarm", "uparmtwist", "forearm", "foretwist", "foretwist1", "foretwistt", "hand", "hand1",
+    "finger01", "finger01extra", "finger02", "finger03", "finger11", "finger12", "finger13", "finger21", "finger22", "finger23",
+    "finger31", "finger32", "finger33", "finger41", "finger42", "finger43" };
+// indices into kArmBoneSuffix the receiver's FK / swing use
+constexpr int kAbClav = 0, kAbUp = 1, kAbFore = 3, kAbHand = 7;
 
 // ---- The body frame (plan Task 4; trace docs/traces/20261113_1850_coop_sender.md) ----
 // Ry(yaw) is the solve's own yaw matrix [c 0 s; 0 1 0; -s 0 c] (boneblend.cpp SolveArmIk, the `ry` beside cWorld), so x' = c x + s z,
@@ -76,14 +88,56 @@ struct PoseSample {
                               // receiver rebuilds the hands with (the frame the sample was built in), interpolated shortest-arc
     float      elbow[2][3];   // [0] left, [1] right: unit vector from the sender's shoulder->wrist line to its elbow, body frame
                               // (Ry(-rootYaw) x world). handState bit 0x20 (kHandNoElbowBit): none - straight arm / not published
+    uint8_t    boneOk;        // protocol 5: bit 0 left / bit 1 right - bone[h] carries the sender's finished arm (else zeros)
+    float      bone[2][kArmBones][4];   // [0] left, [1] right: each kArmBoneSuffix bone's LOCAL rotation, x y z w (unit)
 };
+
+// Smallest-three quaternion packing (protocol 5): the largest |component| is dropped (sign folded into the other three), the other
+// three stored as int16 scaled by 32767 / (1 / sqrt 2). Worst angle error ~0.005 deg (coopnet_logic_test QuatPackError).
+constexpr float kQ16Scale = 32767.0f / 0.70710678f;
+inline void PackQuat(const float q[4], uint8_t* idx, int16_t c[3])
+{
+    float v[4] = { q[0], q[1], q[2], q[3] };
+    if (!(std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]) && std::isfinite(v[3]))) {
+        v[0] = 0.0f; v[1] = 0.0f; v[2] = 0.0f; v[3] = 1.0f;   // never sent: the sender refuses a non-finite bone first
+    }
+    int m = 0;
+    for (int i = 1; i < 4; ++i) { if (std::fabs(v[i]) > std::fabs(v[m])) { m = i; } }
+    const float sgn = v[m] < 0.0f ? -1.0f : 1.0f;
+    int k = 0;
+    for (int i = 0; i < 4; ++i) {
+        if (i == m) { continue; }
+        float x = v[i] * sgn * kQ16Scale;
+        x = x > 32767.0f ? 32767.0f : (x < -32767.0f ? -32767.0f : x);
+        c[k++] = static_cast<int16_t>(std::lround(x));
+    }
+    *idx = static_cast<uint8_t>(m);
+}
+// False for an index byte outside 0..3 (`q` untouched then). The result is a unit quaternion.
+inline bool UnpackQuat(uint8_t idx, const int16_t c[3], float q[4])
+{
+    if (idx > 3) { return false; }
+    float o[4] = {};
+    float s2 = 0.0f;
+    int k = 0;
+    for (int i = 0; i < 4; ++i) {
+        if (i == idx) { continue; }
+        o[i] = static_cast<float>(c[k++]) / kQ16Scale;
+        s2 += o[i] * o[i];
+    }
+    o[idx] = std::sqrt(s2 < 1.0f ? 1.0f - s2 : 0.0f);
+    const float l = std::sqrt(o[0] * o[0] + o[1] * o[1] + o[2] * o[2] + o[3] * o[3]);
+    for (int i = 0; i < 4; ++i) { q[i] = o[i] / l; }   // l >= 0.70710678 (the dropped one is the largest)
+    return true;
+}
 
 namespace detail {
 template <typename T> inline void Put(uint8_t*& p, const T& v) { std::memcpy(p, &v, sizeof(T)); p += sizeof(T); }
 template <typename T> inline void Get(const uint8_t*& p, T& v) { std::memcpy(&v, p, sizeof(T)); p += sizeof(T); }
+constexpr size_t kBoneBytes = sizeof(uint8_t) + 2 * kArmBones * (sizeof(uint8_t) + 3 * sizeof(int16_t));   // boneOk + 50 x 7
 constexpr size_t kPayload = sizeof(uint32_t) + sizeof(double) + 7 * sizeof(float) + 14 * sizeof(float) + 6 * sizeof(float) +
                             2 * sizeof(uint8_t) + sizeof(uint64_t) + sizeof(uint32_t) + 3 * sizeof(float) + sizeof(float) +
-                            6 * sizeof(float);
+                            6 * sizeof(float) + kBoneBytes;
 constexpr size_t kPacketSize = 1 + kPayload;
 static_assert(kPacketSize <= kMaxPacket, "a pose packet must fit one EOS P2P packet");
 }  // namespace detail
@@ -106,6 +160,17 @@ inline size_t Pack(const PoseSample& s, uint8_t* out, size_t cap)
     for (float v : s.rootPos) { detail::Put(p, v); }
     detail::Put(p, s.rootYaw);
     for (int h = 0; h < 2; ++h) { for (float v : s.elbow[h]) { detail::Put(p, v); } }
+    // protocol 5: boneOk, then all 50 bones (a side without its bit carries whatever is in the struct - zeros from the sender)
+    detail::Put(p, static_cast<uint8_t>(s.boneOk & 0x03));
+    for (int h = 0; h < 2; ++h) {
+        for (int j = 0; j < kArmBones; ++j) {
+            uint8_t idx = 0;
+            int16_t c[3] = {};
+            PackQuat(s.bone[h][j], &idx, c);
+            detail::Put(p, idx);
+            detail::Put(p, c[0]); detail::Put(p, c[1]); detail::Put(p, c[2]);
+        }
+    }
     return static_cast<size_t>(p - out);
 }
 
@@ -205,6 +270,21 @@ inline bool Unpack(const uint8_t* in, size_t n, PoseSample* out, const char** wh
     for (float& v : s.rootPos) { detail::Get(p, v); }
     detail::Get(p, s.rootYaw);
     for (int h = 0; h < 2; ++h) { for (float& v : s.elbow[h]) { detail::Get(p, v); } }
+    // protocol 5: the bones (decoded quaternions are unit by construction; an index byte outside 0..3 refuses the packet)
+    detail::Get(p, s.boneOk);
+    s.boneOk &= 0x03;
+    for (int h = 0; h < 2; ++h) {
+        for (int j = 0; j < kArmBones; ++j) {
+            uint8_t idx = 0;
+            int16_t c[3] = {};
+            detail::Get(p, idx);
+            detail::Get(p, c[0]); detail::Get(p, c[1]); detail::Get(p, c[2]);
+            if (!UnpackQuat(idx, c, s.bone[h][j])) {
+                if (why) { *why = "a bone index byte out of range"; }
+                return false;
+            }
+        }
+    }
     if (!ValidateSample(s, why)) { return false; }
     *out = s;
     return true;
@@ -356,6 +436,13 @@ public:
                 r.finger[h].index = a.finger[h].index + (b.finger[h].index - a.finger[h].index) * k;
                 r.finger[h].thumb = a.finger[h].thumb + (b.finger[h].thumb - a.finger[h].thumb) * k;
                 r.finger[h].lower = a.finger[h].lower + (b.finger[h].lower - a.finger[h].lower) * k;
+                // protocol 5: the arm bones - slerp each when both samples carry this side; else the nearer sample's (already in r,
+                // with its boneOk bit)
+                const uint8_t bit = static_cast<uint8_t>(1u << h);
+                if ((a.boneOk & bit) && (b.boneOk & bit)) {
+                    for (int j = 0; j < kArmBones; ++j) { Slerp(a.bone[h][j], b.bone[h][j], k, r.bone[h][j]); }
+                    r.boneOk = static_cast<uint8_t>(r.boneOk | bit);
+                }
             }
             *out = r;
             return true;

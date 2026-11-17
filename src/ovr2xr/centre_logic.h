@@ -77,5 +77,17 @@ inline void ComposeBasePos(float baseYawDeg, const float basePos[3], float headX
     out[2] = basePos[2] + z;
 }
 
+// HEIGHT at the session-start centre (trace 20261117_1627_centre_height_standing; Jay 2026-11-17 chose option B): players loaded in
+// "extremely tall" - the view height is the head's height above the runtime's LOCAL origin (D-159 / INV-306), which ComposeBasePos keeps.
+// Only when the floor says the player is STANDING (eye above the STAGE floor > kStandEyeM - the holsters' STANDING line, mirrors
+// holster_logic.h kStandEyeM) does the session-start centre also move the origin to the head's height, as the game's own recentre does.
+// Seated, no floor, not located, or the headset-back-on centre: height kept exactly as before.
+constexpr float kStandEyeM = 1.38f;
+
+inline bool HeightDue(Reason r, bool floorOk, float eyeAboveFloorM)
+{
+    return r == Reason::SessionStart && floorOk && eyeAboveFloorM > kStandEyeM;
+}
+
 }  // namespace centre
 }  // namespace dlvr

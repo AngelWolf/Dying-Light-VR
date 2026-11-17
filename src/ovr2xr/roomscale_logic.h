@@ -96,5 +96,45 @@ inline void DeadZoneCommand(float& cmdX, float& cmdZ, float deadM)
     cmdZ *= k;
 }
 
+// FIX 1 (spec docs/superpowers/specs/2026-11-17-roomscale-camera-in-step-design.md §3 / §3a A7; trace 20261117_1316_rscam_fix1):
+// roomscale's share of a body move over a time dt - EXACTLY the pre-step's formula (roomscale.cpp PreStepDetour): the move less the
+// game's own wanted velocity x dt, projected on roomscale's extra (world x/z velocity), clamped to [0, |extra| x dt]. 0 when the extra
+// is (near) zero or dt <= 0. World x/z, metres.
+inline void ShareAlong(float dx, float dz, float gameVx, float gameVz, float dt, float extraX, float extraZ, float& outX, float& outZ)
+{
+    outX = 0.0f;
+    outZ = 0.0f;
+    const float elen = std::sqrt(extraX * extraX + extraZ * extraZ);
+    if (!(elen > 1e-4f) || !(dt > 0.0f)) { return; }
+    const float rx = dx - gameVx * dt;
+    const float rz = dz - gameVz * dt;
+    float along = (rx * extraX + rz * extraZ) / elen;
+    const float maxAlong = elen * dt;
+    along = along < 0.0f ? 0.0f : (along > maxAlong ? maxAlong : along);
+    outX = extraX / elen * along;
+    outZ = extraZ / elen * along;
+}
+
+// The time the engine extrapolated the body by (sub_1803A60F0: intraframe = body pos + vel x t), recovered from the extrapolated
+// displacement vt and the velocity it used: t = (vt . v) / |v|^2, clamped to [0, kMaxIntraS]. 0 when the body is (near) still.
+const float kMaxIntraS = 0.1f;   // 5 physics steps at 50 Hz - longer than any real intraframe gap; a larger value is not believed
+inline float IntraframeTime(float vtX, float vtZ, float vX, float vZ)
+{
+    const float vv = vX * vX + vZ * vZ;
+    if (!(vv > 1e-6f)) { return 0.0f; }
+    const float t = (vtX * vX + vtZ * vZ) / vv;
+    return t < 0.0f ? 0.0f : (t > kMaxIntraS ? kMaxIntraS : t);
+}
+
+// The reported-head ring (§3a A4): the getter's stored head is (-x, y, -z) of one position ovr_GetTrackingState reported. Exact float
+// match - IEEE negation is exact, and the engine copies the floats (INV-306 store). Returns the index, -1 when none matches.
+inline int MatchReported(const float (*pos)[3], int n, float sx, float sy, float sz)
+{
+    for (int i = 0; i < n; ++i) {
+        if (pos[i][0] == -sx && pos[i][1] == sy && pos[i][2] == -sz) { return i; }
+    }
+    return -1;
+}
+
 }  // namespace roomscale
 }  // namespace dlvr

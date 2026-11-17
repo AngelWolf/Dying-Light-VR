@@ -25,5 +25,8 @@ void RoomscaleTakeMoved(float* wx, float* wz); // world x/z the body moved BECAU
 void RoomscaleSetCommand(float vx, float vz);  // world x/z velocity (m/s) roomscale adds to the body; 0, 0 = none
 // Physics-side totals since the last call (consumed), for the [ROOMSCALE] window line.
 void RoomscaleTakeStepStats(long* steps, long* commanded, long* guarded, long* gameChanged);
+// Fix 1 (trace docs/traces/20261117_1316_rscam_fix1.md; BETA port 20261117_1600): ovr_GetTrackingState records each head position it
+// reports, with the share total the appSpace shift had taken at that moment (called under the frame lock, right after ToOvr).
+void RoomscaleNoteReported(const float pos[3]);
 
 }  // namespace dlvr
