@@ -36,6 +36,7 @@
 #include "rootyaw_logic.h"   // walk root + spine-top yaw hold math (trace 20261117_1730_root_yaw_hold; BETA port 20261117_1600)
 #include "physcrouch.h"   // physical crouch (plan 2026-10-27 Task 9): EyePointApply publishes the duck factor
 #include "bownock.h"      // BowNockTick / BowNockNoBow - the bow's manual nock (bow_manual_nock), called from BowDrawTick
+#include "lidhand.h"      // LidHandTick - hand-open lids (spec 2026-11-18-hand-open-lids-design), called from BowDrawTick
 #include "grappleaim.h"   // BowReticle3d - gates PublishBowRay
 #include "wristquad.h"    // wristquad::OnThisLaunch - gates the wrist HUD's arm table (wristarm::Tick, stage A)
 #include "camhook.h"
@@ -21201,7 +21202,8 @@ void PublishFolded(float folded, unsigned long long obj)
 // ===== TORSO FROM CONTROLLERS (docs/superpowers/specs/2026-10-29-torso-from-controllers-design.md) =====
 // The head keeps +4460 / +4468 (view, look, shot) exactly as the fold above leaves them; the BODY (+4588 / +4592, which BA2500
 // writes into the root, INV-262) faces look + the torso gap read from the two grips (headfollow::TorsoGapStep). Walking is the
-// root's frame (INV-652), so the pad thread rotates the left stick by the same gap (HeadFollowTorsoStickGap). The published body
+// root's frame (INV-652), so walklook (below) turns the player's walk vector back onto the look at the game's walk call (2026-11-18,
+// replaced the pad thread's stick rotation StickForGap; it reads g_pubObj / g_pubTorsoFolding / g_pubTorsoMs). The published body
 // turn (PublishFolded) becomes folded + gap, so the arm frame (S-60), the head-position report (S-61) and the roomscale probe follow
 // the ROOT; the cutscene hand-back keeps reading g_s.folded (the camera's).
 headfollow::TorsoState g_torso;
@@ -21209,7 +21211,6 @@ bool      g_torsoSaidFirst = false;
 volatile LONG     g_pubTorsoGapBits = 0;   // OpenXR degrees, + = body left of the look
 volatile LONGLONG g_pubTorsoMs      = 0;   // GetTickCount64 of the publish, 0 = never
 volatile LONG     g_pubTorsoFolding = 0;   // 1 = published by an update that folded and wrote the facing
-volatile LONG     g_stickPolls = 0, g_stickMaxCdeg = 0;   // pad thread: polls given a fresh gap, the largest |gap| (centi-degrees)
 double    g_tSum = 0.0;
 long long g_tN = 0, g_tClamped = 0, g_tHeld = 0, g_tFaults = 0, g_tNoPose = 0;
 float     g_tMin = 0.0f, g_tMax = 0.0f;
@@ -21425,8 +21426,8 @@ void Before(uintptr_t a1, float h, float dt)
             "read 0.00) | head yaw %+.2f, folded %+.2f | body-facing delta %+.1f deg | self-check %s | reported head position "
             "turned by %+.1f deg | elbow axis vs root max %.1f deg, at rest %.1f deg (-1 = no sample) | check re-latched for the "
             "stick %ld, held for the root %ld (this player) | torso: %s gap mean %+.1f min %+.1f max %+.1f deg over %lld updates, "
-            "clamped at %.0f %lld, held (hands close / missing) %lld, no head or grip pose %lld, facing write faults %lld | walk "
-            "stick given the gap on %ld polls, largest %.1f deg | causes: limit pulled the body %.1f deg total, hands used none %lld / "
+            "clamped at %.0f %lld, held (hands close / missing) %lld, no head or grip pose %lld, facing write faults %lld | "
+            "causes: limit pulled the body %.1f deg total, hands used none %lld / "
             "left %lld / right %lld / both %lld, right stick turning on %lld updates (unread %lld)",
             on ? 1 : 0, g_folded, g_paused, static_cast<unsigned long long>(g_pausedVtRva), g_off, g_selFaults,
             g_faults, g_maxStep, g_maxResume, g_maxAddend, h, g_s.folded, static_cast<float>(g_bfDeltaCdeg) / 100.0f,
@@ -21439,8 +21440,6 @@ void Before(uintptr_t a1, float h, float dt)
             g_tN ? "" : "NO TORSO READING - the body followed the head as before;",
             g_tN ? static_cast<float>(g_tSum / static_cast<double>(g_tN)) : 0.0f, g_tMin, g_tMax, g_tN,
             headfollow::kTorsoMaxGapDeg, g_tClamped, g_tHeld, g_tNoPose, g_tFaults,
-            static_cast<long>(InterlockedExchange(&g_stickPolls, 0)),
-            static_cast<float>(InterlockedExchange(&g_stickMaxCdeg, 0)) / 100.0f,
             static_cast<float>(g_tPulled), g_tHands[0], g_tHands[1], g_tHands[2], g_tHands[3], g_tStick, g_tStickUnread);
         g_winStart = now;
         g_folded = g_paused = g_off = g_selFaults = g_faults = 0;
@@ -22091,6 +22090,199 @@ void Install()
 
 }  // namespace shakeyaw
 
+// ===== WALK FOLLOWS THE LOOK (docs/superpowers/specs/2026-11-18-walk-follows-look-design.md §2 + §3a; trace
+// docs/traces/20261118_1507_walk_follows_look.md; INV-652 addenda 1-3) =====
+// Torso from controllers turns the ROOT toward the hands (up to 40 deg) and walking is the root's frame (INV-652), so an arm held
+// out steered walking (users: "having their arm out whilst moving, is moving them in that direction"). Jay: no stick correction -
+// walking (and the dodges, Jay: "Back to my view then") follows the LOOK at the game's own walk call; the body keeps its twist.
+// One detour on gamedll +ED2040 (the walk-speed setter). Only the call returning to +BA3A7D (the player walk +BA2B20's single call)
+// is considered; for the local player the fold last published, while that fold folded with the torso written under 100 ms ago,
+// with the active IMoveController == MoveController, headfollow::WalkOnLook rebuilds the world vector on the look (+4468) after
+// checking it equals root3x3 * local (player+4616) - else the call passes through untouched, counted by reason. The original is
+// called with a LOCAL copy; the caller's buffer, player+4616 and every field are never written.
+// COST: every +ED2040 call (three callers) one _ReturnAddress compare. On the player's call (once per player update): two
+// interlocked reads + one 64-bit read, GetTickCount64, one +BA2980 call (the <= 10-entry table walk +BA2B20 itself makes), one
+// GetWorldXform, four float reads, two sincos, ~40 flops. LOG: install line, FIRST line, a 5 s line only with activity or a refusal
+// plus a once-a-minute heartbeat.
+// [LOADBEARING: WALK-FOLLOWS-LOOK] with comfort_body_follows_head on, the only thing keeping a held-out arm from steering walking.
+namespace walklook {
+
+constexpr uintptr_t kRva          = 0xED2040;   // sub_180ED2040 (wk1_out.txt) - the walk-speed setter, three callers
+constexpr uintptr_t kRetRva       = 0xBA3A7D;   // return address of +BA2B20's call at +BA3A78 (raw E8 scan: the only one)
+constexpr uintptr_t kSupplierRva  = 0xBA2980;   // the active IMoveController (wk8_out.txt)
+constexpr uintptr_t kMoveCtlVtRva = 0x172EFA0;  // MoveController's IMoveController sub-vtable (wk3_out.txt, COL offset 24)
+// +ED2040: mov [rsp+8],rbx | push rdi | sub rsp,20h | mov rax,gs:[58h] - 19 bytes (WriteAbsoluteJmp needs 14), whole instructions
+// ending at +ED2053, gs:[58h] absolute (no RIP-relative), and no branch in the function targets +ED2041..+ED2052 (wk9_out.txt).
+const unsigned char kBytes[] = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x20,
+                                 0x65, 0x48, 0x8B, 0x04, 0x25, 0x58, 0x00, 0x00, 0x00 };
+using SetWalkFn  = void*(__fastcall*)(uintptr_t player, float* world);
+using SupplierFn = uintptr_t(__fastcall*)(uintptr_t player);
+using XformFn    = const float*(*)(void* controlObject);
+
+SetWalkFn     g_true     = nullptr;
+SupplierFn    g_supplier = nullptr;
+XformFn       g_xform    = nullptr;
+uintptr_t     g_ret      = 0;   // absolute, the loaded build's (buildrva)
+uintptr_t     g_moveVt   = 0;
+volatile LONG g_installed = 0;  // 1 once an install was attempted
+volatile LONG g_live      = 0;  // 1 committed, -1 failed
+volatile LONG g_saidOff   = 0;
+volatile LONG g_saidFirst = 0;
+// 5 s window (stamped on every matched call - INV-9); index = the reason the call was not turned, kFixed = turned.
+enum Reason { kFixed = 0, kNotPlayer, kNotFolding, kNotMoveCtl, kNonFinite, kNotUpright, kCheckFailed, kFault, kReasons };
+volatile LONG64 g_win[kReasons] = {};
+volatile LONG64 g_winMs = 0;
+volatile LONG   g_winN = 0;
+volatile LONG   g_maxErrUm = 0;    // largest self-check error in the window, micrometres / s
+volatile LONG   g_maxTurnCdeg = 0; // largest |root - look| turned back in the window, centi-degrees
+
+void Bump(volatile LONG* slot, LONG v)
+{
+    LONG cur = *slot;
+    while (v > cur) {
+        const LONG was = InterlockedCompareExchange(slot, v, cur);
+        if (was == cur) { break; }
+        cur = was;
+    }
+}
+
+void Window(ULONGLONG now)
+{
+    const LONG64 start = g_winMs;
+    if (start == 0) {
+        InterlockedCompareExchange64(&g_winMs, static_cast<LONG64>(now), 0);
+        return;
+    }
+    if (now - static_cast<ULONGLONG>(start) < 5000 ||
+        InterlockedCompareExchange64(&g_winMs, static_cast<LONG64>(now), start) != start) {
+        return;
+    }
+    LONG64 c[kReasons];
+    LONG64 refused = 0;
+    for (int i = 0; i < kReasons; ++i) {
+        c[i] = InterlockedExchange64(&g_win[i], 0);
+        if (i >= kNonFinite) { refused += c[i]; }
+    }
+    const LONG errUm = InterlockedExchange(&g_maxErrUm, 0);
+    const LONG turnC = InterlockedExchange(&g_maxTurnCdeg, 0);
+    const LONG w = InterlockedIncrement(&g_winN);
+    if (c[kFixed] > 0 || refused > 0 || (w % 12) == 1) {
+        // [PROBE: WALKLOOK] gate=comfort_body_follows_head  site=HEADSET  log-only=no
+        LOG("boneblend: [WALKLOOK] 5 s | turned to the look %lld (largest turn %.1f deg) | passed through: not the local player %lld, "
+            "fold not folding %lld, controller not MoveController %lld | REFUSED: non-finite %lld, root not upright %lld, "
+            "self-check failed %lld (largest error %.3f mm/s), read fault %lld | comfort_body_follows_head %d",
+            c[kFixed], static_cast<float>(turnC) / 100.0f, c[kNotPlayer], c[kNotFolding], c[kNotMoveCtl], c[kNonFinite],
+            c[kNotUpright], c[kCheckFailed], static_cast<float>(errUm) / 1000.0f, c[kFault], ComfortBodyFollowsHead ? 1 : 0);
+    }
+}
+
+// The player's call only. Fills `send` (the vector the original gets) and returns the reason.
+Reason Decide(uintptr_t a1, const float* w, float* send)
+{
+    send[0] = w[0];
+    send[1] = w[1];
+    send[2] = w[2];
+    const uintptr_t obj = static_cast<uintptr_t>(InterlockedCompareExchange64(&camyaw::follow::g_pubObj, 0, 0));
+    if (obj == 0 || obj != a1) { return kNotPlayer; }
+    const LONGLONG pubMs = InterlockedCompareExchange64(&camyaw::follow::g_pubTorsoMs, 0, 0);
+    const bool folding = InterlockedCompareExchange(&camyaw::follow::g_pubTorsoFolding, 0, 0) != 0;
+    if (!ComfortBodyFollowsHead ||
+        !headfollow::StickGapFresh(GetTickCount64(), static_cast<unsigned long long>(pubMs), folding)) {
+        return kNotFolding;
+    }
+    float m[12] = {}, l[3] = {}, look = 0.0f;
+    __try {
+        const uintptr_t mc = g_supplier(a1);
+        if (mc == 0 || *reinterpret_cast<const uintptr_t*>(mc) != g_moveVt) { return kNotMoveCtl; }
+        const float* x = g_xform(reinterpret_cast<void*>(a1 + 24));   // IControlObject at player+24 (INV-652)
+        if (!x) { return kFault; }
+        for (int i = 0; i < 12; ++i) { m[i] = x[i]; }
+        const float* lp = reinterpret_cast<const float*>(a1 + 4616);
+        l[0] = lp[0];
+        l[1] = lp[1];
+        l[2] = lp[2];
+        look = *reinterpret_cast<const float*>(a1 + 4468);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return kFault;
+    }
+    const headfollow::WalkOut o = headfollow::WalkOnLook(m, l, w, look);
+    if (o.checkErr >= 0.0f) { Bump(&g_maxErrUm, static_cast<LONG>(fminf(o.checkErr * 1.0e6f, 2.0e9f))); }
+    if (InterlockedCompareExchange(&g_saidFirst, 1, 0) == 0) {
+        // [PROBE: WALKLOOK] gate=comfort_body_follows_head  site=HEADSET  log-only=no
+        LOG("boneblend: [WALKLOOK] FIRST (logged unconditionally) - verdict %d (0 turned, 1 non-finite, 2 not upright, 3 self-check "
+            "failed) | local l %+.3f %+.3f %+.3f | world in %+.3f %+.3f %+.3f | root forward col %+.4f %+.4f %+.4f, up col %+.4f "
+            "%+.4f %+.4f | self-check error %.6f m/s | look %+.2f deg, root - look %+.2f deg | sent %+.3f %+.3f %+.3f | player %p",
+            o.why, l[0], l[1], l[2], w[0], w[1], w[2], m[2], m[6], m[10], m[1], m[5], m[9], o.checkErr, look, o.turnDeg,
+            o.w[0], o.w[1], o.w[2], reinterpret_cast<void*>(a1));
+    }
+    if (o.why != headfollow::kWalkFixed) {
+        return o.why == headfollow::kWalkNotUpright ? kNotUpright
+             : (o.why == headfollow::kWalkCheckFailed ? kCheckFailed : kNonFinite);
+    }
+    Bump(&g_maxTurnCdeg, static_cast<LONG>(fabsf(o.turnDeg) * 100.0f));
+    send[0] = o.w[0];
+    send[1] = o.w[1];
+    send[2] = o.w[2];
+    return kFixed;
+}
+
+void* __fastcall Hook(uintptr_t a1, float* w)
+{
+    if (reinterpret_cast<uintptr_t>(_ReturnAddress()) != g_ret || !w) { return g_true(a1, w); }   // other callers: untouched
+    float send[3];
+    const Reason r = Decide(a1, w, send);
+    InterlockedIncrement64(&g_win[r]);
+    Window(GetTickCount64());
+    return g_true(a1, send);
+}
+
+// Called every BoneBlendTick. Installs on the first tick that sees comfort_body_follows_head ON; until then the game's code is
+// untouched. Switching it off later leaves the hook passing everything through (the folding gate fails).
+void Install()
+{
+    if (g_installed) { return; }
+    if (!ComfortBodyFollowsHead) {
+        if (InterlockedCompareExchange(&g_saidOff, 1, 0) == 0) {
+            // [PROBE: WALKLOOK] gate=comfort_body_follows_head (install)  site=HEADSET  log-only=no
+            LOG("boneblend: [WALKLOOK] NOT INSTALLED - comfort_body_follows_head=0 (walking is the game's own; switching it on "
+                "installs the hook on the next rig tick)");
+        }
+        return;
+    }
+    HMODULE gd = GetModuleHandleA("gamedll_x64_rwdi.dll");
+    HMODULE eng = GetModuleHandleA("engine_x64_rwdi.dll");
+    if (!gd || !eng) { return; }
+    InterlockedExchange(&g_installed, 1);   // latch before the attempt
+    const uintptr_t base = reinterpret_cast<uintptr_t>(gd);
+    g_ret      = base + ::dlvr::buildrva::Gd(kRetRva);
+    g_moveVt   = base + ::dlvr::buildrva::Gd(kMoveCtlVtRva);
+    g_supplier = reinterpret_cast<SupplierFn>(base + ::dlvr::buildrva::Gd(kSupplierRva));
+    g_xform    = reinterpret_cast<XformFn>(GetProcAddress(eng, "?GetWorldXform@IControlObject@@QEBAAEBVmtx34@@XZ"));
+    bool ok = g_xform != nullptr;
+    PreparedDetour prep[1] = {};
+    if (ok) {
+        ok = InstallDetour(base + kRva, kBytes, sizeof(kBytes), reinterpret_cast<void*>(&Hook),
+                           reinterpret_cast<void**>(&g_true), "walklook", &prep[0]);
+    }
+    int  attempts  = 0;
+    bool committed = false;
+    for (; ok && attempts < 20 && !committed; ++attempts) {
+        committed = CommitDetours(prep, 1);
+        if (!committed) { Sleep(2); }
+    }
+    InterlockedExchange(&g_live, (ok && committed) ? 1 : -1);
+    // [PROBE: WALKLOOK] gate=comfort_body_follows_head (install)  site=HEADSET  log-only=no
+    LOG("boneblend: [WALKLOOK] detour on the walk-speed setter (gamedll+0x%llX, %s build) GetWorldXform %s, prepared=%s "
+        "committed=%s after %d attempt(s) | player call returns to %p, MoveController vtable %p, supplier %p%s",
+        static_cast<unsigned long long>(kRva), ::dlvr::buildrva::BuildName(::dlvr::buildrva::ModuleBuild(::dlvr::buildrva::kGamedll)),
+        g_xform ? "resolved" : "*** NOT RESOLVED ***", ok ? "OK" : "FAILED", committed ? "yes" : "NO", attempts,
+        reinterpret_cast<void*>(g_ret), reinterpret_cast<void*>(g_moveVt), reinterpret_cast<void*>(g_supplier),
+        (ok && committed) ? " - LIVE: walking follows the look while body-follows-head folds"
+                          : " - *** NOT LIVE: a held-out arm steers walking this session ***");
+}
+
+}  // namespace walklook
+
 float HeadFollowFoldedForSolve(unsigned long long* objOut)
 {
     const LONG bits = camyaw::follow::g_pubFoldedBits;
@@ -22111,31 +22303,6 @@ volatile LONG g_bfHeldByRoot     = 0;
 float HeadFollowFoldedDeg()
 {
     return HeadFollowFoldedForSolve(nullptr);
-}
-
-// headpose.h - the torso gap for the walk stick (torso from controllers §4.4). Pad thread. The polls given a gap and the largest
-// |gap| go to the [HEADFOLLOW] 5 s line. COST: three interlocked reads; on a fresh gap one CAS loop.
-bool HeadFollowTorsoStickGap(float& gapXrDeg)
-{
-    gapXrDeg = 0.0f;
-    const LONGLONG pubMs = InterlockedCompareExchange64(&camyaw::follow::g_pubTorsoMs, 0, 0);
-    const bool folding = InterlockedCompareExchange(&camyaw::follow::g_pubTorsoFolding, 0, 0) != 0;
-    if (!headfollow::StickGapFresh(GetTickCount64(), static_cast<unsigned long long>(pubMs), folding)) { return false; }
-    const LONG bits = camyaw::follow::g_pubTorsoGapBits;
-    memcpy(&gapXrDeg, &bits, sizeof(gapXrDeg));
-    if (!std::isfinite(gapXrDeg)) {
-        gapXrDeg = 0.0f;
-        return false;
-    }
-    InterlockedIncrement(&camyaw::follow::g_stickPolls);
-    const LONG c = static_cast<LONG>(fabsf(gapXrDeg) * 100.0f);
-    LONG cur = camyaw::follow::g_stickMaxCdeg;
-    while (c > cur) {
-        const LONG was = InterlockedCompareExchange(&camyaw::follow::g_stickMaxCdeg, c, cur);
-        if (was == cur) { break; }
-        cur = was;
-    }
-    return true;
 }
 
 // cinlook.cpp (INV-620 (a)): D2's addend now in +4460, the object it was added to, and whether D2's own chase is running (the addend is
@@ -25108,6 +25275,7 @@ bool BowItemElemWorld(uintptr_t item, int id, float out12[12])
 
 void BowDrawTick(void* ent)
 {
+    LidHandTick();            // hand-open lids (trace 20261118_1711): lid_by_hand=0 -> one bool test; before the bow path, which is unchanged
     BowNockCarryWatch(ent);   // a carried arrow is given back when the nock's tick stops (one bool test when not carrying)
     if (!BowManualDraw) { return; }
     static int       s_said = 0;
@@ -43626,6 +43794,8 @@ void BoneBlendTick()
         camyaw::Install();
         // [SHAKEYAW] - the shot-shake test; installs once the setting is first seen ON, pass-through after.
         shakeyaw::Install();
+        // [WALKLOOK] - walking follows the look (arm-out drift); installs once comfort_body_follows_head is first seen ON.
+        walklook::Install();
         // [RENDTAG] - pass-through on rd3d11's pose recorder, once diag_render_pose or declare_rendered_orientation is 1.
         rendtag::Install();
         // [ITEMPOS] - U-17. Unconditional, like playertail: a read-only

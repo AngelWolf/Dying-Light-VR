@@ -8626,6 +8626,8 @@ constexpr float kWidePx = 24.0f;
 bool      g_hold = false;
 ULONGLONG g_noLeavesSinceMs = 0;         // 0 = the last pass had fresh leaves
 long c_heldPasses = 0, c_holdOver = 0, c_heldDraws = 0, c_wideAt = 0, c_wideTxt = 0;
+long c_floatAt = 0, c_floatTxt = 0;   // FLOATING GUARD (trace 20261118_1822): unmatched draws kept as made, near a non-piece leaf
+long c_rowRefused = 0;                 // ROW-RULE PIECE BOX (trace 20261118_1842): row / band candidates refused (glyph outside the box)
 ULONGLONG g_nextLog = 0;
 bool g_saidFirst = false;
 constexpr long kSamples = 16;
@@ -8703,9 +8705,13 @@ void Window()
         // [PROBE: WRISTROUTE] gate=ui_wrist_hud (ovr2xr.txt, read at launch)  site=HEADSET  log-only=yes
         LOG("[WRISTROUTE] 5 s HOLD + WIDE: passes held back (no fresh leaves while the HUD panel shows) %ld (%ld draws not drawn), "
             "passes past the %llu ms cap drawn as made %ld | wider match (nearest leaf a shown piece's, within %.1f UI px = 24 on a 2880-high UI "
-            "screen): corners %ld, text %ld", c_heldPasses, c_heldDraws, static_cast<unsigned long long>(kHoldMaxMs), c_holdOver,
-            static_cast<double>(::dlvr::uipanel::UiPxTol(kWidePx, g_scrH)), c_wideAt, c_wideTxt);
-        c_heldPasses = c_holdOver = c_heldDraws = c_wideAt = c_wideTxt = 0;
+            "screen): corners %ld, text %ld | kept as made (nearest leaf a NON-piece's within %.1f UI px - a floating element): corners %ld, "
+            "text %ld | row matches refused (glyph outside that piece's box + %.1f UI px) %ld", c_heldPasses, c_heldDraws,
+            static_cast<unsigned long long>(kHoldMaxMs), c_holdOver,
+            static_cast<double>(::dlvr::uipanel::UiPxTol(kWidePx, g_scrH)), c_wideAt, c_wideTxt,
+            static_cast<double>(::dlvr::uipanel::UiPxTol(kWidePx, g_scrH)), c_floatAt, c_floatTxt,
+            static_cast<double>(::dlvr::uipanel::UiPxTol(kWidePx, g_scrH)), c_rowRefused);
+        c_heldPasses = c_holdOver = c_heldDraws = c_wideAt = c_wideTxt = c_floatAt = c_floatTxt = c_rowRefused = 0;
         memset(w_min, 0, sizeof(w_min)); memset(w_max, 0, sizeof(w_max)); memset(w_zero, 0, sizeof(w_zero));
         memset(w_drop, 0, sizeof(w_drop)); memset(w_minSet, 0, sizeof(w_minSet)); w_passes = 0;
     }
@@ -8852,6 +8858,42 @@ int NearPiece(float x, float y, bool text)
     if (best < 0 || bd > ::dlvr::uipanel::UiPxTol(kWidePx, g_scrH)) { return -1; }   // tuned on a 2880-high UI screen (sweep 20261113_2125)
     const int p = g_leaf[best].piece;
     return (p >= 0 && p < kP && (g_hdr.shownMask & (1 << p))) ? best : -1;
+}
+// FLOATING GUARD (trace docs/traces/20261118_1822_wrist_floating_guard.md; Jay 2026-11-18: "It's the elements that are still left
+// floating infront of the player specifically"): the nearest leaf of this kind by NearPiece's own metric is NO piece's (piece < 0 - a
+// floating prompt / marker / trap box, world-placed, INV-538) and within kWidePx -> true: that draw is a floating element's that missed
+// its own leaf (leaves publish ~64 / s, passes ~144 / s) and stays as made instead of falling to the piece box / wide match / carry.
+bool NearFloating(float x, float y, bool text)
+{
+    int best = -1;
+    float bd = 1e30f;
+    for (int i = 0; i < g_nLeaves; ++i) {
+        const Leaf& l = g_leaf[i];
+        if ((l.text != 0) != text) { continue; }
+        float d;
+        if (text) {
+            const float dx = x < l.rect[0] ? l.rect[0] - x : (x > l.rect[2] ? x - l.rect[2] : 0.0f);
+            const float dy = fabsf(l.rect[1] - y);
+            d = dx > dy ? dx : dy;
+        } else {
+            const float dx = fabsf(l.at[0] - x), dy = fabsf(l.at[1] - y);
+            d = dx > dy ? dx : dy;
+        }
+        if (d < bd) { bd = d; best = i; }
+    }
+    return best >= 0 && bd <= ::dlvr::uipanel::UiPxTol(kWidePx, g_scrH) && g_leaf[best].piece < 0;
+}
+// ROW-RULE PIECE BOX (trace docs/traces/20261118_1842_wrist_row_rule_piece_box.md; RUN WF2: quests' routed count jumping 17 <-> 23..29
+// between passes): a row / row-band match to a SHOWN piece's text leaf counts only when the glyph lies inside that piece's box grown by
+// kWidePx - the rules' x band reaches a full leaf width left of a leaf, so the wide quests rows reached the floating prompts. INV-729's
+// ammo glyph (3866.7, 2332) sits 4 px above the weapon box (3776, 2336) - inside the margin. A non-piece leaf (piece < 0) always passes.
+bool GlyphInPieceBox(int leaf, float x, float y)
+{
+    const int p = g_leaf[leaf].piece;
+    if (p < 0 || p >= kP || !(g_hdr.shownMask & (1 << p))) { return true; }
+    const float* b = g_hdr.pieceBox[p];
+    const float t = ::dlvr::uipanel::UiPxTol(kWidePx, g_scrH);
+    return x >= b[0] - t && x <= b[2] + t && y >= b[1] - t && y <= b[3] + t;
 }
 }  // namespace
 
@@ -9186,6 +9228,7 @@ int Route(ID3D11DeviceContext* ctx, bool indexed, UINT start, INT base)
         }
     }
     int matched = -1;
+    bool floatKept = false;   // FLOATING GUARD (trace 20261118_1822): this draw stays as made; the carried owner is not changed
     if (kind == 1) {
         ++c_at;
         float dist = 0;
@@ -9200,7 +9243,8 @@ int Route(ID3D11DeviceContext* ctx, bool indexed, UINT start, INT base)
                 if (!l.text && fabsf(l.at[0] - ux) <= exactTol && fabsf(l.at[1] - uy) <= exactTol) { matched = i; break; }
             }
         }
-        if (matched < 0) {   // WIDER MATCH (after the 2 px rule): the nearest image leaf, if a shown piece's within kWidePx - also
+        if (matched < 0 && NearFloating(ux, uy, false)) { floatKept = true; ++c_floatAt; }   // a floating element's corner (trace 20261118_1822)
+        if (matched < 0 && !floatKept) {   // WIDER MATCH (after the 2 px rule): the nearest image leaf, if a shown piece's within kWidePx - also
                              // during a stand-down (RUN WS2l: the Legend icon / sliding quests are 2.5-23 px off their leaves mid-animation)
             matched = NearPiece(ux, uy, false);
             if (matched >= 0) { ++c_wideAt; }
@@ -9251,6 +9295,7 @@ int Route(ID3D11DeviceContext* ctx, bool indexed, UINT start, INT base)
                 if (!l.text) { continue; }
                 const float rd = fabsf(l.rect[1] - g[1]);
                 if (rd > 6.0f || g[0] < l.rect[0] - (l.rect[2] - l.rect[0]) - 6.0f || g[0] > l.rect[2] + 6.0f) { continue; }
+                if (!GlyphInPieceBox(i, g[0], g[1])) { ++c_rowRefused; continue; }   // trace 20261118_1842
                 if (rd < bd) { bd = rd; matched = i; }
             }
             if (matched < 0) {   // ROW BAND (INV-729; trace docs/traces/20261112_2125_wrist_row_band.md; verified RUN WS2h): a glyph drawn
@@ -9265,12 +9310,14 @@ int Route(ID3D11DeviceContext* ctx, bool indexed, UINT start, INT base)
                     if (g[1] < l.rect[1] - h || g[1] > l.rect[3] || g[0] < l.rect[0] - (l.rect[2] - l.rect[0]) - 6.0f || g[0] > l.rect[2] + 6.0f) {
                         continue;
                     }
+                    if (!GlyphInPieceBox(i, g[0], g[1])) { ++c_rowRefused; continue; }   // trace 20261118_1842
                     const float dd = fabsf(l.rect[1] - g[1]);
                     if (dd < bb) { bb = dd; matched = i; }
                 }
             }
+            if (matched < 0 && NearFloating(g[0], g[1], true)) { floatKept = true; ++c_floatTxt; }   // a floating element's glyph
             if (matched >= 0) { ++c_txtLeaf; }
-            else {   // text_owner: the piece box (not the minimap's) holding the glyph - NOT during a menu / wheel stand-down (it took
+            else if (!floatKept) {   // text_owner: the piece box (not the minimap's) holding the glyph - NOT during a menu / wheel stand-down (it took
                      // menu text in the quests box); the wide match below runs either way (trace 20261112_2215)
                 for (int p = 0; p < kP && matched < 0 && !g_hdr.standDown; ++p) {
                     if (p == ::dlvr::wristleaf::kMinimap || !(g_hdr.shownMask & (1 << p))) { continue; }
@@ -9303,7 +9350,7 @@ int Route(ID3D11DeviceContext* ctx, bool indexed, UINT start, INT base)
     }
     if (matched >= 0) { g_owner = g_leaf[matched].piece; g_ownOpen = !g_leaf[matched].last; }
     else if (matched == -1 && !g_ownOpen) { g_owner = -1; }
-    const int p = g_owner;
+    const int p = floatKept ? -1 : g_owner;   // FLOATING GUARD: this draw only - g_owner / g_ownOpen carry on unchanged for the next draws
     if (e0) {   // STAND-DOWN DUMP (log-only): a draw left as made (during a stand-down, after one, or into the ring), then remember
                 // whether it went to a piece (dropped during a stand-down, routed otherwise)
         ++g_sdDraw;

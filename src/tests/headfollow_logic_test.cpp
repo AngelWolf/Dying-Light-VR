@@ -600,15 +600,124 @@ static void facing_target_continuous()
     CHECK(NearDeg(FacingTarget(-170.0f, -15.0f, 170.0f), 175.0f));   // -185 == 175: +5 the short way, never -355
 }
 
-static void stick_rotation_sign()
+// The root 3x4 as gamedll +BA2500 / +EBAA90 build it (INV-652 addendum 2): forward f = (cos y, 0, sin y), up = +Y, left = up x f,
+// stored in the THIRD / SECOND / FIRST columns of an mtx34 (rows of 4: x row m0..m3, y row m4..m7, z row m8..m11).
+static void RootMtx(float yawDeg, float m[12])
 {
-    float x = 0.0f, y = 1.0f;
-    StickForGap(30.0f, x, y);   // body 30 deg LEFT of the look: the stick turns right to walk along the look
-    CHECK(Near(x, 0.5f));
-    CHECK(Near(y, 0.8660254f));
-    float x0 = 0.3f, y0 = -0.7f;
-    StickForGap(0.0f, x0, y0);
-    CHECK(x0 == 0.3f && y0 == -0.7f);
+    const double r = yawDeg * 0.017453292519943295;
+    const float c = static_cast<float>(std::cos(r)), s = static_cast<float>(std::sin(r));
+    const float f[3] = { c, 0.0f, s };
+    const float u[3] = { 0.0f, 1.0f, 0.0f };
+    const float lf[3] = { u[1] * f[2] - u[2] * f[1], u[2] * f[0] - u[0] * f[2], u[0] * f[1] - u[1] * f[0] };   // +EBAA90's v10..v12
+    for (int row = 0; row < 3; ++row) {
+        m[row * 4 + 0] = lf[row];
+        m[row * 4 + 1] = u[row];
+        m[row * 4 + 2] = f[row];
+        m[row * 4 + 3] = 7.0f;   // translation, never read
+    }
+}
+
+static void MulM(const float m[12], const float l[3], float w[3])
+{
+    for (int row = 0; row < 3; ++row) { w[row] = m[row * 4] * l[0] + m[row * 4 + 1] * l[1] + m[row * 4 + 2] * l[2]; }
+}
+
+// Body facing == look: the vector is unchanged (the walk was already along the look).
+static void walk_on_look_identity_when_aligned()
+{
+    float m[12];
+    RootMtx(37.0f, m);
+    const float l[3] = { 0.4f, 0.0f, 3.1f };
+    float w[3];
+    MulM(m, l, w);
+    const WalkOut o = WalkOnLook(m, l, w, 37.0f);
+    CHECK(o.why == kWalkFixed);
+    CHECK(o.checkErr < 1e-5f);
+    CHECK(Near(o.turnDeg, 0.0f));
+    CHECK(Near(o.w[0], w[0]) && Near(o.w[1], w[1]) && Near(o.w[2], w[2]));
+}
+
+// Body turned 30 deg off the look (the arm out): the output is exactly the vector the engine would make with the root ON the look.
+static void walk_on_look_turns_body_vector_to_look()
+{
+    float body[12], look[12];
+    RootMtx(70.0f, body);
+    RootMtx(40.0f, look);
+    const float l[3] = { -0.8f, 0.25f, 4.0f };   // forward + a little left + vertical (kept)
+    float w[3], want[3];
+    MulM(body, l, w);
+    MulM(look, l, want);
+    const WalkOut o = WalkOnLook(body, l, w, 40.0f);
+    CHECK(o.why == kWalkFixed);
+    CHECK(Near(o.turnDeg, 30.0f));
+    CHECK(Near(o.w[0], want[0]) && Near(o.w[1], want[1]) && Near(o.w[2], want[2]));
+    CHECK(Near(std::sqrt(o.w[0] * o.w[0] + o.w[1] * o.w[1] + o.w[2] * o.w[2]),
+               std::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2])));   // same speed: +ED2040's start-physics test unchanged
+}
+
+// The dodges (states 8 / 9 / 10, INV-652 addendum 3): local +X / -X / -Z go left / right / back of the LOOK.
+static void walk_on_look_dodges_follow_look()
+{
+    float body[12], look[12];
+    RootMtx(-150.0f, body);
+    RootMtx(170.0f, look);   // 40 deg apart across +-180
+    const float dodges[3][3] = { { 1.0f, 0.0f, 0.0f }, { -1.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, -1.0f } };
+    for (const auto& l : dodges) {
+        float w[3], want[3];
+        MulM(body, l, w);
+        MulM(look, l, want);
+        const WalkOut o = WalkOnLook(body, l, w, 170.0f);
+        CHECK(o.why == kWalkFixed);
+        CHECK(Near(o.turnDeg, 40.0f));
+        CHECK(Near(o.w[0], want[0]) && Near(o.w[1], want[1]) && Near(o.w[2], want[2]));
+    }
+}
+
+// The self-check fails closed: a vector that is NOT M3x3 * l (wrong model, e.g. a transposed matrix) is passed through untouched.
+static void walk_on_look_check_fails_closed()
+{
+    float m[12];
+    RootMtx(30.0f, m);
+    const float l[3] = { 1.0f, 0.0f, 2.0f };
+    float w[3];
+    float mt[12];
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) { mt[r * 4 + c] = m[c * 4 + r]; }
+        mt[r * 4 + 3] = 0.0f;
+    }
+    MulM(mt, l, w);   // what a transposed reading would have produced
+    const WalkOut o = WalkOnLook(m, l, w, 0.0f);
+    CHECK(o.why == kWalkCheckFailed);
+    CHECK(o.checkErr > 0.5f);
+    CHECK(o.w[0] == w[0] && o.w[1] == w[1] && o.w[2] == w[2]);
+    // within 1 mm/s passes
+    float w2[3];
+    MulM(m, l, w2);
+    w2[0] += 0.0005f;
+    CHECK(WalkOnLook(m, l, w2, 0.0f).why == kWalkFixed);
+}
+
+// Not upright (root tilted 2 deg) and non-finite input: passed through untouched.
+static void walk_on_look_refuses_tilt_and_nan()
+{
+    float m[12];
+    RootMtx(0.0f, m);
+    const double t = 2.0 * 0.017453292519943295;
+    m[1] = static_cast<float>(std::sin(t));   // up tilted toward +X
+    m[5] = static_cast<float>(std::cos(t));
+    const float l[3] = { 0.0f, 0.0f, 1.0f };
+    float w[3];
+    MulM(m, l, w);
+    WalkOut o = WalkOnLook(m, l, w, 0.0f);
+    CHECK(o.why == kWalkNotUpright);
+    CHECK(o.w[0] == w[0] && o.w[2] == w[2]);
+    float m2[12];
+    RootMtx(0.0f, m2);
+    const float bad[3] = { 0.0f, NAN, 1.0f };
+    o = WalkOnLook(m2, bad, w, 0.0f);
+    CHECK(o.why == kWalkNonFinite);
+    o = WalkOnLook(m2, l, w, INFINITY);
+    CHECK(o.why == kWalkNonFinite);
 }
 
 // Final review C1: a head-only turn at frame rate must not move the body even for a moment (the filter is on the torso's
@@ -783,7 +892,11 @@ int main()
     new_object_resets();
     nonfinite_input_holds();
     facing_target_continuous();
-    stick_rotation_sign();
+    walk_on_look_identity_when_aligned();
+    walk_on_look_turns_body_vector_to_look();
+    walk_on_look_dodges_follow_look();
+    walk_on_look_check_fails_closed();
+    walk_on_look_refuses_tilt_and_nan();
     stick_gap_refused_when_stale();
     head_turn_transient_keeps_body();
     hands_close_head_turn_keeps_body();

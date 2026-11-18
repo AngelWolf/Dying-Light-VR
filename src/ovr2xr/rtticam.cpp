@@ -367,7 +367,10 @@ uintptr_t TryVtableInModule(HMODULE mod, const char* modName, const char* cls)
     const uintptr_t colVa = base + colRva;
     const uintptr_t codeLo = base;
     const uintptr_t codeHi = base + imageSize;
-    g_vtable = 0;
+    // The result is a LOCAL (trace docs/traces/20261118_1830_rtti_lookup_race.md): this used to be the namespace global g_vtable,
+    // returned after the scan - two threads at once (lodoverride's LevelDI lookup and the swing install's WeaponMeleeController,
+    // RUN WF1 18:25:52.850) handed the swing LevelDI's vtable and melee never installed.
+    uintptr_t found = 0;
     for (size_t off = 0; off + 8 <= imageSize; off += 8) {
         if (*reinterpret_cast<const uintptr_t*>(img + off) != colVa) {
             continue;
@@ -380,20 +383,20 @@ uintptr_t TryVtableInModule(HMODULE mod, const char* modName, const char* cls)
             }
         }
         if (good >= 3) {
-            g_vtable = reinterpret_cast<uintptr_t>(slots);
+            found = reinterpret_cast<uintptr_t>(slots);
             break;
         }
     }
-    if (!g_vtable) {
+    if (!found) {
         _snprintf_s(g_status, sizeof(g_status), _TRUNCATE,
                     "%s locator found but no vtable references it", cls);
         return 0;
     }
     LOG("rtti: %s vtable at %p (RVA 0x%zX in %s), td RVA 0x%X, col RVA 0x%X", cls,
-        reinterpret_cast<void*>(g_vtable), g_vtable - base, modName, tdRva, colRva);
+        reinterpret_cast<void*>(found), found - base, modName, tdRva, colRva);
     _snprintf_s(g_status, sizeof(g_status), _TRUNCATE,
-                "%s vtable RVA 0x%zX in %s", cls, g_vtable - base, modName);
-    return g_vtable;
+                "%s vtable RVA 0x%zX in %s", cls, found - base, modName);
+    return found;
 }
 
 // Tries engine_x64_rwdi.dll first (where every class used so far has lived),
