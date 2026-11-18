@@ -26,6 +26,7 @@
 #include "headpose.h"       // GetHeadPose, NeckPivotReportedPos
 #include "camogesture.h"    // CamoGesturePadPoll - the camouflage wipe, beside body grab's hand publish
 #include "looting_logic.h"
+#include "lidhand.h"        // LidHandOnNearby - hand-open lids publish / null pick inside NearbyHook (trace 20261118_1711)
 #include "overlay.h"        // OverlayVisible - a blocked input for body grab
 
 #include <windows.h>
@@ -213,6 +214,12 @@ bool ReadU8(uintptr_t a, unsigned char* out)
 bool CallSetter(void* player, void* body)
 {
     __try { g_setter(player, body, 1); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// The game's own NULL pick (+BED850(player, 0, 0) - the game writes it itself at four sites, ida/lt4b :247 / :794 / :967 / :989).
+bool CallSetterNull(void* player)
+{
+    __try { g_setter(player, nullptr, 0); return true; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
@@ -851,6 +858,17 @@ void __fastcall NearbyHook(void* player, void* out)
     GameVec gz{};
     why::GazeRepick(player, &gz);
     why::GazeTotals();
+    // [LOADBEARING: lid_by_hand null pick] (lid_by_hand) hand-open lids (spec 2026-11-18-hand-open-lids-design, trace
+    //      20261118_1711): right after the gaze re-pick and BEFORE every later reader of the pick (the camouflage test below, loot by
+    //      hand's body pick, the HUD prompt, the X press): a game pick on a lid container or a carried item becomes the game's own
+    //      NULL pick, so the game's interaction (walk-to, look turn, player clip) never starts for them. lid_by_hand=0 -> false at one
+    //      bool test inside LidHandOnNearby.
+    {
+        const GameVec* lv = static_cast<const GameVec*>(out);
+        if (LidHandOnNearby(player, lv->data, lv->count, gz.data, gz.count) && !CallSetterNull(player)) {
+            InterlockedIncrement(&g_nFault);
+        }
+    }
     BodyGrabPublishPlayer(player);   // severed limbs: bodygrab's level query takes the ILevel from the player
     {
         uintptr_t pick = 0;

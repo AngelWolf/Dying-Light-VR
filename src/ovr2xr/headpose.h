@@ -53,11 +53,6 @@ const XrVector3f& LastReportedHeadPos();
 // ovr_GetTrackingState's job workers.
 float HeadFollowFoldedDeg();
 
-// Torso from controllers §4.4: the torso gap (OpenXR degrees, + = the body LEFT of the look) for the walk stick - true only while
-// a FOLDING update published it under 100 ms ago (headfollow::StickGapFresh); false and 0 otherwise (switch off, the fold paused,
-// no grips, stale). Pad thread. COST: three interlocked reads.
-bool HeadFollowTorsoStickGap(float& gapXrDeg);
-
 // The yaw-only rotation (OpenXR, about +Y) that C1 removed from that same report.
 // Identity when the decouple is not active. Written at the same instant as
 // LastReportedHead(), so the two always describe the same frame.

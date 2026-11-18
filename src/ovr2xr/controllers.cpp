@@ -1843,6 +1843,8 @@ bool GetControllerMenuButton(bool& outPressed)
     return true;
 }
 
+bool ControllerLeftIsIndexProfile() { return g_profileIsIndex[kLeftHand]; }
+
 bool GetControllerButton(FaceButton button, bool& outPressed)
 {
     if (button < 0 || button > kButtonY || !g_buttonActive[button]) {

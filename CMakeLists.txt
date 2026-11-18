@@ -133,6 +133,9 @@ add_library(LibOVRRT64_1 SHARED
     # Loot by hand (docs/superpowers/plans/2026-10-23-loot-by-hand.md): the GetNearbyTriggers detour, the pad bytes and the
     # event probe. The decision is looting_logic.h (tests/looting_logic_test.cpp).
     ${SRC_ROOT}/ovr2xr/looting.cpp
+    # Hand-open lids (docs/superpowers/plans/2026-11-18-hand-open-lids-phase2.md): lid bone from the hand, the game's own open /
+    # take, items on the hand. The decision is lidhand_logic.h (tests/lidhand_logic_test.cpp).
+    ${SRC_ROOT}/ovr2xr/lidhand.cpp
     # Grab bodies by hand (docs/superpowers/plans/2026-10-23-body-grab.md): the ragdoll pull, driven from the player-update tail.
     # The decisions are bodygrab_logic.h + looting_logic.h's DRAG state (tests/bodygrab_logic_test.cpp, looting_logic_test.cpp).
     ${SRC_ROOT}/ovr2xr/bodygrab.cpp

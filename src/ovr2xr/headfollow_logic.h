@@ -316,20 +316,64 @@ inline float FacingTarget(float lookDeg, float gapFieldDeg, float facingNowDeg)
     return facingNowDeg + Wrap180(lookDeg + gapFieldDeg - facingNowDeg);
 }
 
-// The walk stick for a body turned gapXrDeg LEFT of the look: forward (0, 1) becomes (sin g, cos g), so the root's frame maps
-// it onto the look (vr_decouple_move's rotation, ovr2xr.cpp). x right, y forward, before the byte negation. 0 = untouched.
-inline void StickForGap(float gapXrDeg, float& x, float& y)
+// ===== WALK FOLLOWS THE LOOK - docs/superpowers/specs/2026-11-18-walk-follows-look-design.md §2 / §3a, INV-652 addenda 1-3 =====
+// The player walk (gamedll +BA2B20) hands +ED2040 the world walk vector w = M3x3 * l, M = the root's 3x4 (mtx34 rows of 4:
+// left column m[0] m[4] m[8], up m[1] m[5] m[9], forward m[2] m[6] m[10]; +EBAA90 builds forward = (cos f, 0, sin f)), l = the
+// local walk vector (player+4616, local +X left, +Y up, +Z forward). WalkOnLook rebuilds the same vector on the LOOK yaw L
+// (degrees, the same units as the facing f): left (sin L, 0, -cos L), up (0, 1, 0), forward (cos L, 0, sin L).
+// It refuses (keep w) unless every input is finite, the root is upright within kWalkUprightCos and w == M3x3 * l within
+// max(kWalkCheckAbs, kWalkCheckRel * |w|) - the self-check that our model of the engine's root is right for this call.
+constexpr float kWalkUprightCos = 0.99984770f;   // cos 1 deg
+constexpr float kWalkCheckAbs   = 0.001f;        // 1 mm/s
+constexpr float kWalkCheckRel   = 0.005f;        // 0.5 % of |w|
+
+enum WalkWhy { kWalkFixed = 0, kWalkNonFinite = 1, kWalkNotUpright = 2, kWalkCheckFailed = 3 };
+
+struct WalkOut {
+    int   why;       // WalkWhy
+    float checkErr;  // |w - M3x3 l| (m/s); -1 when not computed
+    float turnDeg;   // the root's forward yaw minus L, wrapped (how far walking was turned back); 0 when not computed
+    float w[3];      // the vector to send: w_L when why == kWalkFixed, else the incoming w unchanged
+};
+
+inline WalkOut WalkOnLook(const float m[12], const float l[3], const float w[3], float lookDeg)
 {
-    if (gapXrDeg == 0.0f) { return; }
-    const float g = gapXrDeg * 0.01745329252f;
-    const float c = std::cos(g), sn = std::sin(g);
-    const float nx = x * c + y * sn;
-    const float ny = -x * sn + y * c;
-    x = nx;
-    y = ny;
+    WalkOut o{ kWalkNonFinite, -1.0f, 0.0f, { w[0], w[1], w[2] } };
+    for (int i = 0; i < 12; ++i) {
+        if (!std::isfinite(m[i])) { return o; }
+    }
+    for (int i = 0; i < 3; ++i) {
+        if (!std::isfinite(l[i]) || !std::isfinite(w[i])) { return o; }
+    }
+    if (!std::isfinite(lookDeg)) { return o; }
+    const float upLen = std::sqrt(m[1] * m[1] + m[5] * m[5] + m[9] * m[9]);
+    if (!(upLen > 1e-6f) || m[5] / upLen < kWalkUprightCos) {
+        o.why = kWalkNotUpright;
+        return o;
+    }
+    const float fx = m[0] * l[0] + m[1] * l[1] + m[2] * l[2];
+    const float fy = m[4] * l[0] + m[5] * l[1] + m[6] * l[2];
+    const float fz = m[8] * l[0] + m[9] * l[1] + m[10] * l[2];
+    const float ex = fx - w[0], ey = fy - w[1], ez = fz - w[2];
+    o.checkErr = std::sqrt(ex * ex + ey * ey + ez * ez);
+    const float wLen = std::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+    const float tol = kWalkCheckAbs > kWalkCheckRel * wLen ? kWalkCheckAbs : kWalkCheckRel * wLen;
+    if (!(o.checkErr <= tol)) {
+        o.why = kWalkCheckFailed;
+        return o;
+    }
+    const float rootDeg = std::atan2(m[10], m[2]) * 57.2957795f;
+    o.turnDeg = Wrap180(rootDeg - lookDeg);
+    const float r = lookDeg * 0.01745329252f;
+    const float c = std::cos(r), s = std::sin(r);
+    o.w[0] = l[0] * s + l[2] * c;
+    o.w[1] = l[1];
+    o.w[2] = -l[0] * c + l[2] * s;
+    o.why = kWalkFixed;
+    return o;
 }
 
-// The pad thread may use a published gap only if a FOLDING update wrote it under kTorsoStickStaleMs ago.
+// A published torso gap is used only if a FOLDING update wrote it under kTorsoStickStaleMs ago (walk follows the look's gate).
 inline bool StickGapFresh(unsigned long long nowMs, unsigned long long pubMs, bool pubFolding)
 {
     return pubMs != 0 && pubFolding && nowMs >= pubMs && nowMs - pubMs < kTorsoStickStaleMs;

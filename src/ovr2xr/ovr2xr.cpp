@@ -52,6 +52,7 @@
 #include "meleethrow.h"
 #include "throwable.h"
 #include "looting.h"    // loot by hand (spec 2026-10-23-loot-by-hand-design): LootPoll / LootPadByte, the loot_* settings
+#include "lidhand.h"    // hand-open lids (spec 2026-11-18-hand-open-lids-design): LidHandPoll, the lid_* settings
 #include "bodygrab.h"   // body grab (plan 2026-10-23-body-grab): BodyGrabHandActive - the trigger bytes; the body_grab_* settings
 #include "camogesture.h"   // the camouflage gesture (plan 2026-11-07-camouflage-gesture): the camo_* settings
 #include "breakout.h"   // physical breakout (plan 2026-10-24-physical-breakout): BreakoutPoll; the breakout_* settings
@@ -84,7 +85,10 @@
 #include "settings.h"
 #include "snap_logic.h"
 #include "menutap_logic.h"  // the left menu button's tap / hold machine + the co-op teleport latch (INV-745)
+#include "menuchord_logic.h"  // SteamVR: X + Y together = the menu button (trace 20261118_1047_steamvr_xy_menu_chord)
 #include "fovtable_logic.h"   // first-launch FOV rows (no hmd_cache.txt yet)
+#include "cantview_logic.h"   // canted views -> parallel (LocateViews; trace 20261118_1150_canted_views)
+#include "fovcrop_logic.h"    // SteamVR: the projection view cut to the panel window (trace 20261118_1345_steamvr_panel_crop)
 #include "eyefov_logic.h"     // one frustum for both eyes (INV-597)
 #include "videoforce_logic.h" // vr_force_vsync_off's bring-up stub
 #include "buggywheel.h"       // buggy_hand_steer (BuggyHandSteer)
@@ -678,6 +682,14 @@ constexpr bool g_diagEyePoseCompare = false;
 bool  g_diagEyePoseCompare = false;
 #endif
 
+// [DEP: diag_fake_view_cant_deg] required-for=testing the canted-view conversion (cantview_logic.h, LocateViews) on a headset
+//      whose views are parallel (g_fakeViewCantDeg; trace docs/traces/20261118_1150_canted_views.md). +N turns the two located
+//      views outward N deg each (left eye +Y) with their FOV re-expressed - a fake canted runtime - and the conversion then runs
+//      on it; -N fakes the same and BYPASSES the conversion (the pre-fix declaration: the double image). tree=PROBE-ONLY (a
+//      debug fake; 0 = nothing touched). HEADSET (the image in the lenses). VDXR / SteamVR honour a declared FOV; Meta Link
+//      does not (D-165) - the fake is not valid there. DEFAULT 0 - never shipped on. OUTSIDE every DLVR_BETA_LEAN block.
+float g_fakeViewCantDeg = 0.0f;
+
 // The game renders a SYMMETRIC frustum, because ovr_GetHmdDesc has to answer
 // before any view exists and can only offer a symmetric fallback. Real headset
 // FOVs are asymmetric - on Quest 3 the optical centre sits below and outward of
@@ -710,6 +722,10 @@ int   g_symmetricFov = 2;
 //      the mode goes through SymmetricFovMode(). The setting itself (file, config: dump) is never rewritten. VDXR / SteamVR keep
 //      the setting (D-265: 0 misaligns the eyes on VDXR).
 bool  g_runtimeStretchesFov = false;
+// The runtime's name starts "SteamVR/OpenXR" (menuchord::RuntimeIsSteamVr) - set once in ovr_Create, before the first pad poll.
+// SteamVR takes the left Touch menu button (Jay 2026-11-18: "SteamVR eats the input"), so there the X + Y chord is the menu
+// button (dlvr_FilterScePad's face-button block). VDXR / WiVRn / Meta's runtime: false, X / Y unchanged.
+bool  g_runtimeIsSteamVr = false;
 
 int SymmetricFovMode()
 {
@@ -1375,6 +1391,12 @@ const Setting kSettings[] = {
            "Manual override on top of auto assign."),
     S_BOOL("invert_eye_offset", g_invertEyeOffset, "Invert eye offset", "Stereo",
            "Negate HmdToEyeOffset, for the SDK 0.x meaning. This engine wants 1.x."),
+    S_FLOAT("diag_fake_view_cant_deg", g_fakeViewCantDeg, -25.0f, 25.0f,
+            "Diagnostics: fake canted displays (deg per eye)", "Stereo",
+            "Test only. Pretends the headset's two displays are turned outward by this many degrees each, like a Pimax. "
+            "Positive: the canted-display fix handles it and the picture should look normal. Negative: the same fake "
+            "with the fix bypassed, which shows the double image a canted headset had before the fix. Read at launch. "
+            "Not valid over Meta Link. DEFAULT 0."),
     // LOCKED OFF 2026-10-07 (Jay: "Yes" - lock declare_rendered_orientation's prerequisites; the declaration refuses by name at 1).
     S_BOOL_LOCKED("use_render_pose", g_useRenderPose, "Use game render pose", "Stereo",
            "Describe each eye image with the pose the GAME says it rendered from. "
@@ -2082,6 +2104,14 @@ const Setting kSettings[] = {
             "The hand counts as still below this speed. Moving faster before the search starts cancels that grip."),
     S_FLOAT("loot_settle_s", dlvr::LootSettleS, 0.0f, 1.5f, "Loot: settle time (s)", "Controller Bindings",
             "How long the hand must stay still on the body before the search starts."),
+    S_BOOL("lid_by_hand", dlvr::LidByHand, "Open chests and trunks by hand", "Controller Bindings",
+           "spec 2026-11-18-hand-open-lids-design. Needs \"Loot by hand\" on. Wooden chests, car trunks and lidded baskets: squeeze "
+           "a grip with your hand on the lid and swing it open - your view and position are never moved (no walk-up, no kneel). "
+           "Past the open point the game opens it and the lid finishes swinging; grab it again to close it (visual only). Grip an "
+           "item inside to hold it; let go over your shoulder to put it in your inventory, anywhere else to put it back. X does "
+           "nothing on these containers while this is on. HEADSET only."),
+    S_FLOAT("lid_open_frac", dlvr::LidOpenFrac, 0.1f, 0.9f, "Lid: open point (fraction)", "Controller Bindings",
+            "How far the lid must be swung, as a share of its full opening, before the game opens the container."),
     S_BOOL("body_grab", dlvr::BodyGrab, "Grab bodies by hand", "Controller Bindings",
            "Needs \"Loot by hand\" on. Squeeze a grip with your hand on a dead body away from its torso - an arm, a leg, the "
            "head - and that part follows your hand while the rest drags behind. On the torso, a still hand loots as before; "
@@ -7443,6 +7473,86 @@ void LocateViews(Session* s)
     XrView views[2]{};
     views[0].type = views[1].type = XR_TYPE_VIEW;
     if (XR_SUCCEEDED(xrLocateViews_(s->session, &li, &vs, 2, &count, views)) && count >= 2) {
+        // [LOADBEARING: CANTED-VIEWS] the game renders BOTH eyes at ONE orientation (SDK 1.10 HmdToEyeOffset is a translation,
+        //      ovr2xr.cpp:24-27). On a runtime whose two views are turned against each other (canted displays - a Pimax), the
+        //      views are replaced HERE by their bisector and each FOV re-expressed in it (cantview_logic.h ToParallel), before
+        //      anything copies them: the head (:headPose below), the declared poses (submit, rendered * inv(view0) * view_e)
+        //      and the game's frustum (RealEyeFov / hmd_cache) then all describe the image the game drew. Without it eye 1 is
+        //      declared turned by the whole cant - the doubled image a Crystal Light player reported 2026-11-18. Views under
+        //      1 deg apart are not touched (the path every logged headset runs). Trace docs/traces/20261118_1150_canted_views.md.
+        //      COST: one quaternion product + atan2 per locate; converting adds 8 vector rotations + 4 atan; fake off = one test.
+        {
+            using namespace ::dlvr::cantview;
+            const bool oriOkCv = (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0;
+            static const float s_fake = g_fakeViewCantDeg;   // latched at the first locate: the game's frustum is fixed per launch
+            const float fakeDeg = fminf(fabsf(s_fake), kMaxFakeDeg);
+            const bool bypass = s_fake < 0.0f;
+            Quat cq[2];
+            Fov cf[2];
+            for (int e = 0; e < 2; ++e) {
+                cq[e] = { views[e].pose.orientation.x, views[e].pose.orientation.y, views[e].pose.orientation.z,
+                          views[e].pose.orientation.w };
+                cf[e] = { views[e].fov.angleLeft, views[e].fov.angleRight, views[e].fov.angleUp, views[e].fov.angleDown };
+            }
+            const Fov rawF[2] = { cf[0], cf[1] };
+            const float rawAngle = AngleDeg(cq[0], cq[1]);
+            bool clampedCv = false;
+            if (fakeDeg > 0.0f) {
+                FakeCant(0, fakeDeg, cq[0], cf[0], &clampedCv);
+                FakeCant(1, fakeDeg, cq[1], cf[1], &clampedCv);
+            }
+            const float usedAngle = AngleDeg(cq[0], cq[1]);
+            const Quat cvRel0 = Mul(Conj(Bisector(cq[0], cq[1])), cq[0]);   // view 0 against the bisector, for the log
+            static Quat s_rel[2] = { { 0.0f, 0.0f, 0.0f, 1.0f }, { 0.0f, 0.0f, 0.0f, 1.0f } };
+            static bool s_active = false;
+            bool convertedNow = false;
+            if (bypass) {
+                // the A/B leg only (diag_fake_view_cant_deg < 0): the views go on exactly as faked - the pre-fix declaration
+            } else if (oriOkCv) {
+                const Result cr = ToParallel(cq, cf);
+                clampedCv = clampedCv || cr.clamped;
+                convertedNow = cr.converted;
+                s_active = cr.converted;
+                if (cr.converted) { s_rel[0] = cr.rel[0]; s_rel[1] = cr.rel[1]; }
+            } else if (s_active) {
+                // orientation not valid this locate: it is HELD below and the FOV is not - re-express it with the last turn
+                cf[0] = Reexpress(cf[0], s_rel[0], &clampedCv);
+                cf[1] = Reexpress(cf[1], s_rel[1], &clampedCv);
+            }
+            for (int e = 0; e < 2; ++e) {
+                views[e].pose.orientation = XrQuaternionf{ cq[e].x, cq[e].y, cq[e].z, cq[e].w };
+                views[e].fov = XrFovf{ cf[e].left, cf[e].right, cf[e].up, cf[e].down };
+            }
+            if (oriOkCv) {
+                static bool s_said = false;
+                static int s_lastState = -1;
+                static int s_lines = 0;
+                const int state = bypass ? 2 : (convertedNow ? 1 : 0);
+                if ((!s_said || state != s_lastState) && s_lines < 20) {
+                    ++s_lines;
+                    const float k = kDegPerRad;
+                    const float yaw0 = 2.0f * atan2f(cvRel0.y, fabsf(cvRel0.w)) * k * (cvRel0.w < 0.0f ? -1.0f : 1.0f);
+                    const float off0 = 2.0f * asinf(fminf(1.0f, sqrtf(cvRel0.x * cvRel0.x + cvRel0.z * cvRel0.z))) * k;
+                    // [PROBE: CANTVIEW] gate=none (first located views unconditionally, then each change of decision, 20 lines max)  site=HEADSET  log-only=yes
+                    LOG("[CANTVIEW] %s: the runtime's two views are %.3f deg apart (after the fake: %.3f; fake %.1f deg per eye%s; "
+                        "view 0 turned %+.3f deg about head-up and %.3f deg off that axis, + = left) | runtime FOV deg view0 L%.2f "
+                        "R%.2f U%.2f D%.2f view1 L%.2f R%.2f U%.2f D%.2f | -> %s | FOV used view0 L%.2f R%.2f U%.2f D%.2f view1 "
+                        "L%.2f R%.2f U%.2f D%.2f%s",
+                        s_said ? "decision changed" : "FIRST located views (logged unconditionally)", rawAngle, usedAngle,
+                        fakeDeg, bypass ? ", conversion BYPASSED" : "", yaw0, off0,
+                        rawF[0].left * k, rawF[0].right * k, rawF[0].up * k, rawF[0].down * k,
+                        rawF[1].left * k, rawF[1].right * k, rawF[1].up * k, rawF[1].down * k,
+                        state == 1 ? "CONVERTED to parallel: both eyes at their bisector, FOV re-expressed in it"
+                                   : (state == 2 ? "NOT CONVERTED: diag_fake_view_cant_deg is negative (the fix bypassed)"
+                                                 : "UNCHANGED: under 1.0 deg apart, a parallel-view headset"),
+                        cf[0].left * k, cf[0].right * k, cf[0].up * k, cf[0].down * k,
+                        cf[1].left * k, cf[1].right * k, cf[1].up * k, cf[1].down * k,
+                        clampedCv ? " | CLAMPED at 80 deg: part of the display is not covered (black at that edge)" : "");
+                    s_said = true;
+                    s_lastState = state;
+                }
+            }
+        }
         // Take only what the runtime says is meaningful.
         //
         // When a valid bit is clear the matching part of views[].pose is
@@ -8603,6 +8713,7 @@ OVR_PUBLIC_FUNCTION(ovrResult) ovr_Create(ovrSession* pSession, ovrGraphicsLuid*
                 XR_VERSION_PATCH(ip.runtimeVersion));
             // [LOADBEARING: FOV-META-OWN-FOV] the runtime's name decides the symmetric_fov mode used; logged either way.
             g_runtimeStretchesFov = dlvr::eyefov::RuntimeStretchesToOwnFov(ip.runtimeName);
+            g_runtimeIsSteamVr = dlvr::menuchord::RuntimeIsSteamVr(ip.runtimeName);
             LOG("symmetric_fov: file value %d -> using %d (runtime \"%s\" %s)", g_symmetricFov, SymmetricFovMode(),
                 ip.runtimeName,
                 g_runtimeStretchesFov
@@ -8611,6 +8722,7 @@ OVR_PUBLIC_FUNCTION(ovrResult) ovr_Create(ovrSession* pSession, ovrGraphicsLuid*
         } else {
             LOG("runtime: xrGetInstanceProperties failed");
             g_runtimeStretchesFov = false;
+            g_runtimeIsSteamVr = false;
             LOG("symmetric_fov: file value %d used as it is - the runtime's name could not be read", g_symmetricFov);
         }
     }
@@ -10084,6 +10196,86 @@ OVR_PUBLIC_FUNCTION(void) ovr_DestroyMirrorTexture(ovrSession session, ovrMirror
     delete m;
 }
 
+// SteamVR PANEL CROP (fovcrop_logic.h; trace docs/traces/20261118_1345_steamvr_panel_crop.md; Jay 2026-11-18 "Go ahead", "SteamVR
+// only"). On the SteamVR runtime the projection view e is cut to the runtime's own panel window inside the image the game drew:
+// imageRect = that window's pixels, fov = the exact tangents of its pixel edges. SteamVR passes a layer's frustum to the headset
+// driver, and the Pimax driver ("aapvr") shows it with the panel's frustum instead - a Crystal Light saw the whole image doubled
+// at symmetric_fov=2, correct with the SteamVR dashboard open. Called AFTER the wrist HUD, the lens mask and lsVp took the
+// uncropped values (they describe the whole image). COST: a bitwise compare of the cached inputs per eye per submit; on a change
+// 8 tan + 4 atan.
+namespace {
+struct PanelCropCache {
+    bool                    have = false;
+    XrFovf                  img{}, panel{};
+    XrRect2Di               vp{};
+    int                     gate = -1;   // -1 computed by Crop, else the gate reason below
+    ::dlvr::fovcrop::Result res{};
+};
+PanelCropCache g_pcCache[2];
+int            g_pcLastLogged[2] = { -99, -99 };
+int            g_pcLines = 0;
+constexpr int  kPcGatePitched = 10, kPcGateCentre = 11, kPcGateNoGameFov = 12;
+
+const char* PanelCropGateName(int gate)
+{
+    switch (gate) {
+        case kPcGatePitched:   return "NOT CUT: the declared pose is pitched (auto_pitch / pitch_offset_deg) - the panel window is not in the image's frame";
+        case kPcGateCentre:    return "NOT CUT: fov_center_correct=1 declares a re-centred frustum";
+        case kPcGateNoGameFov: return "NOT CUT: no game frustum this submit (the runtime's own FOV is declared already)";
+        default:               return ::dlvr::fovcrop::WhyName(gate);
+    }
+}
+
+void SteamVrPanelCrop(int e, XrCompositionLayerProjectionView& pv, const XrFovf& panel, float pitchDeg, bool haveGameFov)
+{
+    if (e < 0 || e > 1) { return; }
+    PanelCropCache& c = g_pcCache[e];
+    const int gate = fabsf(pitchDeg) >= 0.01f ? kPcGatePitched
+                   : (g_fovCenterCorrect ? kPcGateCentre : (!haveGameFov ? kPcGateNoGameFov : -1));
+    const XrRect2Di& vp = pv.subImage.imageRect;
+    const bool same = c.have && c.gate == gate && memcmp(&c.img, &pv.fov, sizeof(XrFovf)) == 0 &&
+                      memcmp(&c.panel, &panel, sizeof(XrFovf)) == 0 && memcmp(&c.vp, &vp, sizeof(XrRect2Di)) == 0;
+    if (!same) {
+        c.have = true;
+        c.img = pv.fov;
+        c.panel = panel;
+        c.vp = vp;
+        c.gate = gate;
+        if (gate < 0) {
+            c.res = ::dlvr::fovcrop::Crop(::dlvr::fovcrop::Fov{ pv.fov.angleLeft, pv.fov.angleRight, pv.fov.angleUp, pv.fov.angleDown },
+                                          ::dlvr::fovcrop::Fov{ panel.angleLeft, panel.angleRight, panel.angleUp, panel.angleDown },
+                                          ::dlvr::fovcrop::Rect{ vp.offset.x, vp.offset.y, vp.extent.width, vp.extent.height });
+        }
+        const int decision = gate >= 0 ? gate : c.res.why;
+        if (decision != g_pcLastLogged[e] && g_pcLines < 20) {
+            ++g_pcLines;
+            const float k = 57.2957795f;
+            const bool cut = gate < 0 && c.res.why == ::dlvr::fovcrop::kCropped;
+            // [PROBE: FOVCROP] gate=none (SteamVR runtime; first decision per eye unconditionally, then each change, 20 lines max)  site=HEADSET  log-only=no
+            LOG("[FOVCROP] eye%d %s: %s | image deg L%.2f R%.2f U%.2f D%.2f rect (%d,%d %dx%d) | panel deg L%.2f R%.2f U%.2f D%.2f | "
+                "margin px L%.1f R%.1f T%.1f B%.1f | -> declared deg L%.2f R%.2f U%.2f D%.2f rect (%d,%d %dx%d)",
+                e, g_pcLastLogged[e] == -99 ? "FIRST (logged unconditionally)" : "decision changed", PanelCropGateName(decision),
+                pv.fov.angleLeft * k, pv.fov.angleRight * k, pv.fov.angleUp * k, pv.fov.angleDown * k, vp.offset.x, vp.offset.y,
+                vp.extent.width, vp.extent.height, panel.angleLeft * k, panel.angleRight * k, panel.angleUp * k, panel.angleDown * k,
+                gate < 0 ? c.res.marginPx[0] : 0.0, gate < 0 ? c.res.marginPx[1] : 0.0, gate < 0 ? c.res.marginPx[2] : 0.0,
+                gate < 0 ? c.res.marginPx[3] : 0.0,
+                (cut ? c.res.fov.left : pv.fov.angleLeft) * k, (cut ? c.res.fov.right : pv.fov.angleRight) * k,
+                (cut ? c.res.fov.up : pv.fov.angleUp) * k, (cut ? c.res.fov.down : pv.fov.angleDown) * k,
+                cut ? c.res.rect.x : vp.offset.x, cut ? c.res.rect.y : vp.offset.y, cut ? c.res.rect.w : vp.extent.width,
+                cut ? c.res.rect.h : vp.extent.height);
+            g_pcLastLogged[e] = decision;
+        }
+    }
+    if (c.gate < 0 && c.res.why == ::dlvr::fovcrop::kCropped) {
+        pv.fov = XrFovf{ c.res.fov.left, c.res.fov.right, c.res.fov.up, c.res.fov.down };
+        pv.subImage.imageRect.offset.x = c.res.rect.x;
+        pv.subImage.imageRect.offset.y = c.res.rect.y;
+        pv.subImage.imageRect.extent.width = c.res.rect.w;
+        pv.subImage.imageRect.extent.height = c.res.rect.h;
+    }
+}
+}  // namespace
+
 // ============================================================================
 //  Frame submission
 // ============================================================================
@@ -10163,6 +10355,7 @@ ovr_SubmitFrame(ovrSession session, long long frameIndex,
     }
 
     XrCompositionLayerProjectionView projViews[2]{};
+    XrFovf imgFov0{};   // eye 0's frustum of the WHOLE image, before the SteamVR panel crop: the menu panel / loading quads draw the whole pass
     XrCompositionLayerProjection proj{ XR_TYPE_COMPOSITION_LAYER_PROJECTION };
     XrCompositionLayerQuad overlayQuad{ XR_TYPE_COMPOSITION_LAYER_QUAD };
     XrCompositionLayerQuad grappleQuad{ XR_TYPE_COMPOSITION_LAYER_QUAD };   // grapple_reticle_3d
@@ -10796,6 +10989,13 @@ ovr_SubmitFrame(ovrSession session, long long frameIndex,
             projViews[e].subImage.imageRect.extent.width = viewport[src].Size.w;
             projViews[e].subImage.imageRect.extent.height = viewport[src].Size.h;
             lsVp[e] = projViews[e].subImage.imageRect;   // the loading-screen void cuts this eye's HUD box from here
+            if (e == 0) { imgFov0 = projViews[0].fov; }
+            // [LOADBEARING: STEAMVR-PANEL-CROP] on SteamVR the view handed to xrEndFrame is cut to the runtime's panel window (pixels +
+            //      their exact frustum). Removing it puts back the Pimax ("aapvr") doubled image: that driver shows a layer with the
+            //      panel's frustum, not the layer's (Crystal Light, 2026-11-18; correct with the SteamVR dashboard open).
+            if (g_runtimeIsSteamVr) {
+                SteamVrPanelCrop(e, projViews[e], s->views[e].fov, pitch, layerFov != nullptr);
+            }
         }
 
         // AFW held-eye pose: remember the orientation each RENDERED eye of this image was drawn with (the held eye keeps
@@ -10936,14 +11136,14 @@ ovr_SubmitFrame(ovrSession session, long long frameIndex,
     const XrPosef menuEyes[2] = { projViews[0].pose, projViews[1].pose };
     // The desktop window: the menu panel is laid over it only on a submit that redrew it (deskmirror.h DrawPanel, trace 20261114_1125).
     ::dlvr::deskmirror::SetFresh(mirrorRefreshed && !s->mirrors.empty() ? s->mirrors[0]->tex : nullptr);
-    const int menuQuads = ::dlvr::uipanel::Render(s->appSpace, proj.viewCount == 2, menuEyes, menuRendered0, projViews[0].fov,
+    const int menuQuads = ::dlvr::uipanel::Render(s->appSpace, proj.viewCount == 2, menuEyes, menuRendered0, imgFov0,
                                                   menuQuad, s->frameState.predictedDisplayTime);
     for (int mq = 0; mq < menuQuads && submitted < 5; ++mq) {
         layers[submitted++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&menuQuad[mq]);
     }
     // LOADING-SCREEN VOID (loadscreen.h): the picture on its room-fixed quad pair, under the settings panel. Not loading = one
     // bool test.
-    const int loadQuads = ::dlvr::loadscreen::Render(s->appSpace, proj.viewCount == 2, s->posesValid, menuEyes, projViews[0].fov,
+    const int loadQuads = ::dlvr::loadscreen::Render(s->appSpace, proj.viewCount == 2, s->posesValid, menuEyes, imgFov0,
                                                      lsVp, ::dlvr::CalibScreenVoid(), loadQuad);
     for (int lq = 0; lq < loadQuads && submitted < static_cast<uint32_t>(kLayerCap - 1); ++lq) {
         layers[submitted++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&loadQuad[lq]);
@@ -12572,16 +12772,9 @@ extern "C" __declspec(dllexport) void dlvr_FilterScePad(void* pData)
                         g_vrDecoupleMaxDeg, lx, ly);
                 }
             }
-            // TORSO FROM CONTROLLERS (docs/superpowers/specs/2026-10-29-torso-from-controllers-design.md §4.4): the body (root) now
-            // faces the controllers, and walking is the root's frame (INV-652) - so turn the stick by the torso gap and you still
-            // walk where you LOOK. Only while a folding update published the gap under 100 ms ago; never in a game menu.
-            // COST per pad poll: three interlocked reads and, with a gap, one sincos.
-            if (!gameMenu) {
-                float torsoGap = 0.0f;
-                if (dlvr::HeadFollowTorsoStickGap(torsoGap)) {
-                    dlvr::headfollow::StickForGap(torsoGap, lx, ly);
-                }
-            }
+            // Torso from controllers turns the body toward the hands; walking along the LOOK is now done at the game's walk call
+            // (boneblend.cpp walklook, 2026-11-18 - docs/superpowers/specs/2026-11-18-walk-follows-look-design.md), not by turning
+            // this stick, so sprint's near-forward check sees the stick as pushed.
             // Y confirmed inverted 2026-09-02 (pushing the stick forward
             // moved the character backward) - OpenXR's +y-is-forward does
             // not match this buffer's own convention on this axis. Negated
@@ -12636,6 +12829,14 @@ extern "C" __declspec(dllexport) void dlvr_FilterScePad(void* pData)
     // bits - OR'd in, never cleared, so a real pad's own press still works
     // too (matches vr_trigger_fire's non-destructive approach, unlike the
     // stick axes which have no such option).
+    // SteamVR X + Y CHORD (Jay 2026-11-18: "60 ms, combo works in menus, keep Options tap" -> "Do it"; trace
+    // docs/traces/20261118_1047_steamvr_xy_menu_chord.md; menuchord_logic.h, unit-tested): on SteamVR (which takes the left menu
+    // button) with the left hand not on Index, the first of X / Y is held back 60 ms; both down inside it = the menu button's `down`
+    // for the tap / hold machine below (tap = SELECT, 0.5 s = START), and neither bit reaches the game until both are up. A single
+    // press passes 60 ms late; a tap shorter than that is re-sent as a 100 ms pulse. Everywhere else X / Y pass exactly as before.
+    // Also inside in-game menus (Jay's ruling) - this runs before the mpBefore snapshot, so a withheld bit stays withheld there.
+    // COST per poll: two cached-bool reads + a few compares.
+    bool xyChordDown = false;
     if (g_vrFaceButtons) {
         auto* buttons = reinterpret_cast<uint32_t*>(p);
         bool pressed = false;
@@ -12649,11 +12850,41 @@ extern "C" __declspec(dllexport) void dlvr_FilterScePad(void* pData)
             *buttons |= 0x2000u;  // Circle
             anyPressed = true;
         }
-        if (dlvr::GetControllerButton(dlvr::kButtonX, pressed) && pressed) {
+        bool rawX = false, rawY = false;
+        if (!dlvr::GetControllerButton(dlvr::kButtonX, rawX)) { rawX = false; }
+        if (!dlvr::GetControllerButton(dlvr::kButtonY, rawY)) { rawY = false; }
+        const bool chordOn = g_runtimeIsSteamVr && !dlvr::ControllerLeftIsIndexProfile();
+        static dlvr::menuchord::Machine s_chord;
+        static bool s_chordFirst = true;
+        if (s_chordFirst) {
+            s_chordFirst = false;
+            // [PROBE: XYCHORD] gate=vr_face_buttons  site=HEADSET  log-only=no
+            LOG("vr_face_buttons (scepad): [XYCHORD] first poll (logged unconditionally) - runtime SteamVR %d, left hand Index %d -> "
+                "X + Y chord %s (window %llu ms, tap pulse %llu ms)", g_runtimeIsSteamVr ? 1 : 0,
+                dlvr::ControllerLeftIsIndexProfile() ? 1 : 0, chordOn ? "ON = the menu button" : "OFF - X / Y pass as before",
+                dlvr::menuchord::kWindowMs, dlvr::menuchord::kTapPulseMs);
+        }
+        static bool s_chordOnSaid = false;
+        if (chordOn != s_chordOnSaid) {
+            s_chordOnSaid = chordOn;
+            // [PROBE: XYCHORD] gate=vr_face_buttons  site=HEADSET  log-only=no
+            LOG("vr_face_buttons (scepad): [XYCHORD] chord now %s (runtime SteamVR %d, left hand Index %d)", chordOn ? "ON" : "OFF",
+                g_runtimeIsSteamVr ? 1 : 0, dlvr::ControllerLeftIsIndexProfile() ? 1 : 0);
+        }
+        const dlvr::menuchord::State chordBefore = s_chord.st;
+        const dlvr::menuchord::Out co = dlvr::menuchord::Step(s_chord, chordOn, rawX, rawY, GetTickCount64());
+        xyChordDown = co.chord;
+        if (s_chord.st != chordBefore) {
+            // Logged on each state change only (a chord lasts a few hundred ms; a tap a few polls).
+            // [PROBE: XYCHORD] gate=vr_face_buttons  site=HEADSET  log-only=no
+            LOG("vr_face_buttons (scepad): [XYCHORD] %s -> %s (X %d Y %d)", dlvr::menuchord::StateName(chordBefore),
+                dlvr::menuchord::StateName(s_chord.st), rawX ? 1 : 0, rawY ? 1 : 0);
+        }
+        if (co.sendX) {
             *buttons |= 0x8000u;  // Square
             anyPressed = true;
         }
-        if (dlvr::GetControllerButton(dlvr::kButtonY, pressed) && pressed) {
+        if (co.sendY) {
             *buttons |= 0x1000u;  // Triangle
             anyPressed = true;
         }
@@ -12701,7 +12932,9 @@ extern "C" __declspec(dllexport) void dlvr_FilterScePad(void* pData)
         constexpr uint32_t kStartBit = 0x8u;        // OPTIONS
         static dlvr::menutap::Machine s_tap;
         bool pressed = false;
-        const bool down = dlvr::GetControllerMenuButton(pressed) && pressed;
+        // + the SteamVR X + Y chord (face-button block above; false off SteamVR / with vr_face_buttons=0). OR'd, so PSVR2's right
+        // Options tap (Sony's remap of this button) keeps working beside it (Jay 2026-11-18: "keep Options tap").
+        const bool down = (dlvr::GetControllerMenuButton(pressed) && pressed) || xyChordDown;
         const ULONGLONG now = GetTickCount64();
         const dlvr::menutap::State before = s_tap.st;
         bool offer = false;
@@ -12832,6 +13065,12 @@ extern "C" __declspec(dllexport) void dlvr_FilterScePad(void* pData)
     //      the two-handed hold absorbed a mag-zone press; it no longer does (Task 5). COST: one bool or per poll per call.
     bool lootSuppressL1 = false, lootSuppressR1 = false;
     dlvr::LootPoll(g_vrGrip, holsterOwnsL || twoHandSuppressL1 || reloadSuppressL1, holsterOwnsR, lootSuppressL1, lootSuppressR1);
+    // Hand-open lids (spec 2026-11-18-hand-open-lids-design, trace 20261118_1711): AFTER loot by hand (a press it owns is not a lid
+    // grab). A grip held on a lid / an item, or squeezed next to one, is the grab, not L1 (the kick) / R1. lid_by_hand=0 -> both
+    // false at one bool test.
+    bool lidSuppressL1 = false, lidSuppressR1 = false;
+    dlvr::LidHandPoll(g_vrGrip, holsterOwnsL || twoHandSuppressL1 || reloadSuppressL1 || lootSuppressL1, holsterOwnsR || lootSuppressR1,
+                      lidSuppressL1, lidSuppressR1);
     // Physical breakout (plan 2026-10-24-physical-breakout Task 3): the shove detector only - it withholds and injects nothing;
     // the game call happens on the game thread (HookTail -> BreakoutTick). breakout_physical=0 -> one bool test.
     dlvr::BreakoutPoll();
@@ -12844,13 +13083,15 @@ extern "C" __declspec(dllexport) void dlvr_FilterScePad(void* pData)
     // kick) / R1 (right, the combat grapple), until it opens. enemy_push_grab=0 -> both false at one bool test.
     bool pgSuppressL1 = false, pgSuppressR1 = false;
     // (+ reloadSuppressL1: the manual reload's press is never an enemy grab - the arbitration marker at LootPoll above. One bool or.)
-    dlvr::PushGrabPoll(g_vrGrip, holsterOwnsL || twoHandSuppressL1 || lootSuppressL1 || reloadSuppressL1,
-                       holsterOwnsR || lootSuppressR1 || camoSuppressR1,
+    dlvr::PushGrabPoll(g_vrGrip, holsterOwnsL || twoHandSuppressL1 || lootSuppressL1 || reloadSuppressL1 || lidSuppressL1,
+                       holsterOwnsR || lootSuppressR1 || camoSuppressR1 || lidSuppressR1,
                        pgSuppressL1, pgSuppressR1);
     // (Manual reload's ReloadPadPoll runs ABOVE, before TwoHandPoll - rifle plan Task 5.)
     // In an in-game menu the grips are plain L1 / R1 (game-menu pass-through, B) - a withhold that would have applied is counted.
-    if (gameMenu && (holsterSuppressL1 || twoHandSuppressL1 || lootSuppressL1 || pgSuppressL1 || reloadSuppressL1)) { ++g_mp.supL1; }
-    if (gameMenu && (holsterSuppressR1 || lootSuppressR1 || camoSuppressR1 || pgSuppressR1)) { ++g_mp.supR1; }
+    if (gameMenu && (holsterSuppressL1 || twoHandSuppressL1 || lootSuppressL1 || pgSuppressL1 || reloadSuppressL1 || lidSuppressL1)) {
+        ++g_mp.supL1;
+    }
+    if (gameMenu && (holsterSuppressR1 || lootSuppressR1 || camoSuppressR1 || pgSuppressR1 || lidSuppressR1)) { ++g_mp.supR1; }
     if (g_vrGrip) {
         constexpr float kGripThreshold = 0.5f;
         auto* buttons = reinterpret_cast<uint32_t*>(p);
@@ -12859,12 +13100,13 @@ extern "C" __declspec(dllexport) void dlvr_FilterScePad(void* pData)
         // (+ ReloadWithholdsL1: Jay after RUN XB1 - no L1 from the left grip while a manual crossbow is not loaded. One call.)
         if (dlvr::GetControllerSqueeze(dlvr::kLeftHand, squeezeL) && squeezeL >= kGripThreshold &&
             (gameMenu || (!holsterSuppressL1 && !twoHandSuppressL1 && !lootSuppressL1 && !pgSuppressL1 && !reloadSuppressL1 &&
-                          !dlvr::ReloadWithholdsL1()))) {
+                          !lidSuppressL1 && !dlvr::ReloadWithholdsL1()))) {
             *buttons |= 0x400u;  // L1
             anyGripPressed = true;
         }
         if (dlvr::GetControllerSqueeze(dlvr::kRightHand, squeezeR) &&
-            squeezeR >= kGripThreshold && (gameMenu || (!holsterSuppressR1 && !lootSuppressR1 && !camoSuppressR1 && !pgSuppressR1))) {
+            squeezeR >= kGripThreshold &&
+            (gameMenu || (!holsterSuppressR1 && !lootSuppressR1 && !camoSuppressR1 && !pgSuppressR1 && !lidSuppressR1))) {
             *buttons |= 0x800u;  // R1
             anyGripPressed = true;
         }

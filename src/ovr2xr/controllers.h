@@ -168,6 +168,11 @@ extern float FingerTrackFistAt;  // finger_track_fist_at
 // VALVE INDEX (2026-10-14): the left trackpad press (trackpad/force through the 0.5 on / 0.3 off hysteresis).
 bool GetControllerMenuButton(bool& outPressed);
 
+// True while the LEFT hand's active interaction profile is valve/index_controller (LogActiveInteractionProfiles, frame thread; a
+// bool, read on the pad-poll thread at most one frame stale). The SteamVR X + Y chord (menuchord_logic.h) skips Index, whose menu
+// is the left trackpad press. 2026-11-18.
+bool ControllerLeftIsIndexProfile();
+
 // Face buttons - not symmetric across hands like the stick/trigger above, so
 // a single enum rather than a Hand parameter: A/B are the right Touch
 // controller's pair, X/Y the left's, matching Touch's real physical layout.
