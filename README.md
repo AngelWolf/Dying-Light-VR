@@ -108,6 +108,7 @@ Quest / Touch layout, default buttons. Valve Index: X = left A, Y = left B, Menu
 | X | Interact / pick up. Hold: Survivor Sense |
 | Y | Hold: repair weapon |
 | Menu | Inventory / map. Hold: pause |
+| X+Y (STEAMVR ONLY) | Inventory / map. Hold: pause |
 
 ### Right controller
 
