@@ -100,7 +100,26 @@ struct Sample {
     bool   poseOk;     // head AND right grip both valid
     bool   inHolster;  // the hand is inside the right-shoulder holster zone
     Vec3   back{ 0.0f, 0.0f, 0.0f };   // unit "toward the body" in APP space (BackInApp); zero = unknown - never refuses
+    // Fix 5 (HANDOFF-MELEE-FIXES-2026-11-19, Jay "Go ahead"): the right grip, for the shoulder-zone exit rule. Default
+    // false = unknown, which keeps the old rule (Idle on exit).
+    bool   gripKnown = false;   // GetControllerSqueeze(right) returned a finite value this sample
+    bool   gripDown = false;    // gripKnown only: squeeze >= holster::kGripThreshold (the holster's own press threshold)
 };
+
+// Fix 5: what the first pose-valid sample OUTSIDE the shoulder zone did after a zone visit (Step::zoneExit).
+// Armed = no grip press inside the zone - a stroke out of it can fire; IdlePressed = a grip press inside (a draw / stow) -
+// the old rule, must slow below armSpeed first; IdleUnknown = the grip state was unknown on an in-zone sample - the old rule.
+enum class ZoneExit { None, Armed, IdlePressed, IdleUnknown };
+
+inline const char* ZoneExitName(ZoneExit z)
+{
+    switch (z) {
+    case ZoneExit::Armed:       return "ARMED (no grip press inside the zone - a stroke out of it can fire)";
+    case ZoneExit::IdlePressed: return "IDLE (grip pressed inside the zone - must slow below arm speed first)";
+    case ZoneExit::IdleUnknown: return "IDLE (grip state unknown inside the zone - must slow below arm speed first)";
+    default:                    return "none";
+    }
+}
 
 // Candidate (B1 rebound suppression, Stage 1 run 1: 11 FIRE for 5 slashes): Armed + speed >= fireSpeed no longer
 // FIREs. It starts a candidate whose PATH LENGTH is accumulated; it FIREs (-> Active) once the path reaches minTravelM,
@@ -156,6 +175,7 @@ struct Step {
     bool  repeat = false;          // bit-identical to the previous sample - dropped
     bool  nonFinite = false;       // refused as a pose loss
     bool  holsterRefused = false;  // refused: hand in the holster zone
+    ZoneExit zoneExit = ZoneExit::None;   // fix 5: this sample ended a shoulder-zone visit - which state it left in
     bool  candStarted = false;     // this sample started a CANDIDATE (Armed + speed >= fireSpeed)
     bool  dropped = false;         // a CANDIDATE was dropped this sample - no FIRE, no END
     Drop  dropWhy = Drop::None;    // dropped only: why
@@ -200,6 +220,12 @@ public:
         const bool finite = Finite(s.p) && std::isfinite(s.tMs);
         if (!finite) { st.nonFinite = true; }
 
+        // Fix 5: a grip PRESS = down now while the previous sample's grip was not known-down (a held grip entering the zone is
+        // not a press - the holster treats it the same way). Bookkept on every sample, pose or not.
+        const bool gripPress = s.gripKnown && s.gripDown && !(gripPrevKnown_ && gripPrevDown_);
+        gripPrevKnown_ = s.gripKnown;
+        gripPrevDown_ = s.gripKnown && s.gripDown;
+
         // A missing or garbage pose ends a swing and wipes the history: a velocity across a gap is not a velocity.
         // A pending candidate is DROPPED (no FIRE, no END - nothing fired), exactly like the Idle/Armed case.
         if (!s.poseOk || !finite) {
@@ -207,11 +233,20 @@ public:
             else if (state_ == State::Candidate) { st = DropCandidate(st, State::Idle, Drop::PoseLost, s.tMs); }
             else { state_ = State::Idle; }
             Clear();
+            zoneVisit_ = false;   // fix 5: tracking resumed after a gap is Idle (spec §2.1), wherever the hand was
             st.state = state_;
             return st;
         }
         // The holster reach is never a swing (spec §2.1, REF §3.4c).
         if (s.inHolster) {
+            // Fix 5: remember whether this visit saw a grip press or an unknown grip - either keeps the old Idle on exit.
+            if (!zoneVisit_) {
+                zoneVisit_ = true;
+                zoneUsed_ = false;
+                zoneUnknown_ = false;
+            }
+            if (!s.gripKnown) { zoneUnknown_ = true; }
+            if (gripPress) { zoneUsed_ = true; }
             st.holsterRefused = true;
             if (state_ == State::Active) { st = EndSwing(st, End::Holster, s.tMs, State::Idle); }
             else if (state_ == State::Candidate) { st = DropCandidate(st, State::Idle, Drop::Holster, s.tMs); }
@@ -219,6 +254,18 @@ public:
             Clear();
             st.state = state_;
             return st;
+        }
+        // Fix 5 (HANDOFF-MELEE-FIXES-2026-11-19 #5, Jay "Go ahead"): the first pose-valid sample out of the zone. A visit with no
+        // grip press and a known grip throughout leaves ARMED, so a stroke that leaves the zone already faster than armSpeed (a
+        // wind-up over the shoulder into a chop) can fire; before, it stayed Idle until the hand slowed below armSpeed. The ring
+        // is empty (Clear() above), so this sample still has no speed verdict - Armed -> Candidate waits for a full window.
+        if (zoneVisit_) {
+            zoneVisit_ = false;
+            if (state_ == State::Idle) {
+                if (zoneUsed_) { st.zoneExit = ZoneExit::IdlePressed; }
+                else if (zoneUnknown_) { st.zoneExit = ZoneExit::IdleUnknown; }
+                else { st.zoneExit = ZoneExit::Armed; state_ = State::Armed; }
+            }
         }
         // A bit-identical pose is a repeat, not a sample (REF §3.3: per-frame speed alternates spike/zero).
         if (havePrev_ && s.p.x == prevP_.x && s.p.y == prevP_.y && s.p.z == prevP_.z) {
@@ -489,6 +536,12 @@ private:
     float path_ = 0.0f;          // path length since candStart_, non-repeat samples only (Candidate + Active)
     State state_ = State::Idle;
     bool  blocked_ = false;
+    // Fix 5: the shoulder-zone visit and the grip's previous state (Update only).
+    bool  zoneVisit_ = false;      // inside a zone visit (since its first refused sample)
+    bool  zoneUsed_ = false;       // that visit saw a grip press
+    bool  zoneUnknown_ = false;    // that visit saw an in-zone sample with the grip state unknown
+    bool  gripPrevKnown_ = false;  // the previous sample's grip was known
+    bool  gripPrevDown_ = false;   // ... and down
     double tFire_ = 0.0;
     Vec3  vFire_{ 0.0f, 0.0f, 0.0f };
     float peak_ = 0.0f;

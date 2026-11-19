@@ -173,6 +173,56 @@ inline void ReportedHeadPosForFold(float foldedDeg, float& x, float& z)
     z = nz;
 }
 
+// ===== HAND-TWIST VIEW HOLD - docs/superpowers/specs/2026-11-19-hand-twist-view-hold-design.md §4 / §8b, INV-748 =====
+// The camera base (PlayerFppVis+4112) is the eye point in BODY-LOCAL coordinates (INV-747). Torso from controllers turns the body
+// by the hand twist G on top of the look; the head term is cancelled by the fold above, but two levers still turn with the body:
+//   a = HSPINE1's body-local position minus the head term (L + R - S, INV-306) - unpitched;
+//   v = the eye lever below HSPINE1 plus the face offset (eye - HSPINE1 + d1) - pitched in place by C06C60 (INV-310), P (body-local).
+// c = (Y(G) - I) a + (P Y(G) P^T - I) v puts both where a body WITHOUT the twist would have them. Y(G) is EXACTLY the rotation
+// ReportedHeadPosForFold applies (the verified S-61 sign, same units: G = Wrap180(after - look), the term PublishFolded adds), on
+// body-local x/z about local +Y (the root's own up, INV-262 / R3). G == 0 -> c == 0 exactly. Row-major 3x3, m[3*r + c].
+inline void FoldYawMat(float gDeg, float m[9])
+{
+    const float t = gDeg * 0.01745329252f;
+    const float c = std::cos(t), s = std::sin(t);
+    m[0] = c;    m[1] = 0.0f; m[2] = s;      // x' = x c + z s   (ReportedHeadPosForFold)
+    m[3] = 0.0f; m[4] = 1.0f; m[5] = 0.0f;
+    m[6] = -s;   m[7] = 0.0f; m[8] = c;      // z' = -x s + z c
+}
+
+inline void Mat3MulVecHt(const float m[9], const float v[3], float o[3])
+{
+    o[0] = m[0] * v[0] + m[1] * v[1] + m[2] * v[2];
+    o[1] = m[3] * v[0] + m[4] * v[1] + m[5] * v[2];
+    o[2] = m[6] * v[0] + m[7] * v[1] + m[8] * v[2];
+}
+
+// P = I (or nullptr) when C06C60 did not pitch the basis the eye was read from.
+inline void HandTwistViewCorrection(float gDeg, const float a[3], const float v[3], const float* P, float c[3])
+{
+    if (gDeg == 0.0f) { c[0] = c[1] = c[2] = 0.0f; return; }
+    float Y[9];
+    FoldYawMat(gDeg, Y);
+    float ya[3];
+    Mat3MulVecHt(Y, a, ya);
+    float yv[3];
+    if (P) {
+        // P Y P^T v
+        float pt[3];
+        pt[0] = P[0] * v[0] + P[3] * v[1] + P[6] * v[2];
+        pt[1] = P[1] * v[0] + P[4] * v[1] + P[7] * v[2];
+        pt[2] = P[2] * v[0] + P[5] * v[1] + P[8] * v[2];
+        float ypt[3];
+        Mat3MulVecHt(Y, pt, ypt);
+        Mat3MulVecHt(P, ypt, yv);
+    } else {
+        Mat3MulVecHt(Y, v, yv);
+    }
+    c[0] = (ya[0] - a[0]) + (yv[0] - v[0]);
+    c[1] = (ya[1] - a[1]) + (yv[1] - v[1]);
+    c[2] = (ya[2] - a[2]) + (yv[2] - v[2]);
+}
+
 // The delta is ALWAYS applied (2026-10-25, Jay: "Go with B"). The verdict is LOG ONLY: a REFUSED used to drop the delta to 0 for the
 // player object, which pinned the elbow axis to the playspace start - both elbows went up once the player faced ~100+ deg away
 // (rig item 3). In 957 of 1,302 refused windows (fold >= 60) the root followed the body, i.e. the delta was right; 5 followed the
@@ -307,6 +357,53 @@ inline TorsoOut TorsoGapStep(TorsoState& s, unsigned long long obj, const TorsoI
     o.rawGapXrDeg = w > 0.0f ? Wrap180(measured - h) : gap;
     o.weight = w;
     o.held = w <= 0.0f;
+    return o;
+}
+
+// ===== NECK HOLD (trace 20261119_1430, Jay 2026-11-19: "hold the root while headturning till it hits the range the body is meant to
+// turn"; range 40 deg + re-centre while walking: "Yes.") - replaces the hand twist (removed, trace 20261119_1400). The body's HEADING
+// (OpenXR yaw, h's convention, no flip) holds while the head turns; the gap (body - head) is clamped to +-kNeckRangeDeg, the head pulling
+// the body round past it; while walking the body eases back under the head; a stick turn never changes h, so the body turns with the
+// stick at once (the gap is kept). Reuses the hand twist's limit and jump test.
+constexpr float kNeckRangeDeg      = kTorsoMaxGapDeg;   // 40: under the sprint stick angle (INV-653)
+constexpr float kNeckRecentreTauS  = 0.30f;             // walking: the body back under the head (my call, a constant)
+
+struct NeckHoldState {
+    float              yaw  = 0.0f;   // the body's heading, degrees (OpenXR, LOCAL)
+    float              lastH = 0.0f;  // the head yaw at the previous step
+    bool               have = false;
+    unsigned long long obj  = 0;
+};
+
+struct NeckOut {
+    float gapXrDeg = 0.0f;   // where the body faces relative to the head, + = left (OpenXR yaw)
+    bool  clamped  = false;  // at the range this step (the head pulled the body)
+    bool  recentring = false;
+    bool  reset    = false;  // a new object / a head-yaw jump put the body under the head
+};
+
+inline NeckOut NeckHoldStep(NeckHoldState& s, unsigned long long obj, float headYawXrDeg, bool walking, float dt)
+{
+    NeckOut o;
+    const float h = std::isfinite(headYawXrDeg) ? headYawXrDeg : s.lastH;
+    if (obj != s.obj || !s.have || std::fabs(Wrap180(h - s.lastH)) > kTorsoJumpDeg) {   // new player / recentre / snap
+        s.obj = obj;
+        s.yaw = h;
+        s.have = true;
+        o.reset = true;
+    } else if (walking) {
+        const float d = (std::isfinite(dt) && dt > 0.0f) ? dt : 0.0f;
+        s.yaw = Wrap180(s.yaw + (1.0f - std::exp(-d / kNeckRecentreTauS)) * Wrap180(h - s.yaw));
+        o.recentring = true;
+    }
+    s.lastH = h;
+    float gap = Wrap180(s.yaw - h);
+    if (gap > kNeckRangeDeg || gap < -kNeckRangeDeg) {   // the head pulls the body round, and it stays where it was pulled
+        gap = gap > 0.0f ? kNeckRangeDeg : -kNeckRangeDeg;
+        s.yaw = Wrap180(h + gap);
+        o.clamped = true;
+    }
+    o.gapXrDeg = gap;
     return o;
 }
 

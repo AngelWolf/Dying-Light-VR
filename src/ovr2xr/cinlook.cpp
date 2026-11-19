@@ -124,6 +124,150 @@ float* __fastcall LookHook(void* self, float* out)
     return r;
 }
 
+// ===== [DEATHLOOK] - the same runaway during a DEATH (2026-11-19 (41), Jay: "CAMERA SPINNING ON DEATH" - "It spins left/right around
+// me"; trace docs/traces/20261119_2115_deathlook.md). Static, OUR gamedll 97046bba (ida/dth1_out.txt, dth2_out.txt; Mac names dth3_mac):
+// a death runs DeadController::Start -> ReactionController::StartDeathReaction (Mac). ReactionController's GetILookController (OURS
+// +D73610) returns its look interface (this+48) ONLY while its reaction type +304 is 10..19 = EReactionType::IsDeath (Mac +591A90; 10
+// DeathDefault .. 19 DeathFromLethalObject); DeadController has none (+84830 = 0). That interface's slot 0 (OURS +D735E0, vtable
+// +1730618, COL offset 48) returns PlayerDI +4460 with pitch 0, unconditionally; its rate slots return -1 (no limit) - CinematicController's
+// shape before cinlook. The look integrator +BA1350 (the only caller of the selected controller's slot 0, ida/dth5_out.txt:204) puts +4468
+// on it and D2 adds the head yaw again: one addend per update = the view spinning left / right. Same removal as LookHook.
+constexpr uint32_t kDlColOffset = 48;   // ReactionController's look interface sub-object (dth1: vt +1730618, COL offset 48)
+// OURS +D735E0 == EGL +D72A80 (scratchpad sigfind.py, 1 hit in each): push rbx; sub rsp,20h; mov rax,[rcx-30h]; add rcx,-30h;
+// mov rbx,rdx; call [rax+20h]; mov dword [rbx+4],0; mov eax,[rax+116Ch] (+4460); mov [rbx],eax
+constexpr unsigned char kDlSig[34] = { 0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0x41, 0xd0, 0x48, 0x83, 0xc1, 0xd0, 0x48, 0x8b,
+                                       0xda, 0xff, 0x50, 0x20, 0xc7, 0x43, 0x04, 0x00, 0x00, 0x00, 0x00, 0x8b, 0x80, 0x6c, 0x11, 0x00,
+                                       0x00, 0x89 };
+
+LookFn             g_dlOrig = nullptr;
+bool               g_dlDone = false;
+int                g_dlTries = 0;
+// Game thread (the player update) writes; camhook's 1 Hz thread prints and resets once no call has come for 1.5 s (a death is over by
+// then - a reset racing a new death's first call can at worst merge or drop one line's counts; log only).
+volatile long      g_dlCalls = 0, g_dlRemoved = 0, g_dlChaseSkips = 0, g_dlOtherObj = 0, g_dlNotLook = 0, g_dlFaults = 0, g_dlDeaths = 0;
+float              g_dlMinRem = 0.0f, g_dlMaxRem = 0.0f;
+volatile ULONGLONG g_dlLastMs = 0;
+
+float* __fastcall DeathLookHook(void* self, float* out)
+{
+    float* r = g_dlOrig(self, out);   // the reaction's own wanted look - outside any __try
+    const ULONGLONG now = GetTickCount64();
+    if (g_dlLastMs == 0 || now - g_dlLastMs > 1000) {
+        ++g_dlDeaths;
+        // [PROBE: DEATHLOOK] gate=none (always on)  site=HEADSET  log-only=no
+        LOG("cinlook: [DEATHLOOK] death #%ld first wanted-look call (ReactionController owns the look)", g_dlDeaths);
+    }
+    g_dlLastMs = now;
+    ++g_dlCalls;
+    if (!r) { return r; }
+    uintptr_t owner = 0;
+    float look = 0.0f;
+    bool ok = false;
+    __try {
+        const uintptr_t ctrl = reinterpret_cast<uintptr_t>(self) - kDlColOffset;   // as +D735E0 itself: [rcx-30h], vfunc +20h
+        const uintptr_t vt = *reinterpret_cast<const uintptr_t*>(ctrl);
+        const OwnerFn f = *reinterpret_cast<const OwnerFn*>(vt + 32);
+        owner = f(ctrl);
+        if (owner) {
+            look = *reinterpret_cast<const float*>(owner + kLook);
+            ok = true;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        ok = false;
+    }
+    if (!ok) {
+        ++g_dlFaults;
+        return r;
+    }
+    float added = 0.0f;
+    uintptr_t addedObj = 0;
+    bool inChase = false;
+    CamYawAddendNow(&added, &addedObj, &inChase);
+    if (memcmp(&r[0], &look, sizeof(float)) != 0) {   // not +4460 itself - left exactly as the game returned it
+        ++g_dlNotLook;
+        return r;
+    }
+    const float before = r[0];
+    r[0] = cinyaw::RemoveAddend(r[0], look, added, addedObj == owner, inChase);
+    if (r[0] != before) {
+        const float d = before - r[0];
+        if (g_dlRemoved == 0 || d < g_dlMinRem) { g_dlMinRem = d; }
+        if (g_dlRemoved == 0 || d > g_dlMaxRem) { g_dlMaxRem = d; }
+        ++g_dlRemoved;
+    } else if (inChase) {
+        ++g_dlChaseSkips;
+    } else if (addedObj != owner) {
+        ++g_dlOtherObj;
+    }
+    return r;
+}
+
+void DeathLookInstall()
+{
+    if (g_dlDone) { return; }
+    const uintptr_t gd = reinterpret_cast<uintptr_t>(GetModuleHandleA("gamedll_x64_rwdi.dll"));
+    if (!gd) { return; }   // not mapped yet - the 1 Hz caller retries
+    ++g_dlTries;
+    int stage = 0;
+    const uintptr_t vt = RttiFindVtable(gd, ".?AVReactionController@@", kDlColOffset, &stage);
+    if (!vt) {
+        g_dlDone = g_dlTries >= kMaxTries;
+        static const char* const kStage[] = { "the class name .?AVReactionController@@ is not in the module",
+                                              "no object locator names it with offset 48 (the look interface)",
+                                              "no vtable points at that locator" };
+        // [PROBE: DEATHLOOK] gate=none (always on)  site=FLAT  log-only=yes
+        LOG("cinlook: [DEATHLOOK] REFUSED (try %d) - %s. Nothing written; a death's look keeps feeding the head yaw back (the view "
+            "spins).%s", g_dlTries, stage < 0 ? "the RTTI scan faulted" : kStage[stage > 2 ? 2 : stage], g_dlDone ? "" : " Retried next second.");
+        return;
+    }
+    const uintptr_t slot = vt + 8 * kSlot;
+    const uintptr_t have = ReadP(slot);
+    if (have == reinterpret_cast<uintptr_t>(&DeathLookHook)) { g_dlDone = true; return; }
+    bool sigOk = false;
+    __try { sigOk = have && memcmp(reinterpret_cast<const void*>(have), kDlSig, sizeof(kDlSig)) == 0; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    if (!sigOk) {
+        g_dlDone = true;
+        // [PROBE: DEATHLOOK] gate=none (always on)  site=FLAT  log-only=yes
+        LOG("cinlook: [DEATHLOOK] REFUSED - ReactionController look slot 0 gamedll+0x%zX holds gamedll+0x%zX, whose first 34 bytes are "
+            "not the wanted-look function both known builds share (OURS +D735E0, EGL +D72A80). Nothing written.",
+            static_cast<size_t>(slot - gd), static_cast<size_t>(have - gd));
+        return;
+    }
+    g_dlOrig = reinterpret_cast<LookFn>(have);
+    DWORD old = 0;
+    // [LOADBEARING: deathlook vtable slot] ReactionController look interface (RTTI COL offset 48) slot 0 -> DeathLookHook. OURS vtable
+    // +1730618 slot 0 +D735E0, EGL +D72A80. Without it a death integrates design D's head yaw into the look every update - the view spins.
+    if (!VirtualProtect(reinterpret_cast<void*>(slot), sizeof(void*), PAGE_READWRITE, &old)) {
+        g_dlDone = true;
+        // [PROBE: DEATHLOOK] gate=none (always on)  site=FLAT  log-only=yes
+        LOG("cinlook: [DEATHLOOK] REFUSED - VirtualProtect on the slot failed (error %lu). Nothing written.", GetLastError());
+        return;
+    }
+    InterlockedExchangePointer(reinterpret_cast<PVOID volatile*>(slot), reinterpret_cast<PVOID>(&DeathLookHook));
+    DWORD unused = 0;
+    VirtualProtect(reinterpret_cast<void*>(slot), sizeof(void*), old, &unused);
+    g_dlDone = true;
+    const bool ok = ReadP(slot) == reinterpret_cast<uintptr_t>(&DeathLookHook);
+    // [PROBE: DEATHLOOK] gate=none (always on)  site=FLAT  log-only=yes
+    LOG("cinlook: [DEATHLOOK] ARMED (logged unconditionally) - ReactionController look slot 0 gamedll+0x%zX swapped (vtable +0x%zX, was "
+        "gamedll+0x%zX, read back %s). A death's wanted look no longer hands design D's head yaw back to the look.",
+        static_cast<size_t>(slot - gd), static_cast<size_t>(vt - gd), static_cast<size_t>(have - gd), ok ? "OK" : "*** NOT OUR FUNCTION ***");
+}
+
+// camhook's 1 Hz thread: a death's totals once its calls have stopped for 1.5 s. COST: two loads and a compare a second.
+void DeathLookTick()
+{
+    if (g_dlCalls == 0) { return; }
+    const ULONGLONG last = g_dlLastMs;
+    if (GetTickCount64() - last <= 1500) { return; }
+    // [PROBE: DEATHLOOK] gate=none (always on)  site=HEADSET  log-only=yes
+    LOG("cinlook: [DEATHLOOK] death #%ld ended - wanted-look calls %ld, head yaw taken out %ld (min %+.2f max %+.2f deg), left alone: "
+        "not +4460 %ld, inside the engine's chase %ld, another object %ld, faults %ld", g_dlDeaths, g_dlCalls, g_dlRemoved, g_dlMinRem,
+        g_dlMaxRem, g_dlNotLook, g_dlChaseSkips, g_dlOtherObj, g_dlFaults);
+    g_dlCalls = g_dlRemoved = g_dlChaseSkips = g_dlOtherObj = g_dlNotLook = g_dlFaults = 0;
+    g_dlMinRem = g_dlMaxRem = 0.0f;
+}
+
 }  // namespace
 
 void CinLookReport()
@@ -140,6 +284,10 @@ bool CinLookArmed(uintptr_t* vtRva)
 
 void CinLookInstall()
 {
+    // [DEATHLOOK] (trace 20261119_2115_deathlook): ReactionController's death look - its own done flag, so it runs before the cutscene
+    // install's early return; then a finished death's totals. Both no-ops once armed / with no death.
+    DeathLookInstall();
+    DeathLookTick();
     if (g_done) { return; }
     const uintptr_t gd = reinterpret_cast<uintptr_t>(GetModuleHandleA("gamedll_x64_rwdi.dll"));
     if (!gd) { return; }   // not mapped yet - the 1 Hz caller retries

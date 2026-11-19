@@ -24,6 +24,7 @@
 #endif
 #include "bodygrab.h"   // BodyGrab / BodyGrabReachM / BodyGrabHitboxMarginM - the hip yield's log line
 #include "looting.h"    // LootYieldAt / LootByHand / LootReachM - the hip yield (spec 2026-10-26 §2.4)
+#include "lidhand.h"    // LidHandHandInZone - the hips yield to a lid / chest item first (trace 20261119_1240)
 
 #include <windows.h>
 
@@ -151,6 +152,7 @@ struct HipYield {
     bool   asked = false;   // LootYieldAt answered for the current press and its line is not written yet
     float  dist = -1.0f;
     bool   limb = false;
+    bool   lid = false;     // yielded to a lid / chest item under the hand (trace 20261119_1215)
     double waitS = -1.0;
 };
 HipYield g_rhipYield;
@@ -167,7 +169,17 @@ void HipYieldAsk(HipYield& y, int hand, const holster::Machine& m, holster::Inpu
     y.prevDown = down;
     if (edge) { y.asked = false; }
     if (!edge && m.state() != holster::Press::Pending) { return; }
-    in.yield = LootYieldAt(hand, edge, &y.dist, &y.limb, &y.waitS);
+    // The lid first (trace 20261119_1240): a hand in a lid's edge zone / an item's zone, or holding one, wins on BOTH hips - asked of
+    // lidhand directly, not through loot by hand (lids stand on their own). hand 0 = LEFT here, lidhand side 1 = left.
+    y.lid = LidHandHandInZone(hand == 0 ? 1 : 0);
+    if (y.lid) {
+        y.dist = 0.0f;
+        y.limb = false;
+        y.waitS = -1.0;
+        in.yield = holster::Yield::Yes;
+    } else {
+        in.yield = LootYieldAt(hand, edge, &y.dist, &y.limb, &y.waitS);
+    }
     y.asked = true;
 }
 
@@ -185,8 +197,10 @@ void HipYieldLog(HipYield& y, const char* side, const holster::Step& s)
     const float reach = (BodyGrab && BodyGrabReachM > LootReachM) ? BodyGrabReachM : LootReachM;
     // [PROBE: HIPYIELD] gate=holster_rhip_enable,holster_hip_enable  site=HEADSET  log-only=yes
     LOG("holster: [HIPYIELD] %s hip press: %s at %.3f m (reach %.3f, limb margin %.3f%s) -> %s after %.0f ms%s%s", side,
-        s.yielded ? (y.limb ? "severed limb" : "corpse") : "nothing", y.dist, reach, BodyGrabHitboxMarginM,
-        BodyGrab ? "" : ", body_grab off", s.yielded ? "yielded to the body" : (LootByHand ? "holster fires" : "loot_by_hand off"),
+        s.yielded ? (y.lid ? "lid / chest item" : y.limb ? "severed limb" : "corpse") : "nothing", y.dist, reach, BodyGrabHitboxMarginM,
+        BodyGrab ? "" : ", body_grab off",
+        s.yielded ? (y.lid ? "yielded to the lid / item (hand-open lids)" : "yielded to the body")
+                  : (LootByHand ? "holster fires" : "loot_by_hand off"),
         y.waitS < 0.0 ? -1.0 : y.waitS * 1000.0, k == 1 ? " | first line, logged unconditionally" : "",
         k == kMaxHipYieldLines ? " | LAST HIPYIELD line this session" : "");
 }

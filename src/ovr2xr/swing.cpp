@@ -22,6 +22,7 @@
 #include <windows.h>
 
 #include <cmath>
+#include <cstdarg>   // AiAppend ([SWINGAI] v2 rows)
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -32,6 +33,10 @@
 
 #define LOG(...) ::dlvr::LogTo("dlvr_ovr2xr.log", __VA_ARGS__)
 #include "periodic_log.h"   // LOG_PERIODIC - diag_periodic_logs
+#if defined(DLVR_SWING_PROBE)   // the probe variant: swing.cpp's own periodic lines ([SWING STATS]) always print (trace 20261119_1730)
+#undef LOG_PERIODIC
+#define LOG_PERIODIC(...) LOG(__VA_ARGS__)
+#endif
 
 namespace dlvr {
 
@@ -134,7 +139,7 @@ bool AnimSuppressMeleeIdle = true;   // DEFAULT ON 2026-10-01 (Jay: Tier A ships
 //      list beside B1's real one, and the swing is classified BOTH / GAME ONLY / BLADE ONLY / NEITHER / SPLIT. Read-only for
 //      the game (INV-623..627; the search writes only its own arguments, ida/hb10). Needs melee_swing_mode=2.
 //      tree=PROBE-ONLY. Log-only. DEFAULT OFF. HEADSET.
-#if !defined(DLVR_BETA_LEAN)   // BETA lean: constexpr false in swing.h (docs/BETA_CENSUS.md)
+#if !defined(DLVR_BETA_LEAN) || defined(DLVR_SWING_PROBE)   // BETA lean: constexpr false in swing.h; back in the probe variant
 bool DiagSwingShadow = false;
 #endif
 
@@ -240,7 +245,11 @@ long g_candDropped = 0;           // candidates dropped (no FIRE, no END): slowe
                                   // relatch (SwingUpdateThunk) - printed next to fires/ends
 long g_backfillTrunc = 0;         // B1Build backfills whose candidate start was older than the whole ring (capped)
 long g_dropLinesSuppressed = 0;   // fix round 1: dropped candidates NOT logged because g_dropBudget ran out (window)
+#if defined(DLVR_SWING_PROBE)     // the probe variant: uncapped (trace 20261119_1730, Jay: "nothing log wise is capped")
+long g_dropBudget = 0x7FFFFFFF;
+#else
 long g_dropBudget = 120;          // fix round 1: [SWING] candidate dropped lines left this SESSION
+#endif
 long g_totFires = 0, g_totFaults = 0, g_detailBudget = 600;
 bool g_disabled = false;          // a fault disables the WHOLE driver for the session - fail CLOSED (M3)
 ULONGLONG g_statsStart = 0;
@@ -301,11 +310,19 @@ volatile LONG g_seenThreadsCount       = 0;
 constexpr int kSelfLocal = 0, kSelfRemote = 1, kSelfUnjudged = 2;
 volatile LONG g_localMatched     = 0;   // 1 once any controller's player equalled the local player object
 volatile LONG g_remoteSelfCalls  = 0;   // slot-16 calls from REMOTE controllers, this STATS window - Interlocked only
+#if defined(DLVR_SWING_PROBE)   // the probe variant: classification lines never stop (trace 20261119_1730)
+constexpr int kNoteSlots = 64;
+#else
 constexpr int kNoteSlots = 8;
+#endif
 void* volatile g_noteSelf[kNoteSlots] = {};
 volatile LONG  g_noteCls[kNoteSlots]  = {};
 volatile LONG  g_noteLines = 0;         // classification lines this session, capped at kNoteCap
+#if defined(DLVR_SWING_PROBE)   // the probe variant: uncapped (trace 20261119_1730)
+constexpr LONG kNoteCap = 0x7FFFFFFF;
+#else
 constexpr LONG kNoteCap = 48;
+#endif
 
 uintptr_t GuardedReadPtr(uintptr_t a)
 {
@@ -523,7 +540,11 @@ double      g_lastT = 0.0;                      // time of g_lastP (the detector
 // printed at its FIRE or drop: a jump is ONE segment carrying most of the path, and may be a not-TRACKED sample.
 // Game thread only. Per sample: one Len and one 32-bit flags read while a candidate is open, nothing otherwise.
 struct PathSeg { float lenM; float dtMs; long flags; };
+#if defined(DLVR_SWING_PROBE)   // the probe variant: every segment kept (trace 20261119_1730)
+constexpr int kPathSegMax = 512;
+#else
 constexpr int kPathSegMax = 24;
+#endif
 PathSeg g_pathSeg[kPathSegMax] = {};
 int     g_pathSegN = 0;        // stored (<= kPathSegMax)
 int     g_pathSegTotal = 0;    // all segments of this candidate, stored or not
@@ -701,7 +722,7 @@ SubStepResult B1SubStep(void* self, float* record, HitParams& hp, const bladelin
     return kSubStepOk;
 }
 
-#if !defined(DLVR_BETA_LEAN)   // BETA lean: compiled out (docs/BETA_CENSUS.md) - DEV only (Jay 2026-10-26)
+#if !defined(DLVR_BETA_LEAN) || defined(DLVR_SWING_PROBE)   // BETA lean: compiled out - DEV + the probe variant (trace 20261119_1730)
 // ===== diag_swing_shadow - THE SWING SHADOW PROBE (spec docs/superpowers/specs/2026-10-26-swing-shadow-probe-design.md) =====
 // Per DriverFrame (probe on): the drawn weapon's Holder / DTrailStart1 / DTrailEnd1 and the player's hand holder, into a ring
 // parallel to g_wr (same index, same clock). In B1Build, after the game's own g_search: the same span's quads built from
@@ -736,7 +757,7 @@ long g_shCls[7] = {};             // indexed by swingshadow::Cls
 ULONGLONG g_shLast5s = 0;         // the 5 s line's own stamp (INV-9 / INV-10)
 
 // Per swing (FIRE .. END).
-constexpr int kShKeys = 16;
+constexpr int kShKeys = 64;   // was 16 - raised so no set fills in the probe run (Jay 2026-11-19, trace 20261119_1730)
 swingshadow::Key g_shGame[kShKeys] = {}, g_shBlade[kShKeys] = {};
 int    g_shNGame = 0, g_shNBlade = 0;
 bool   g_shOpen = false;          // a swing is being shadowed (opened at FIRE with the probe on)
@@ -777,6 +798,599 @@ NearRec g_near[kShKeys] = {};
 int     g_nearN = 0;
 long    g_nearCalls = 0, g_nearOverflow = 0;
 long    g_missCls[4] = {};   // session: swings with HIT / INSIDE NOT HIT / NEAR MISS only / NOTHING NEAR
+
+// ===== [SWINGAI] - the game's OWN candidate list at every B1 search (trace docs/traces/20261119_1730_swing_probe.md; Jay 2026-11-19:
+// "Setup the probe then. We need everything from this run") =====
+// The miss probe above runs the game's search, so a zombie that never became a CANDIDATE reads NOTHING NEAR there. This reads the
+// list the gather (+C4B400) itself walks - the AI manager's (GameDI +1344 -> vfunc +1952 = level -> +2544 -> +424 / +432) - and
+// for every entry within kAiNearM of the player's head point (player vfunc +1840, ray 1's origin) runs the gather's OWN extents test
+// against THIS search's sphere (the game's sub_180C51830 centre / sub_180C51900 radius on the real HitParams) and records what the
+// gather and the per-candidate check read (HumanAI by slot 37 == +5E41C0, IsDead, active byte +3064, IsEnemy = player slot 42 +336,
+// player slot 270 +2160). At END: one line per swing + one per object. Log-only; game memory is never written. Steam rvas only.
+constexpr uintptr_t kAiGameDiRva = 0x1C16348, kAiCentroidRva = 0xC51830, kAiRadiusRva = 0xC51900, kAiBoxDistRva = 0x1C27B0;
+// v2 (RUN SP1 read; Jay: "WHEN I SAID WE NEED EVERYTHING, WHY WAS THAT NOT INCLUDED" -> "Do it."): for every HumanAI within kAiNearM,
+// the search's OWN per-candidate path replicated step by step (ida/sw2-sw5, C48E30 +C49378..+C49B84): the gate (candidate +0x888,
+// player +0x870, byte_181C12082), ray 1, the concept (*(obj+824)), the model (*(concept+72)), the 21 bones (GetMeshElemFromBoneID,
+// the skip masks read from *(obj+3312), GetElementExtentsLocal + GetElementWorldMatrix), every quad's two triangles against each
+// bone box (swingshadow::TriAabb, exact) + a sampled distance, and ray 2 to an overlapping bone's box centre (approximate).
+// Slot 37 (+5E41C0) is used for IDENTITY only - it returns +4793 first and is not an alive reading (D-378); it is never called.
+constexpr uintptr_t kAiIsDeadRva = 0x5E41C0;   // HumanAI vtable slot 37 - the HumanAI identity test only, never called
+constexpr uintptr_t kAiGateRva = 0x191820;     // HumanAI slot 273 (+0x888) - sub_180191820 (sw3: IsEnemy / +320 == 5 / +1744)
+constexpr uintptr_t kAiByte12082Rva = 0x1C12082, kAiBoneTabRva = 0x139EAA0;
+constexpr uintptr_t kAiConceptVtRva = 0x151D010, kAiGetterRva = 0x144470;   // (obj+816)'s vtable, its slot 1 = return this[1]
+constexpr int       kAiBones = 21;
+const unsigned char kAiBoneIds[kAiBones] = { 8, 5, 4, 3, 2, 1, 0, 18, 20, 22, 19, 21, 23, 10, 11, 12, 13, 14, 15, 16, 17 };
+constexpr float     kAiNearM = 3.0f;
+constexpr int       kAiMax = 64;   // objects tracked per swing; past it still counted ("past the cap") - no line cap per session
+using AiCentroidFn = float*(__fastcall*)(float* out, const void* hp);
+using AiRadiusFn   = float(__fastcall*)(const void* hp, const float* centre);   // __m128, the low lane = the radius
+using AiBoxDistFn  = float(__fastcall*)(const float* ext, const float* p);      // squared distance point -> local box
+using AiW2LFn      = float*(__fastcall*)(const void* co, float* out, const float* in);
+using AiExtFn      = const float*(__fastcall*)(const void* co);
+using AiXformFn    = const float*(__fastcall*)(const void* co);
+using AiElemFn     = int(__fastcall*)(const void* model, unsigned char bone);              // IModelObject::GetMeshElemFromBoneID
+using AiElemExtFn  = float*(__fastcall*)(const void* model, float* out, int elem);         // IModelObject::GetElementExtentsLocal
+using AiElemMtxFn  = const float*(__fastcall*)(const void* model, int elem);              // IModelObject::GetElementWorldMatrix
+using AiRayFn      = unsigned char(__fastcall*)(void* self, unsigned char kind, void* coll, const float* from, float* to,
+                                                unsigned short flags, void* ignore, unsigned a8, unsigned a9, int a10);
+const char* const kAiRayName = "?Raytrace@IGSObject@@QEAAEEPEAUSCollision@@AEBVvec3@@AEAV3@GPEAVIControlObject@@IIH@Z";
+struct AiRec {
+    void*  obj; float dist; bool human, dead, active, enemy; uintptr_t vt;
+    int    inCalls;    // B1 searches in which the gather's extents test passed for it
+    float  minD2R2;    // smallest (box distance^2 / radius^2) over the searches (< 1 = inside the sphere)
+    // v2, per swing (counts are B1 searches):
+    int    gateFail, ray1Block, ray1Clear, ray1Target, ray1Water, noConcept, noModel, masksUnread, ovSearches, ovRay1Pass,
+           ovNotHitByGame, gameHitSearches, ray2Block, faults;
+    int    bonesNoElem, bonesSkipped;   // summed over searches
+    float  bestD;                       // least triangle-box distance over every bone, quad and search (0 = overlap)
+    int    bestBone, bestSearch;
+    float  pos[3];                      // root position at the closest search
+    unsigned rawTeam, rawState; unsigned char raw2352, raw4793;
+    char   ray1Who[48];
+};
+AiRec        g_ai[kAiMax] = {};
+int          g_aiN = 0, g_aiOver = 0;
+long         g_aiCalls = 0, g_aiListMax = 0, g_aiNearMax = 0, g_aiSwings = 0;
+long         g_aiChkAgree = 0, g_aiChkMiss = 0, g_aiSesAgree = 0, g_aiSesMiss = 0;   // known-case check: game hits the replica overlaps
+double       g_aiUsMax = 0.0;   // this swing's slowest SwingAiSearch, microseconds
+AiElemFn     g_aiElem = nullptr;
+AiElemExtFn  g_aiElemExt = nullptr;
+AiElemMtxFn  g_aiElemMtx = nullptr;
+AiRayFn      g_aiRay = nullptr;
+int          g_aiReady = 0;          // 0 untried, 1 ready, -1 refused (named once)
+const char*  g_aiWhy = "not tried";
+int          g_aiSlot270 = -1;       // player slot 270 at the last search (-1 = unread)
+float        g_aiSphere[4] = { 0, 0, 0, -1 };   // the last search's centre + radius
+AiCentroidFn g_aiCentroid = nullptr;
+AiRadiusFn   g_aiRadius = nullptr;
+AiBoxDistFn  g_aiBoxDist = nullptr;
+AiW2LFn      g_aiW2L = nullptr;
+AiExtFn      g_aiExt = nullptr;
+AiXformFn    g_aiXform = nullptr;
+
+bool AiHeadOk(uintptr_t at, const unsigned char* want, int n)
+{
+    __try {
+        for (int i = 0; i < n; ++i) { if (reinterpret_cast<const unsigned char*>(at)[i] != want[i]) { return false; } }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// Once: the three gamedll helpers by their first bytes (set-aside gamedll 97046bba), the three engine exports by name.
+bool AiResolve()
+{
+    if (g_aiReady != 0) { return g_aiReady == 1; }
+    const HMODULE en = GetModuleHandleA("engine_x64_rwdi.dll");
+    if (!en || !g_gd) { return false; }   // retried next search
+    static const unsigned char hC[7] = { 0x44, 0x8B, 0x4A, 0x08, 0x4C, 0x8B, 0xC1 };
+    static const unsigned char hR[8] = { 0x48, 0x8B, 0xC4, 0x48, 0x81, 0xEC, 0xA8, 0x00 };
+    static const unsigned char hB[8] = { 0xF3, 0x0F, 0x10, 0x0A, 0x0F, 0x57, 0xC0, 0xF3 };
+    g_aiW2L   = reinterpret_cast<AiW2LFn>(GetProcAddress(en, "?PointWorldToLocal@IControlObject@@QEBA?AVvec3@@AEBV2@@Z"));
+    g_aiExt   = reinterpret_cast<AiExtFn>(GetProcAddress(en, "?GetExtentsLocal@IControlObject@@QEBAAEBVextents@@XZ"));
+    g_aiXform = reinterpret_cast<AiXformFn>(GetProcAddress(en, "?GetWorldXform@IControlObject@@QEBAAEBVmtx34@@XZ"));
+    const bool cOk = AiHeadOk(g_gd + kAiCentroidRva, hC, 7), rOk = AiHeadOk(g_gd + kAiRadiusRva, hR, 8);
+    const bool bOk = AiHeadOk(g_gd + kAiBoxDistRva, hB, 8);
+    g_aiElem    = reinterpret_cast<AiElemFn>(GetProcAddress(en, "?GetMeshElemFromBoneID@IModelObject@@QEBAHE@Z"));
+    g_aiElemExt = reinterpret_cast<AiElemExtFn>(GetProcAddress(en, "?GetElementExtentsLocal@IModelObject@@QEBA?AVextents@@H@Z"));
+    g_aiElemMtx = reinterpret_cast<AiElemMtxFn>(GetProcAddress(en, "?GetElementWorldMatrix@IModelObject@@QEBAAEBVmtx34@@H@Z"));
+    g_aiRay     = reinterpret_cast<AiRayFn>(GetProcAddress(en, kAiRayName));
+    // The search's bone table (dword_18139EAA0, 21 dwords, the low byte read - +C4943A) must hold exactly kAiBoneIds.
+    unsigned char tab[4 * kAiBones] = {};
+    for (int i = 0; i < kAiBones; ++i) { tab[4 * i] = kAiBoneIds[i]; }
+    const bool tOk = AiHeadOk(g_gd + kAiBoneTabRva, tab, 4 * kAiBones);
+    static const unsigned char hGet[5] = { 0x48, 0x8B, 0x41, 0x08, 0xC3 };   // mov rax, [rcx+8]; ret
+    const bool gOk = AiHeadOk(g_gd + kAiGetterRva, hGet, 5);
+    static const unsigned char hGate[6] = { 0x40, 0x53, 0x48, 0x83, 0xEC, 0x20 };   // sub_180191820's first bytes (our gamedll)
+    const bool gateOk = AiHeadOk(g_gd + kAiGateRva, hGate, 6);
+    g_aiWhy = !g_aiW2L ? "PointWorldToLocal export" : !g_aiExt ? "GetExtentsLocal export" : !g_aiXform ? "GetWorldXform export"
+            : !cOk ? "+C51830 bytes (not the Steam gamedll?)" : !rOk ? "+C51900 bytes" : !bOk ? "+1C27B0 bytes"
+            : !g_aiElem ? "GetMeshElemFromBoneID export" : !g_aiElemExt ? "GetElementExtentsLocal export"
+            : !g_aiElemMtx ? "GetElementWorldMatrix export" : !g_aiRay ? "IGSObject::Raytrace export"
+            : !tOk ? "the bone table +139EAA0 (not 8 5 4 3 2 1 0 18 20 22 19 21 23 10..17)" : !gOk ? "+144470 getter bytes"
+            : !gateOk ? "+191820 (candidate gate) bytes" : nullptr;
+    if (g_aiWhy) {
+        g_aiReady = -1;
+        // [PROBE: SWINGAI] gate=diag_swing_shadow  site=FLAT  log-only=yes
+        LOG("swing: [SWINGAI] REFUSED - %s not found / not matching; the AI-list readout is off this launch (the shadow / miss lines "
+            "are unaffected)", g_aiWhy);
+        return false;
+    }
+    g_aiCentroid = reinterpret_cast<AiCentroidFn>(g_gd + kAiCentroidRva);
+    g_aiRadius = reinterpret_cast<AiRadiusFn>(g_gd + kAiRadiusRva);
+    g_aiBoxDist = reinterpret_cast<AiBoxDistFn>(g_gd + kAiBoxDistRva);
+    g_aiWhy = "none";
+    g_aiReady = 1;
+    // [PROBE: SWINGAI] gate=diag_swing_shadow  site=FLAT  log-only=yes
+    LOG("swing: [SWINGAI] READY (logged unconditionally) - centroid +C51830, radius +C51900, box distance +1C27B0, gate +191820, "
+        "getter +144470, bone table +139EAA0 (21 ids) all match the Steam gamedll; engine exports PointWorldToLocal / "
+        "GetExtentsLocal / GetWorldXform / GetMeshElemFromBoneID %p / GetElementExtentsLocal %p / GetElementWorldMatrix %p / "
+        "Raytrace %p | per B1 search: every AI-list entry within %.1f m of the head point gets the gather's extents test, the "
+        "search's gate, ray 1, and its 21 bone boxes against every quad (rows Q| Z| K| in dlvr_swingshadow.log)",
+        reinterpret_cast<void*>(g_aiElem), reinterpret_cast<void*>(g_aiElemExt), reinterpret_cast<void*>(g_aiElemMtx),
+        reinterpret_cast<void*>(g_aiRay), static_cast<double>(kAiNearM));
+    return true;
+}
+
+// The AI manager's list (the gather's): data + count. False = a read faulted or a pointer was null.
+bool AiList(uintptr_t* data, unsigned* count)
+{
+    __try {
+        const uintptr_t gdi = *reinterpret_cast<const uintptr_t*>(g_gd + kAiGameDiRva);
+        if (!gdi) { return false; }
+        void* lv = *reinterpret_cast<void* const*>(gdi + 1344);
+        if (!lv) { return false; }
+        const uintptr_t level = reinterpret_cast<uintptr_t>(VCall<void*>(lv, 1952));
+        if (!level) { return false; }
+        const uintptr_t mgr = *reinterpret_cast<const uintptr_t*>(level + 2544);
+        if (!mgr) { return false; }
+        *data = *reinterpret_cast<const uintptr_t*>(mgr + 424);
+        *count = *reinterpret_cast<const unsigned*>(mgr + 432);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// One list entry: its root distance to the head point, and (when near) everything the gather / the check read. False = faulted.
+bool AiProbeOne(void* obj, void* player, const float head[3], const float c[3], float r2, float* dist, AiRec* out, float* d2r2)
+{
+    __try {
+        const float* x = g_aiXform(static_cast<char*>(obj) + 24);
+        const float dx = x[3] - head[0], dy = x[7] - head[1], dz = x[11] - head[2];
+        *dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (*dist > kAiNearM) { return true; }
+        float local[3] = {};
+        g_aiW2L(static_cast<char*>(obj) + 24, local, c);
+        const float d2 = g_aiBoxDist(g_aiExt(static_cast<char*>(obj) + 24), local);
+        *d2r2 = r2 > 0.0f ? d2 / r2 : -1.0f;
+        const uintptr_t vt = *reinterpret_cast<const uintptr_t*>(obj);
+        out->vt = vt;
+        out->human = *reinterpret_cast<const uintptr_t*>(vt + 8 * 37) == g_gd + kAiIsDeadRva;
+        out->dead = false;   // v2: slot 37 is NOT called (D-378) - the raw +4793 / +828 / +2352 bytes are logged instead
+        out->active = out->human ? *reinterpret_cast<const unsigned char*>(static_cast<char*>(obj) + 3064) != 0 : false;
+        out->enemy = VCall<unsigned char>(player, 336, obj) != 0;
+        out->pos[0] = x[3]; out->pos[1] = x[7]; out->pos[2] = x[11];
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// ---- v2: the search's per-candidate path (C48E30 +C49378..). Every game read is guarded; nothing is written to game memory. ----
+struct AiRayHit { bool ok, hit; unsigned long long back; unsigned short surf; };
+struct AiCand {   // one candidate at one search
+    unsigned team, state; unsigned char b2352, b3064, b4793;
+    int c888, p870, b12082, gate;            // -1 = not read
+    void* concept; void* model; const char* why;   // why = the first step that could not be read ("ok" = all read)
+    const char* modelSrc;                    // "getter" (concept+64 slot 1 is a plain read) | "object" (the zombie itself - v2.1)
+    uintptr_t getterRva; unsigned char getterBytes[16];   // concept+64 slot 1, for the static read (never called)
+    unsigned m56, m58; int masks;            // masks: 1 read, 0 cache stale / absent (the game would rebuild it)
+};
+struct AiBone { int elem; bool skip, ok; int ov; float dist; float m[12]; float ext[6]; float cw[3]; };
+
+AiRayHit AiCast(void* player, const float* from, const float* to)
+{
+    AiRayHit r{};
+    __try {
+        alignas(16) unsigned char coll[96] = {};
+        *reinterpret_cast<int*>(coll + 32) = -1;
+        alignas(16) float f[4] = { from[0], from[1], from[2], 0.0f };
+        alignas(16) float t[4] = { to[0], to[1], to[2], 0.0f };
+        char* p = static_cast<char*>(player);
+        r.hit = g_aiRay(p + 40, 0x17, coll, f, t, 0x11, p + 24, 8u, 0u, 0) != 0;   // C48E30 +C49339 (INV-633's replica)
+        r.back = *reinterpret_cast<const unsigned long long*>(coll + 24);
+        r.surf = *reinterpret_cast<const unsigned short*>(coll + 56);
+        r.ok = true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { r.ok = false; }
+    return r;
+}
+
+// The candidate's gate / concept / model / masks, exactly the reads the search makes (the calls replaced by reads where sw3 / sw4
+// showed them to be getters). False = a read faulted (why says which step).
+bool AiCandRead(void* obj, void* player, AiCand* c)
+{
+    c->c888 = c->p870 = c->b12082 = c->gate = -1;
+    c->concept = c->model = nullptr;
+    c->masks = 0;
+    c->modelSrc = "-";
+    c->getterRva = 0;
+    c->why = "raw fields";
+    __try {
+        char* o = static_cast<char*>(obj);
+        c->team = *reinterpret_cast<const unsigned*>(o + 320);
+        c->state = *reinterpret_cast<const unsigned*>(o + 828);
+        c->b2352 = *reinterpret_cast<const unsigned char*>(o + 2352);
+        c->b3064 = *reinterpret_cast<const unsigned char*>(o + 3064);
+        c->b4793 = *reinterpret_cast<const unsigned char*>(o + 4793);
+        c->why = "gate";
+        const uintptr_t vt = *reinterpret_cast<const uintptr_t*>(obj);
+        if (*reinterpret_cast<const uintptr_t*>(vt + 0x888) != g_gd + kAiGateRva) { c->why = "slot +0x888 is not +191820"; return true; }
+        c->c888 = VCall<unsigned char>(obj, 0x888, player) != 0 ? 1 : 0;   // sub_180191820 - reads (sw3)
+        c->p870 = VCall<unsigned char>(player, 0x870) != 0 ? 1 : 0;        // PlayerDI slot 270 - this+320 == 1 (INV-634)
+        c->b12082 = *reinterpret_cast<const unsigned char*>(g_gd + kAiByte12082Rva) != 0 ? 1 : 0;
+        c->gate = (c->c888 || !c->p870 || c->b12082) ? 1 : 0;              // +C49392..+C493B9
+        c->why = "concept";
+        const uintptr_t vt816 = *reinterpret_cast<const uintptr_t*>(o + 816);
+        if (vt816 != g_gd + kAiConceptVtRva || *reinterpret_cast<const uintptr_t*>(vt816 + 8) != g_gd + kAiGetterRva) {
+            c->why = "concept getter (+816 vtable) not the known one";
+            return true;
+        }
+        c->concept = *reinterpret_cast<void* const*>(o + 824);                // +0x610 -> (this+816)->[1] = *(this+824)
+        if (!c->concept) { c->why = "concept null (the search tests no bone)"; return true; }
+        c->why = "model";
+        char* v44 = static_cast<char*>(c->concept) + 64;
+        const uintptr_t vt44 = *reinterpret_cast<const uintptr_t*>(v44);
+        const unsigned char* f1 = reinterpret_cast<const unsigned char*>(*reinterpret_cast<const uintptr_t*>(vt44 + 8));
+        c->getterRva = reinterpret_cast<uintptr_t>(f1);
+        for (int k = 0; k < 16; ++k) { c->getterBytes[k] = f1[k]; }
+        if (f1[0] == 0x48 && f1[1] == 0x8B && f1[2] == 0x41 && f1[3] == 0x08 && f1[4] == 0xC3) {
+            c->model = *reinterpret_cast<void* const*>(v44 + 8);
+            c->modelSrc = "getter";
+        } else {
+            // v2.1 (RUN SP2: never a plain read): the zombie object itself - bodygrab's SkelLimb reads elements on this same
+            // pointer in play, and the search's GetElementExtentsLocal takes it (+C494A6). The known-case check decides.
+            c->model = obj;
+            c->modelSrc = "object";
+        }
+        if (!c->model) { c->why = "model null"; return true; }
+        c->why = "masks";
+        const float* cache = *reinterpret_cast<const float* const*>(o + 3312);   // sub_1805E5080's cache - READ, never rebuilt
+        if (cache && cache[19] == 0.0f) {
+            c->m56 = *reinterpret_cast<const unsigned*>(cache + 56);
+            c->m58 = *reinterpret_cast<const unsigned*>(cache + 58);
+            c->masks = 1;
+        }
+        c->why = "ok";
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// One bone: its element, local box and world matrix, read with the search's own exports. False = faulted.
+bool AiBoneRead(void* obj, void* model, unsigned char id, AiBone* b)
+{
+    b->ok = false;
+    __try {
+        b->elem = g_aiElem(model, id);
+        if (b->elem < 0) { return true; }
+        float ext[16] = {};
+        g_aiElemExt(obj, ext, b->elem);
+        for (int k = 0; k < 6; ++k) { b->ext[k] = ext[k]; }
+        const float* m = g_aiElemMtx(model, b->elem);
+        for (int k = 0; k < 12; ++k) { b->m[k] = m[k]; }
+        b->ok = true;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// The geometry, on our copies only: every quad's two triangles (p0 p1 p3 / p0 p2 p3 - C48E30 +C49597..) in the element frame
+// against the element's local box. Sets ov (quads overlapping) and dist (least sampled distance, 0 = overlap) and cw (box centre).
+void AiBoneGeom(AiBone* b, const float* q, unsigned nq)
+{
+    b->ov = 0;
+    b->dist = 1e9f;
+    const float mn[3] = { std::fmin(b->ext[0], b->ext[3]), std::fmin(b->ext[1], b->ext[4]), std::fmin(b->ext[2], b->ext[5]) };
+    const float mx[3] = { std::fmax(b->ext[0], b->ext[3]), std::fmax(b->ext[1], b->ext[4]), std::fmax(b->ext[2], b->ext[5]) };
+    const float cl[3] = { 0.5f * (mn[0] + mx[0]), 0.5f * (mn[1] + mx[1]), 0.5f * (mn[2] + mx[2]) };
+    swingshadow::Xform34(b->m, cl, b->cw);
+    float inv[12];
+    if (!swingshadow::Inverse34(b->m, inv)) { b->dist = -2.0f; return; }   // -2 = singular element matrix
+    for (unsigned i = 0; i < nq; ++i) {
+        const float* e = q + 13 * static_cast<size_t>(i);
+        float p[4][3];
+        for (int k = 0; k < 4; ++k) { swingshadow::Xform34(inv, e + 3 * k, p[k]); }
+        const float d1 = swingshadow::TriAabbDist(mn, mx, p[0], p[1], p[3]);
+        const float d2 = swingshadow::TriAabbDist(mn, mx, p[0], p[2], p[3]);
+        if (d1 == 0.0f || d2 == 0.0f) { ++b->ov; }
+        b->dist = std::fmin(b->dist, std::fmin(d1, d2));
+    }
+}
+
+int AiAppend(char* buf, size_t cap, int at, const char* fmt, ...)
+{
+    if (at < 0 || static_cast<size_t>(at) >= cap) { return at; }
+    va_list ap;
+    va_start(ap, fmt);
+    const int w = std::vsnprintf(buf + at, cap - static_cast<size_t>(at), fmt, ap);
+    va_end(ap);
+    if (w < 0) { return at; }
+    return (static_cast<size_t>(at + w) >= cap) ? static_cast<int>(cap) - 1 : at + w;
+}
+
+constexpr unsigned kAiQMax = 8192;           // quads copied per search (a corrupt-count guard; the count is logged)
+float  g_aiQ[kAiQMax * 13];
+char   g_aiRow[1 << 20];                      // one row at a time (game thread)
+
+// Per B1 search, after the game's own (ShadowAfterSearch). COST: two pure game calls + per list entry one xform read; for an entry
+// within kAiNearM one engine transform, one box distance, a vtable read and three virtual queries.
+// The game's hits of THIS search call (the targets vector: { data, count }, 64-byte entries, +0 the object). False = unreadable.
+bool AiGameHits(void* targets, unsigned long long* out, int* n, int cap)
+{
+    *n = 0;
+    if (!targets) { return true; }
+    __try {
+        const char* data = *reinterpret_cast<char* const*>(targets);
+        const unsigned count = *reinterpret_cast<const unsigned*>(static_cast<char*>(targets) + 8);
+        for (unsigned i = 0; data && i < count && i < 4096; ++i) {
+            const unsigned long long o = *reinterpret_cast<const unsigned long long*>(data + 64 * static_cast<size_t>(i));
+            bool dup = false;
+            for (int j = 0; j < *n; ++j) { if (out[j] == o) { dup = true; break; } }
+            if (!dup && *n < cap) { out[(*n)++] = o; }
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool AiCopyQuads(const HitParams& hp, unsigned* nq)
+{
+    *nq = hp.count < kAiQMax ? hp.count : kAiQMax;
+    __try {
+        std::memcpy(g_aiQ, hp.quads, static_cast<size_t>(*nq) * 52);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { *nq = 0; return false; }
+}
+
+// Per B1 search, after the game's own (ShadowAfterSearch). COST: the old readout + per HumanAI within kAiNearM: ~12 guarded reads,
+// two pure virtual queries, 21 x (3 engine const queries + a 3x4 inverse + per quad 4 transforms and two triangle-box tests with a
+// 13-point sampled distance) + up to one Raytrace; plus one Raytrace per search and the Q / Z / K rows. The first search of a swing
+// carries the backfill (~50-170 quads) - the slowest; its time is logged (us max on the [SWINGAI] line, us= on every Z row).
+void SwingAiSearch(const HitParams& hp, void* targets)
+{
+    if (!AiResolve() || !hp.player || !hp.count) { return; }
+    LARGE_INTEGER t0, t1;
+    QueryPerformanceCounter(&t0);
+    float c[3] = {}, head[3] = {}, hb[4] = {};
+    const float* hd = nullptr;
+    __try {
+        g_aiCentroid(c, &hp);
+        const float r = g_aiRadius(&hp, c);
+        g_aiSphere[0] = c[0]; g_aiSphere[1] = c[1]; g_aiSphere[2] = c[2]; g_aiSphere[3] = r;
+        hd = VCall<const float*>(hp.player, 1840, static_cast<void*>(hb));
+        head[0] = hd[0]; head[1] = hd[1]; head[2] = hd[2];
+        g_aiSlot270 = VCall<unsigned char>(hp.player, 2160) != 0 ? 1 : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { g_aiWhy = "sphere / head point read faulted"; return; }
+    uintptr_t data = 0;
+    unsigned count = 0;
+    if (!AiList(&data, &count)) { g_aiWhy = "AI manager list unreadable"; return; }
+    ++g_aiCalls;
+    if (static_cast<long>(count) > g_aiListMax) { g_aiListMax = static_cast<long>(count); }
+
+    // This search's quads (the WIDENED array the game searched), ray 1's end point, ray 1, the game's hits.
+    unsigned nq = 0;
+    if (!AiCopyQuads(hp, &nq)) { g_aiWhy = "quad copy faulted"; }
+    float cen[3] = {};
+    const bool cenOk = swingshadow::Centroid(g_aiQ, nq, cen);
+    const AiRayHit r1 = cenOk ? AiCast(hp.player, head, cen) : AiRayHit{};
+    unsigned long long hits[64];
+    int nHits = 0;
+    if (!AiGameHits(targets, hits, &nHits, 64)) { g_aiWhy = "targets vector unreadable"; }
+    {
+        int at = AiAppend(g_aiRow, sizeof(g_aiRow), 0, "Q|swing=%ld|n=%ld|count=%u|copied=%u|head=%.4f,%.4f,%.4f|centroid=%.4f,%.4f,%.4f|"
+                          "ray1hit=%d|ray1back=%llX|ray1surf=%u|ray1ok=%d|gameHits=%d|quads=", g_totFires, g_aiCalls, hp.count, nq,
+                          head[0], head[1], head[2], cen[0], cen[1], cen[2], r1.hit ? 1 : 0, r1.back, static_cast<unsigned>(r1.surf),
+                          r1.ok ? 1 : 0, nHits);
+        for (unsigned i = 0; i < nq; ++i) {
+            const float* e = g_aiQ + 13 * static_cast<size_t>(i);
+            at = AiAppend(g_aiRow, sizeof(g_aiRow), at, "%s%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f",
+                          i ? ";" : "", e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7], e[8], e[9], e[10], e[11], e[12]);
+        }
+        // [PROBE: SWINGAI] gate=diag_swing_shadow  site=HEADSET  log-only=yes
+        SHADOW_LOG("%s", g_aiRow);
+    }
+
+    const float r2 = g_aiSphere[3] * g_aiSphere[3];
+    long nearHere = 0;
+    bool replicaOv[64] = {};   // per game hit: did the replica overlap it this call (the known-case check)
+    for (unsigned i = 0; i < count && i < 4096; ++i) {
+        void* obj = nullptr;
+        __try { obj = *reinterpret_cast<void* const*>(data + 8ull * i); } __except (EXCEPTION_EXECUTE_HANDLER) { obj = nullptr; }
+        if (!obj) { continue; }
+        AiRec tmp{};
+        float dist = 1e9f, d2r2 = -1.0f;
+        if (!AiProbeOne(obj, hp.player, head, c, r2, &dist, &tmp, &d2r2)) { g_aiWhy = "an entry's read faulted"; continue; }
+        if (dist > kAiNearM) { continue; }
+        ++nearHere;
+        int j = 0;
+        for (; j < g_aiN; ++j) { if (g_ai[j].obj == obj) { break; } }
+        if (j == g_aiN) {
+            if (g_aiN >= kAiMax) { ++g_aiOver; continue; }
+            g_ai[g_aiN] = AiRec{};
+            g_ai[g_aiN].obj = obj; g_ai[g_aiN].dist = dist; g_ai[g_aiN].human = tmp.human; g_ai[g_aiN].vt = tmp.vt;
+            g_ai[g_aiN].minD2R2 = 1e9f; g_ai[g_aiN].bestD = 1e9f; g_ai[g_aiN].bestBone = -1; g_ai[g_aiN].bestSearch = -1;
+            std::snprintf(g_ai[g_aiN].ray1Who, sizeof(g_ai[g_aiN].ray1Who), "-");
+            ++g_aiN;
+        }
+        AiRec& a = g_ai[j];
+        if (dist < a.dist) { a.dist = dist; a.pos[0] = tmp.pos[0]; a.pos[1] = tmp.pos[1]; a.pos[2] = tmp.pos[2]; }
+        if (a.pos[0] == 0.0f && a.pos[1] == 0.0f && a.pos[2] == 0.0f) { a.pos[0] = tmp.pos[0]; a.pos[1] = tmp.pos[1]; a.pos[2] = tmp.pos[2]; }
+        a.active = tmp.active; a.enemy = tmp.enemy;   // the latest search's reading
+        if (d2r2 >= 0.0f && d2r2 < 1.0f) { ++a.inCalls; }
+        if (d2r2 >= 0.0f) { a.minD2R2 = std::fmin(a.minD2R2, d2r2); }
+
+        const unsigned long long ou = reinterpret_cast<unsigned long long>(obj);
+        int hitIdx = -1;
+        for (int k = 0; k < nHits; ++k) { if (hits[k] == ou) { hitIdx = k; break; } }
+        if (hitIdx >= 0) { ++a.gameHitSearches; }
+        if (!tmp.human) { continue; }   // the bone path below is read only for a HumanAI (slot 37 identity)
+
+        // The search's gate, concept, model, masks.
+        AiCand cd{};
+        if (!AiCandRead(obj, hp.player, &cd)) { ++a.faults; g_aiWhy = "a candidate read faulted"; continue; }
+        a.rawTeam = cd.team; a.rawState = cd.state; a.raw2352 = cd.b2352; a.raw4793 = cd.b4793;
+        if (cd.gate == 0) { ++a.gateFail; }
+        if (!cd.concept) { ++a.noConcept; }
+        else if (!cd.model) { ++a.noModel; }
+        if (cd.model && !cd.masks) { ++a.masksUnread; }
+        // Ray 1 for THIS candidate (C48E30 +C493F7 condition: clear, or hit this candidate, or surface 3).
+        const unsigned long long self18 = ou + 0x18;
+        const swingshadow::Los v1 = r1.ok ? swingshadow::LosVerdict(r1.hit, r1.back, r1.surf, &self18, 1) : swingshadow::Los::BlockedWorld;
+        const bool r1pass = r1.ok && (v1 == swingshadow::Los::Clear || v1 == swingshadow::Los::Target || v1 == swingshadow::Los::Water);
+        char who[48] = "-";
+        if (v1 == swingshadow::Los::Clear) { ++a.ray1Clear; }
+        else if (v1 == swingshadow::Los::Target) { ++a.ray1Target; }
+        else if (v1 == swingshadow::Los::Water) { ++a.ray1Water; }
+        else {
+            ++a.ray1Block;
+            if (!r1.back) { std::snprintf(who, sizeof(who), "%s", r1.ok ? "world (no model)" : "ray 1 not cast"); }
+            else if (!RttiClassNameOf(static_cast<uintptr_t>(r1.back), who, sizeof(who))) { std::snprintf(who, sizeof(who), "%llX", r1.back); }
+            std::snprintf(a.ray1Who, sizeof(a.ray1Who), "%s", who);
+        }
+
+        // The 21 bones.
+        AiBone bones[kAiBones] = {};
+        int nNoElem = 0, nSkip = 0, nOv = 0, firstOv = -1;
+        float bestHere = 1e9f;
+        int bestBoneHere = -1;
+        for (int b = 0; b < kAiBones; ++b) {
+            AiBone& bn = bones[b];
+            bn.elem = -1;
+            bn.dist = -1.0f;
+            if (!cd.model) { continue; }
+            if (!AiBoneRead(obj, cd.model, kAiBoneIds[b], &bn)) { ++a.faults; continue; }
+            if (bn.elem < 0) { ++nNoElem; continue; }
+            bn.skip = cd.masks && ((cd.m58 >> kAiBoneIds[b]) & 1u) && ((cd.m56 >> kAiBoneIds[b]) & 1u);   // sub_1805E5080's test
+            if (bn.skip) { ++nSkip; }
+            if (!bn.ok) { continue; }
+            AiBoneGeom(&bn, g_aiQ, nq);
+            if (bn.ov > 0 && !bn.skip) { ++nOv; if (firstOv < 0 || bn.ov > bones[firstOv].ov) { firstOv = b; } }
+            if (bn.dist >= 0.0f && bn.dist < bestHere) { bestHere = bn.dist; bestBoneHere = kAiBoneIds[b]; }
+        }
+        a.bonesNoElem += nNoElem;
+        a.bonesSkipped += nSkip;
+        if (bestBoneHere >= 0 && bestHere < a.bestD) { a.bestD = bestHere; a.bestBone = bestBoneHere; a.bestSearch = static_cast<int>(g_aiCalls); }
+        // Ray 2 (APPROXIMATE: to the most-overlapped bone's box centre - the game's contact comes from sub_181131020, not called).
+        const char* r2s = "not cast (no overlap)";
+        if (nOv > 0) {
+            ++a.ovSearches;
+            if (r1pass && cd.gate != 0) {
+                ++a.ovRay1Pass;
+                const AiRayHit r2h = AiCast(hp.player, cen, bones[firstOv].cw);
+                const swingshadow::Los v2 = r2h.ok ? swingshadow::LosVerdict(r2h.hit, r2h.back, r2h.surf, &self18, 1)
+                                                   : swingshadow::Los::BlockedWorld;
+                r2s = swingshadow::LosName(v2);
+                if (v2 == swingshadow::Los::Blocked || v2 == swingshadow::Los::BlockedWorld) { ++a.ray2Block; }
+                if (hitIdx < 0) { ++a.ovNotHitByGame; }
+            } else {
+                r2s = !r1pass ? "not cast (ray 1 refused)" : "not cast (gate refused)";
+            }
+            if (hitIdx >= 0) { replicaOv[hitIdx] = true; }
+        }
+
+        // Z row: everything for this candidate at this search.
+        int at = AiAppend(g_aiRow, sizeof(g_aiRow), 0,
+                          "Z|swing=%ld|n=%ld|obj=%p|pos=%.4f,%.4f,%.4f|dHead=%.3f|sphereD2R2=%.3f|team=%u|state=%u|b2352=%u|act3064=%u|"
+                          "b4793=%u|enemy=%d|c888=%d|p870=%d|b12082=%d|gate=%d|ray1=%s|ray1who=%s|concept=%p|model=%p|modelSrc=%s|"
+                          "getter=%llX(+%llX):%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X|read=%s|"
+                          "m56=%08X|m58=%08X|masks=%d|gameHit=%d|bonesNoElem=%d|bonesSkipped=%d|bonesOverlap=%d|best=%d:%.4f|ray2=%s|bones=",
+                          g_totFires, g_aiCalls, obj, tmp.pos[0], tmp.pos[1], tmp.pos[2], static_cast<double>(dist),
+                          static_cast<double>(d2r2), cd.team, cd.state, cd.b2352, cd.b3064, cd.b4793, tmp.enemy ? 1 : 0, cd.c888,
+                          cd.p870, cd.b12082, cd.gate, swingshadow::LosName(v1), who, cd.concept, cd.model, cd.modelSrc,
+                          static_cast<unsigned long long>(cd.getterRva),
+                          static_cast<unsigned long long>(cd.getterRva >= g_gd ? cd.getterRva - g_gd : 0),
+                          cd.getterBytes[0], cd.getterBytes[1], cd.getterBytes[2], cd.getterBytes[3], cd.getterBytes[4],
+                          cd.getterBytes[5], cd.getterBytes[6], cd.getterBytes[7], cd.getterBytes[8], cd.getterBytes[9],
+                          cd.getterBytes[10], cd.getterBytes[11], cd.getterBytes[12], cd.getterBytes[13], cd.getterBytes[14],
+                          cd.getterBytes[15], cd.why, cd.m56, cd.m58,
+                          cd.masks, hitIdx >= 0 ? 1 : 0, nNoElem, nSkip, nOv, bestBoneHere, static_cast<double>(bestHere), r2s);
+        for (int b = 0; b < kAiBones; ++b) {
+            const AiBone& bn = bones[b];
+            at = AiAppend(g_aiRow, sizeof(g_aiRow), at, "%s%u:%d:%d:%d:%.4f:%.4f,%.4f,%.4f", b ? ";" : "", kAiBoneIds[b], bn.elem,
+                          bn.skip ? 1 : 0, bn.ov, static_cast<double>(bn.dist), bn.cw[0], bn.cw[1], bn.cw[2]);
+        }
+        // [PROBE: SWINGAI] gate=diag_swing_shadow  site=HEADSET  log-only=yes
+        SHADOW_LOG("%s", g_aiRow);
+        // K row: each bone's world 3x4 + local extents (for an offline replay of the same test).
+        at = AiAppend(g_aiRow, sizeof(g_aiRow), 0, "K|swing=%ld|n=%ld|obj=%p|bones=", g_totFires, g_aiCalls, obj);
+        for (int b = 0; b < kAiBones; ++b) {
+            const AiBone& bn = bones[b];
+            if (!bn.ok) { at = AiAppend(g_aiRow, sizeof(g_aiRow), at, "%s%u:-", b ? ";" : "", kAiBoneIds[b]); continue; }
+            at = AiAppend(g_aiRow, sizeof(g_aiRow), at,
+                          "%s%u:%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f:%.4f,%.4f,%.4f,%.4f,%.4f,%.4f", b ? ";" : "",
+                          kAiBoneIds[b], bn.m[0], bn.m[1], bn.m[2], bn.m[3], bn.m[4], bn.m[5], bn.m[6], bn.m[7], bn.m[8], bn.m[9],
+                          bn.m[10], bn.m[11], bn.ext[0], bn.ext[1], bn.ext[2], bn.ext[3], bn.ext[4], bn.ext[5]);
+        }
+        // [PROBE: SWINGAI] gate=diag_swing_shadow  site=HEADSET  log-only=yes
+        SHADOW_LOG("%s", g_aiRow);
+    }
+    // The known-case check: every object the GAME hit this call should overlap in the replica (only HumanAI within kAiNearM are
+    // replicated - a hit on anything else counts as NOT CHECKED, not as a miss).
+    for (int k = 0; k < nHits; ++k) {
+        int j = 0;
+        for (; j < g_aiN; ++j) { if (reinterpret_cast<unsigned long long>(g_ai[j].obj) == hits[k]) { break; } }
+        if (j == g_aiN || !g_ai[j].human) { continue; }
+        if (replicaOv[k]) { ++g_aiChkAgree; ++g_aiSesAgree; } else { ++g_aiChkMiss; ++g_aiSesMiss; }
+    }
+    if (nearHere > g_aiNearMax) { g_aiNearMax = nearHere; }
+    QueryPerformanceCounter(&t1);
+    const double us = static_cast<double>(t1.QuadPart - t0.QuadPart) * g_qpcToMs * 1000.0;
+    if (us > g_aiUsMax) { g_aiUsMax = us; }
+    // [PROBE: SWINGAI] gate=diag_swing_shadow  site=HEADSET  log-only=yes
+    SHADOW_LOG("E|swing=%ld|n=%ld|quads=%u|nearAI=%ld|gameHits=%d|check agree=%ld miss=%ld|us=%.1f", g_totFires, g_aiCalls, nq, nearHere,
+               nHits, g_aiChkAgree, g_aiChkMiss, us);
+}
+
+// At END, after [SWINGMISS]: the swing's line + one per object. `verdict` = the miss probe's.
+void SwingAiEnd(const char* verdict)
+{
+    if (g_aiReady != 1) { return; }
+    ++g_aiSwings;   // uncapped - Jay 2026-11-19: "nothing log wise is capped for this probe"
+    // [PROBE: SWINGAI] gate=diag_swing_shadow  site=HEADSET  log-only=yes
+    LOG("swing: [SWINGAI] #%ld %s | game hit %d | B1 searches read %ld, AI list max %ld, within %.1f m of the head point max %ld per "
+        "search, %d object(s) (%d past the cap) | last sphere centre (%.3f %.3f %.3f) r %.3f m | player slot 270 %d (1 = the "
+        "IsEnemy gate applies) | last problem: %s | KNOWN-CASE CHECK: of the game's hits on a HumanAI within %.1f m, the replica's "
+        "bone test also overlapped %ld, did NOT %ld (session %ld / %ld) | slowest search %.0f us",
+        g_totFires, verdict, g_shNGame, g_aiCalls, g_aiListMax,
+        static_cast<double>(kAiNearM), g_aiNearMax, g_aiN, g_aiOver, static_cast<double>(g_aiSphere[0]),
+        static_cast<double>(g_aiSphere[1]), static_cast<double>(g_aiSphere[2]), static_cast<double>(g_aiSphere[3]), g_aiSlot270,
+        g_aiWhy, static_cast<double>(kAiNearM), g_aiChkAgree, g_aiChkMiss, g_aiSesAgree, g_aiSesMiss, g_aiUsMax);
+    for (int i = 0; i < g_aiN; ++i) {
+        const AiRec& a = g_ai[i];
+        bool inGame = false, inNear = false;
+        float nearD = -1.0f;
+        for (int j = 0; j < g_shNGame; ++j) { if (g_shGame[j].obj == reinterpret_cast<unsigned long long>(a.obj)) { inGame = true; } }
+        for (int j = 0; j < g_nearN; ++j) {
+            if (g_near[j].obj == reinterpret_cast<unsigned long long>(a.obj)) { inNear = true; nearD = g_near[j].dist; }
+        }
+        // [PROBE: SWINGAI] gate=diag_swing_shadow  site=HEADSET  log-only=yes
+        LOG("swing: [SWINGAI]   #%ld obj %p vt +%llX %s | closest %.2f m from the head point at (%.3f %.3f %.3f) | raw: team(+320) "
+            "%u state(+828) %u +2352 %u active(+3064) %d +4793 %u (NOT an alive reading) | IsEnemy %d | inside the search sphere on "
+            "%d of %ld searches (best box^2/r^2 %.2f, < 1 = inside) | in the game's hits %d (on %d searches) | near probe %s%.3f | "
+            "SEARCH PATH: gate refused %d, ray 1 clear %d / this zombie %d / water %d / BLOCKED %d (last by %s), no concept %d, no "
+            "model %d, skip masks unread %d, bones with no element %d, bones skipped (masks) %d | BONES: closest %.3f m (bone %d, "
+            "search %d; 0 = a quad triangle overlaps its box) | overlapped on %d searches, %d of them with ray 1 + gate passing, %d "
+            "of THOSE not hit by the game | ray 2 (approx.) blocked %d | faults %d",
+            g_totFires, a.obj, static_cast<unsigned long long>(a.vt - g_gd), a.human ? "HumanAI" : "not HumanAI",
+            static_cast<double>(a.dist), static_cast<double>(a.pos[0]), static_cast<double>(a.pos[1]), static_cast<double>(a.pos[2]),
+            a.rawTeam, a.rawState, static_cast<unsigned>(a.raw2352), a.active ? 1 : 0, static_cast<unsigned>(a.raw4793),
+            a.enemy ? 1 : 0, a.inCalls, g_aiCalls, a.minD2R2 > 1e8f ? -1.0 : static_cast<double>(a.minD2R2), inGame ? 1 : 0,
+            a.gameHitSearches, inNear ? "touched, dist " : "not touched ", inNear ? static_cast<double>(nearD) : -1.0,
+            a.gateFail, a.ray1Clear, a.ray1Target, a.ray1Water, a.ray1Block, a.ray1Who, a.noConcept, a.noModel, a.masksUnread,
+            a.bonesNoElem, a.bonesSkipped, a.bestD > 1e8f ? -1.0 : static_cast<double>(a.bestD), a.bestBone, a.bestSearch,
+            a.ovSearches, a.ovRay1Pass, a.ovNotHitByGame, a.ray2Block, a.faults);
+    }
+}
+
+void SwingAiReset()
+{
+    g_aiN = 0; g_aiOver = 0; g_aiCalls = 0; g_aiListMax = 0; g_aiNearMax = 0;
+    g_aiChkAgree = 0; g_aiChkMiss = 0; g_aiUsMax = 0.0;
+    g_aiWhy = g_aiReady == 1 ? "none" : g_aiWhy;
+}
 
 float PointSegDist(const float* p, const float* a, const float* b)
 {
@@ -823,7 +1437,7 @@ void ShadowReadFrame(void* self, double tMs)
         g_swIdTip = idT;
         g_swIdEnd = idE;
         if (changed) {
-            if (g_swModelLines < 40) {
+            if (true) {   // was `g_swModelLines < 40` - uncapped for the probe run (trace 20261119_1730)
                 ++g_swModelLines;
                 // [PROBE: SWINGSHADOW] gate=diag_swing_shadow  site=HEADSET  log-only=yes
                 LOG("swing: [SWINGSHADOW] weapon model %p: Holder %d, DTrailStart1 %d, DTrailEnd1 %d%s (the mesh is named by "
@@ -859,6 +1473,7 @@ void ShadowFireStart()
     g_shComplete = true;
     g_shNGame = g_shNBlade = 0;
     g_nearN = 0;   // the miss probe's near set, per swing
+    SwingAiReset();   // [SWINGAI] per swing (trace 20261119_1730)
     g_shSwCalls = 0;
     g_shUsSum = g_shUsMax = 0.0;
     g_shTotUsSum = g_shTotUsMax = 0.0;
@@ -878,7 +1493,7 @@ void ShadowTargetsRead(void* vec, swingshadow::Key* set, int& n, const char* whi
     // +48 the bone (GetBoneIDFromMeshElem, sub_180C48E30:575), +44 the score (sub_180C48E30:566-649).
     const char* data = *reinterpret_cast<char* const*>(vec);
     const unsigned count = *reinterpret_cast<const unsigned*>(static_cast<char*>(vec) + 8);
-    for (unsigned i = 0; data && i < count && i < 64; ++i) {
+    for (unsigned i = 0; data && i < count && i < 4096; ++i) {   // 4096 = a corrupt-count guard only (was 64 - a log cap)
         const char* en = data + 64 * static_cast<size_t>(i);
         const unsigned long long obj = *reinterpret_cast<const unsigned long long*>(en);
         const int elem = *reinterpret_cast<const int*>(en + 8);
@@ -986,7 +1601,7 @@ void ShadowNearSearch(void* self, const HitParams& hp, const int pairs[][2], int
     g_search(self, &nhp, &scratch, dir);
     ++g_nearCalls;
     const char* data = static_cast<const char*>(scratch.data);
-    for (unsigned i = 0; data && i < scratch.count && i < 64; ++i) {
+    for (unsigned i = 0; data && i < scratch.count && i < 4096; ++i) {   // corrupt-count guard only (was 64)
         const char* en = data + 64 * static_cast<size_t>(i);
         const unsigned long long obj = *reinterpret_cast<const unsigned long long*>(en);
         const int elem = *reinterpret_cast<const int*>(en + 8);
@@ -1137,6 +1752,7 @@ void ShadowAfterSearch(void* self, const HitParams& hp, void* targets, bool back
     LARGE_INTEGER q0, q1;
     QueryPerformanceCounter(&q0);
     ShadowAfterSearchBody(self, hp, targets, backfill);
+    SwingAiSearch(hp, targets);   // [SWINGAI]: the game's own candidate list + per-bone path at THIS search (trace 20261119_1730)
     QueryPerformanceCounter(&q1);
     const double us = static_cast<double>(q1.QuadPart - q0.QuadPart) * g_qpcToMs * 1000.0;
     g_shTotUsSum += us;
@@ -1168,7 +1784,7 @@ void ShadowEndSwing(bool madeB1)
     // The miss probe's verdict for this swing (spec: HIT / INSIDE NOT HIT / NEAR MISS / NOTHING NEAR).
     int inside = 0, nearMiss = 0, nearHit = 0;
     float missMin = 1e9f, insideMin = 1e9f;
-    char list[256] = {};
+    char list[4096] = {};   // was 256 (~5 objects) - every touched object listed (trace 20261119_1730)
     size_t at = 0;
     for (int i = 0; i < g_nearN; ++i) {
         bool hit = false;
@@ -1193,6 +1809,7 @@ void ShadowEndSwing(bool madeB1)
     SHADOW_LOG("N|swing=%ld|verdict=%s|game=%d|near=%d|nearHit=%d|inside=%d|insideMin=%.4f|outside=%d|outsideMin=%.4f",
                g_totFires, verdict, g_shNGame, g_nearN, nearHit, inside, inside ? static_cast<double>(insideMin) : -1.0,
                nearMiss, nearMiss ? static_cast<double>(missMin) : -1.0);
+    SwingAiEnd(verdict);   // [SWINGAI] (trace 20261119_1730)
 }
 
 // Once per DriverFrame: the ARMED / REFUSED line (first time, unconditional) and the 5 s totals. The 5 s stamp sits above
@@ -1395,7 +2012,7 @@ bool InstallBuilderHook()
     g_clear1960 = reinterpret_cast<ClearFn>(g_gd + Gd(kClear1960));
     g_realloc   = *reinterpret_cast<ReallocFn*>(g_gd + Gd(kIatRealloc));
     g_free      = *reinterpret_cast<FreeFn*>(g_gd + Gd(kIatFree));
-#if !defined(DLVR_BETA_LEAN)   // BETA lean: compiled out (docs/BETA_CENSUS.md)
+#if !defined(DLVR_BETA_LEAN) || defined(DLVR_SWING_PROBE)   // BETA lean: compiled out; back in the probe variant
     g_dbgByte   = reinterpret_cast<const volatile unsigned char*>(g_gd + Gd(kDebugDrawByteRva));   // diag_swing_shadow only
 #endif
     if (!g_realloc || !g_free) {
@@ -1537,7 +2154,11 @@ void LogPath(const char* what, long idx)
         if (g_pathSeg[i].lenM > g_pathSeg[big].lenM) { big = i; }
         if (g_pathSeg[i].flags < 0 || !(g_pathSeg[i].flags & XR_SPACE_LOCATION_POSITION_TRACKED_BIT)) { ++notTracked; }
     }
+#if defined(DLVR_SWING_PROBE)
+    static char segs[8192];   // static: game thread only; 512 segments x ~14 chars
+#else
     char segs[400];
+#endif
     int off = 0;
     segs[0] = '\0';
     for (int i = 0; i < g_pathSegN && off < static_cast<int>(sizeof(segs)) - 24; ++i) {
@@ -1550,10 +2171,12 @@ void LogPath(const char* what, long idx)
         off += w;
     }
     const PathSeg& b = g_pathSeg[big];
+    char keptText[48] = {};
+    if (g_pathSegTotal > g_pathSegN) { std::snprintf(keptText, sizeof(keptText), " (only the first %d kept)", kPathSegMax); }
     // [PROBE: SWING] gate=melee_swing_mode  site=HEADSET  log-only=yes
     LOG("swing: [SWING] %s #%ld candidate path | %d segment(s)%s | largest %.3f m = share %.2f of the path, dt %.1f "
         "ms, position %s | not position-tracked on %d of %d | segments len mm/dt ms (! = not tracked, ? = unknown):%s",
-        what, idx, g_pathSegTotal, g_pathSegTotal > g_pathSegN ? " (only the first 24 kept)" : "",
+        what, idx, g_pathSegTotal, keptText,
         static_cast<double>(b.lenM), sum > 0.0f ? static_cast<double>(b.lenM / sum) : 0.0, static_cast<double>(b.dtMs),
         b.flags < 0 ? "flags UNKNOWN" : ((b.flags & XR_SPACE_LOCATION_POSITION_TRACKED_BIT) ? "TRACKED" : "NOT TRACKED"),
         notTracked, g_pathSegN, segs);
@@ -1590,6 +2213,10 @@ swing::Sample SampleGrip(XrPosef& gripOut, XrPosef& headOut, bool& gripOk, bool&
     headOk = GetHeadPose(headOut);
     s.poseOk = gripOk && headOk;
     s.p = { gripOut.position.x, gripOut.position.y, gripOut.position.z };
+    // Fix 5 (trace 20261119_1735): the right grip for the shoulder-zone exit rule, every sample. COST: one call, two array reads.
+    float squeeze = 0.0f;
+    s.gripKnown = GetControllerSqueeze(kRightHand, squeeze) && std::isfinite(squeeze);
+    s.gripDown = s.gripKnown && squeeze >= holster::kGripThreshold;
     if (s.poseOk) {
         // Return-stroke rule: "toward the body" in app space (one atan2 + sin + cos). Left zero without a pose.
         s.back = swing::BackInApp(headOut.orientation.x, headOut.orientation.y, headOut.orientation.z,
@@ -1924,6 +2551,25 @@ void DriverFrame(void* self)
     if (!s.poseOk) { ++g_refNoPose; }
     if (st.nonFinite) { ++g_refNonFinite; }
     if (st.holsterRefused) { ++g_refHolster; }
+    // Fix 5: one line per shoulder-zone exit (a reach, not a per-frame event), 300 per session, then one STOPPED line.
+    if (st.zoneExit != swing::ZoneExit::None) {
+        static int s_zoneExitLines = 0;
+        static long s_zoneExitArmed = 0;
+        static long s_zoneExitIdle = 0;
+        if (st.zoneExit == swing::ZoneExit::Armed) { ++s_zoneExitArmed; } else { ++s_zoneExitIdle; }
+        if (s_zoneExitLines < 300) {
+            ++s_zoneExitLines;
+            // [PROBE: SWING] gate=melee_swing_mode  site=HEADSET  log-only=yes
+            LOG("swing: [SWING] shoulder zone exit -> %s | grip %s | session: armed %ld idle %ld",
+                swing::ZoneExitName(st.zoneExit), s.gripKnown ? (s.gripDown ? "down" : "up") : "UNKNOWN",
+                s_zoneExitArmed, s_zoneExitIdle);
+        } else if (s_zoneExitLines == 300) {
+            ++s_zoneExitLines;
+            // [PROBE: SWING] gate=melee_swing_mode  site=HEADSET  log-only=yes
+            LOG("swing: [SWING] shoulder zone exit lines STOPPED at 300 (exits still change the state; armed %ld idle %ld)",
+                s_zoneExitArmed, s_zoneExitIdle);
+        }
+    }
     // Redo 3 motion tracking - a few float copies per frame, no calls. Mirrors the detector: a pose loss or a
     // non-finite sample clears its history (Clear()), a repeat leaves it, anything else becomes the new prevP_.
     if (!s.poseOk || st.nonFinite) {
@@ -2359,7 +3005,11 @@ void StaggerWindowClose(void* self)
 {
     if (!g_staggerSelf || self != g_staggerSelf) { return; }
     g_staggerSelf = nullptr;
+#if defined(DLVR_SWING_PROBE)   // the probe variant: uncapped (trace 20261119_1730)
+    if (true) {
+#else
     if (g_staggerLines < 300) {
+#endif
         ++g_staggerLines;
         // [PROBE: SWING] gate=melee_swing_mode  site=HEADSET  log-only=yes
         LOG("swing: [SWING] LIGHT STAGGER #%ld END after %llu ms - the melee controller is updated again | swing frames fed from "

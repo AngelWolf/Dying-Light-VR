@@ -508,9 +508,12 @@ extern bool  DiagDrawnCensus;
 // eye bone or the clavicles? Slope of each against HMD yaw, per 1 s window. Log-only. HEADSET.
 #if defined(DLVR_BETA_LEAN)   // compiled out of BETA (docs/BETA_CENSUS.md): constant false, the gated code is dropped
 inline constexpr bool DiagHeadTurn = false;
-inline constexpr bool DiagCamYaw = false;
 #else
 extern bool  DiagHeadTurn;
+#endif
+#if defined(DLVR_BETA_LEAN) && !defined(DLVR_YAW_PROBE)   // compiled out of BETA - back in the yaw probe variant (trace 20261119_2145)
+inline constexpr bool DiagCamYaw = false;
+#else
 extern bool  DiagCamYaw;     // [CAMYAW] - design D's D2 detour (camyaw::Hook)
 #endif
 extern bool  HeadYawLookEnableFix;   // head_yaw_look_enable_fix - INV-329, camyaw::lookenable::Hook (LIVE)

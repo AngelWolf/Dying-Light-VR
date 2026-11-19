@@ -877,8 +877,190 @@ static void stick_gap_refused_when_stale()
     CHECK(!StickGapFresh(1000, 0, true));
 }
 
+// ===== HAND-TWIST VIEW HOLD (spec 2026-11-19-hand-twist-view-hold-design §4) =====
+static bool Near3(const float a[3], const float b[3], float tol) {
+    return std::fabs(a[0] - b[0]) < tol && std::fabs(a[1] - b[1]) < tol && std::fabs(a[2] - b[2]) < tol;
+}
+
+static void htv_zero_gap_is_exact_zero()
+{
+    const float a[3] = { 0.03f, 0.02f, 0.11f }, v[3] = { -0.02f, 0.13f, 0.07f };
+    float c[3] = { 9.0f, 9.0f, 9.0f };
+    HandTwistViewCorrection(0.0f, a, v, nullptr, c);
+    CHECK(c[0] == 0.0f && c[1] == 0.0f && c[2] == 0.0f);   // bit for bit: today's base
+}
+
+// The a-term is EXACTLY the fold's own rotation (the verified S-61 sign) applied to x/z.
+static void htv_a_term_is_the_fold_rotation()
+{
+    const float g[4] = { 20.0f, -35.0f, 40.0f, -7.5f };
+    for (float G : g) {
+        const float a[3] = { 0.04f, -0.10f, 0.09f }, v0[3] = { 0.0f, 0.0f, 0.0f };
+        float c[3];
+        HandTwistViewCorrection(G, a, v0, nullptr, c);
+        float x = a[0], z = a[2];
+        ReportedHeadPosForFold(G, x, z);
+        const float want[3] = { x - a[0], 0.0f, z - a[2] };
+        CHECK(Near3(c, want, 1e-6f));
+    }
+}
+
+// A rotation: the corrected lever keeps its length and its height.
+static void htv_keeps_length_and_height()
+{
+    const float a[3] = { 0.05f, -0.10f, 0.12f }, v0[3] = { 0.0f, 0.0f, 0.0f };
+    float c[3];
+    HandTwistViewCorrection(33.0f, a, v0, nullptr, c);
+    const float n[3] = { a[0] + c[0], a[1] + c[1], a[2] + c[2] };
+    CHECK(Near(std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]), std::sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2])));
+    CHECK(c[1] == 0.0f);
+    // the size the spec quotes: r = 13 cm, G = 40 deg -> 2 r sin(20 deg) = 88.9 mm
+    const float r[3] = { 0.13f, 0.0f, 0.0f };
+    HandTwistViewCorrection(40.0f, r, v0, nullptr, c);
+    CHECK(std::fabs(std::sqrt(c[0] * c[0] + c[2] * c[2]) - 0.0889f) < 0.0005f);
+}
+
+// The twist turns about the body's UP: a purely vertical unpitched lever does not move.
+static void htv_vertical_lever_untouched()
+{
+    const float a0[3] = { 0.0f, 0.0f, 0.0f }, v[3] = { 0.0f, 0.13f, 0.0f };
+    float c[3];
+    HandTwistViewCorrection(25.0f, a0, v, nullptr, c);
+    CHECK(Near3(c, a0, 1e-7f));
+}
+
+// C06C60 pitches the eye lever about the LOOK's side axis (gap-free). A vertical lever pitched forward by P must stay where it is:
+// the body without the twist pitches it the same way. Turning it about plain up (P ignored) would wrongly swing it sideways.
+static void htv_pitched_lever_uses_p()
+{
+    const float ph = 45.0f * 0.01745329252f;
+    const float P[9] = { 1.0f, 0.0f, 0.0f,
+                         0.0f, std::cos(ph), -std::sin(ph),
+                         0.0f, std::sin(ph), std::cos(ph) };   // about body-local +X
+    const float up[3] = { 0.0f, 0.13f, 0.0f };
+    float v[3];
+    Mat3MulVecHt(P, up, v);   // the pitched lever
+    const float a0[3] = { 0.0f, 0.0f, 0.0f };
+    float c[3];
+    HandTwistViewCorrection(20.0f, a0, v, P, c);
+    CHECK(Near3(c, a0, 1e-6f));                          // with P: exact, no move
+    HandTwistViewCorrection(20.0f, a0, v, nullptr, c);   // without P: the ~3 cm error the spec sizes
+    const float err = std::sqrt(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]);
+    CHECK(err > 0.02f && err < 0.04f);
+}
+
+static void htv_identity_p_equals_no_p()
+{
+    const float I[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+    const float a[3] = { 0.02f, -0.1f, 0.05f }, v[3] = { 0.01f, 0.12f, -0.05f };
+    float c1[3], c2[3];
+    HandTwistViewCorrection(-28.0f, a, v, I, c1);
+    HandTwistViewCorrection(-28.0f, a, v, nullptr, c2);
+    CHECK(Near3(c1, c2, 1e-7f));
+}
+
+// ===== NECK HOLD (trace 20261119_1430) =====
+// A head-only turn inside the range: the body holds, the gap is minus the head's turn.
+static void neck_holds_inside_range()
+{
+    NeckHoldState s;
+    NeckHoldStep(s, 1, 0.0f, false, 0.011f);
+    float h = 0.0f;
+    NeckOut o{};
+    for (int i = 0; i < 20; ++i) { h += 1.0f; o = NeckHoldStep(s, 1, h, false, 0.011f); }   // 20 deg left in small steps
+    CHECK(NearDeg(o.gapXrDeg, -20.0f));
+    CHECK(!o.clamped);
+    CHECK(NearDeg(s.yaw, 0.0f));
+}
+
+// Past the range the head pulls the body round; turning back the body stays where it was pulled.
+static void neck_pulls_at_range_and_stays()
+{
+    NeckHoldState s;
+    NeckHoldStep(s, 1, 0.0f, false, 0.011f);
+    float h = 0.0f;
+    NeckOut o{};
+    for (int i = 0; i < 60; ++i) { h += 1.0f; o = NeckHoldStep(s, 1, h, false, 0.011f); }   // 60 deg left
+    CHECK(NearDeg(o.gapXrDeg, -kNeckRangeDeg));
+    CHECK(o.clamped);
+    CHECK(NearDeg(s.yaw, 20.0f));   // pulled 20 deg
+    for (int i = 0; i < 20; ++i) { h -= 1.0f; o = NeckHoldStep(s, 1, h, false, 0.011f); }   // back to 40
+    CHECK(NearDeg(o.gapXrDeg, -20.0f));
+    CHECK(NearDeg(s.yaw, 20.0f));
+}
+
+// Mirror: to the right.
+static void neck_pulls_right()
+{
+    NeckHoldState s;
+    NeckHoldStep(s, 1, 0.0f, false, 0.011f);
+    float h = 0.0f;
+    NeckOut o{};
+    for (int i = 0; i < 50; ++i) { h -= 1.0f; o = NeckHoldStep(s, 1, h, false, 0.011f); }
+    CHECK(NearDeg(o.gapXrDeg, kNeckRangeDeg));
+    CHECK(NearDeg(s.yaw, -10.0f));
+}
+
+// Walking eases the body back under the head (gap -> 0); after ~3 time constants it is within 5 % of where it started.
+static void neck_recentres_while_walking()
+{
+    NeckHoldState s;
+    NeckHoldStep(s, 1, 0.0f, false, 0.011f);
+    float h = 0.0f;
+    NeckOut o{};
+    for (int i = 0; i < 30; ++i) { h += 1.0f; o = NeckHoldStep(s, 1, h, false, 0.011f); }   // gap -30
+    const float t3 = 3.0f * kNeckRecentreTauS;
+    const int n = static_cast<int>(t3 / 0.011f) + 1;
+    for (int i = 0; i < n; ++i) { o = NeckHoldStep(s, 1, h, true, 0.011f); }
+    CHECK(o.recentring);
+    CHECK(std::fabs(o.gapXrDeg) < 0.05f * 30.0f + 0.01f);
+    CHECK(o.gapXrDeg < 0.0f);   // eased, never overshot
+}
+
+// A head-yaw jump > kTorsoJumpDeg (recentre / snap) and a new object put the body under the head.
+static void neck_resets_on_jump_and_new_object()
+{
+    NeckHoldState s;
+    NeckHoldStep(s, 1, 0.0f, false, 0.011f);
+    NeckOut o{};
+    for (int i = 0; i < 25; ++i) { o = NeckHoldStep(s, 1, static_cast<float>(i + 1), false, 0.011f); }
+    CHECK(NearDeg(o.gapXrDeg, -25.0f));
+    o = NeckHoldStep(s, 1, 25.0f + 90.0f, false, 0.011f);
+    CHECK(o.reset);
+    CHECK(NearDeg(o.gapXrDeg, 0.0f));
+    for (int i = 0; i < 10; ++i) { o = NeckHoldStep(s, 1, 115.0f + static_cast<float>(i + 1), false, 0.011f); }
+    CHECK(NearDeg(o.gapXrDeg, -10.0f));
+    o = NeckHoldStep(s, 2, 125.0f, false, 0.011f);
+    CHECK(o.reset);
+    CHECK(NearDeg(o.gapXrDeg, 0.0f));
+}
+
+// Across +-180 the gap is the short way.
+static void neck_wraps_across_180()
+{
+    NeckHoldState s;
+    NeckHoldStep(s, 1, 170.0f, false, 0.011f);
+    NeckOut o{};
+    float h = 170.0f;
+    for (int i = 0; i < 20; ++i) { h = Wrap180(h + 1.0f); o = NeckHoldStep(s, 1, h, false, 0.011f); }   // to -170
+    CHECK(NearDeg(o.gapXrDeg, -20.0f));
+    CHECK(!o.clamped);
+}
+
 int main()
 {
+    neck_holds_inside_range();
+    neck_pulls_at_range_and_stays();
+    neck_pulls_right();
+    neck_recentres_while_walking();
+    neck_resets_on_jump_and_new_object();
+    neck_wraps_across_180();
+    htv_zero_gap_is_exact_zero();
+    htv_a_term_is_the_fold_rotation();
+    htv_keeps_length_and_height();
+    htv_vertical_lever_untouched();
+    htv_pitched_lever_uses_p();
+    htv_identity_p_equals_no_p();
     torso_yaw_convention();
     gap_zero_hands_in_front();
     gap_follows_hands_left();

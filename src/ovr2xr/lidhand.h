@@ -6,7 +6,7 @@
 
 namespace dlvr {
 
-extern bool  LidByHand;     // lid_by_hand - the feature (needs loot_by_hand: the shared GetNearbyTriggers detour)
+extern bool  LidByHand;     // lid_by_hand - the feature (needs vr_grip; NOT loot_by_hand - the camouflage poll installs the detour)
 extern float LidOpenFrac;   // lid_open_frac - the open point as a fraction of the lid's own open angle (Tier D)
 
 // From looting.cpp's NearbyHook (the HUD trigger update), right after the gaze re-pick, with the game's gathered list and the gaze
@@ -18,8 +18,13 @@ bool LidHandOnNearby(void* player, void* const* gameData, unsigned gameCount, vo
 // Game thread, once per player update (BowDrawTick's top). Grabs, follows, writes, opens, carries, stows. Off = one bool test.
 void LidHandTick();
 
-// scePad poll, right after LootPoll and before PushGrabPoll / the grip send. leftOwned / rightOwned = an earlier poller took this
-// press. withholdL1 / withholdR1 come back true while that hand owns a lid / an item, or is next to one with the grip squeezed.
+// scePad poll, BEFORE LootPoll (trace 20261119_1240 - a press the lid claims is "owned elsewhere" for loot) and before PushGrabPoll /
+// the grip send. leftOwned / rightOwned = a holster / the two-handed hold / the reload took this press (never loot). withholdL1 / withholdR1 come back true while that hand owns a lid / an item, or is next to one with the grip squeezed.
 void LidHandPoll(bool vrGrip, bool leftOwned, bool rightOwned, bool& withholdL1, bool& withholdR1);
+
+// The hip yield (trace 20261119_1215, Jay: "We'd have to make it both hip holsters"): true while hand `side` (0 = RIGHT, 1 = LEFT)
+// was, at the last game tick, in a published lid's edge zone or an item's zone, or owns a lid / an item. LootYieldAt asks it for both
+// hips. lid_by_hand=0 / not ready -> false. COST: one interlocked read.
+bool LidHandHandInZone(int side);
 
 }  // namespace dlvr
