@@ -56,10 +56,13 @@ namespace dlvr {
 
 // [DEP: lid_by_hand] required-for=opening top-lid containers by hand + items held until stowed (LidByHand) - spec
 //      2026-11-18-hand-open-lids-design. tree=INERT at 0: LidHandOnNearby / LidHandTick / LidHandPoll return at their first test,
-//      nothing is read or written. Needs loot_by_hand=1 (the shared GetNearbyTriggers detour installs only then). HEADSET: the grip
+//      nothing is read or written. Needs vr_grip=1, NOT loot_by_hand (trace 20261119_1240, by code: the shared GetNearbyTriggers
+//      detour is installed by the always-on camouflage poll GripCamoPoll -> TryInstall, which has no loot gate, and NearbyHook calls
+//      LidHandOnNearby before its loot_by_hand return; LidHandPoll owns its press BEFORE LootPoll). HEADSET: the grip
 //      poses + squeeze, the rig's game-world grip (RigGripWorldRead), the player body model (BoneProbeCapturedModel). Tier C -
-//      SHIPS OFF from 1.04 (Jay 2026-11-18: "Ship it OFF"; trace 20261118_2045): it withholds the game's prompt on every lid
-//      container incl. a locked one's lockpick, and roomscale pushes the player off the chest. Jay tests it ON on his disk.
+//      SHIPS OFF from 1.04 (Jay 2026-11-18: "Ship it OFF"; trace 20261118_2045): it withheld the game's prompt on every lid
+//      container incl. a locked one's lockpick (fixed 2026-11-19, trace 20261119_1135: a locked one keeps the game's prompt), and
+//      roomscale pushes the player off the chest. Jay tests it ON on his disk.
 bool  LidByHand = false;
 // [DEP: lid_open_frac] required-for=where the game's own open fires, as a fraction of the lid's open angle (LidOpenFrac). Tier D
 //      (my call 0.5, spec §4.4). tree=INERT at lid_by_hand=0.
@@ -73,6 +76,11 @@ constexpr int kRows = static_cast<int>(sizeof(kLidHinges) / sizeof(kLidHinges[0]
 
 // ---- OUR gamedll 97046bba (RESEARCH §12d / §12e / §13) ----
 constexpr uintptr_t kExecuteRva = 0xB9B930;   // sub_180B9B930(player, trigger, info) - the game's execute (§12d)
+// sub_180EF4340(obj, key, 0, jump, force) - play the object's interaction-data stage for a key; jump = straight to its END pose
+// (ida/lk5_out.txt, lk6_out.txt; trace 20261119_1310). No EGL buildrva row: on EGL the head check below refuses the jump (named).
+constexpr uintptr_t kPlayStageRva = 0xEF4340;
+constexpr size_t    kStageKeySlotOff = 1416;   // vfunc slot 177 (+EF7220): the stage key for the CURRENT state (6 = Open in state 1)
+constexpr float     kOpenEaseS = 0.30f;        // our write carries the lid from the hand to the open angle (my call, a constant)
 constexpr size_t    kStateOff = 824;           // PersistentTriggerObjectDI state (ComplexContainer slot 195 +A57BF0 returns it)
 constexpr size_t    kItemOwnerOff = 1016;      // ContainerItem -> its ComplexContainer (CreateItem +A6E720 writes it, §12e)
 constexpr size_t    kActionSlotOff = 1432;     // vfunc: the trigger's action for a use info (ContainerItem +A69FD0: 1 or 23)
@@ -112,6 +120,8 @@ using GetParentMeshFn = int(__fastcall*)(void* co);
 using GetExtentsFn = const float*(__fastcall*)(void* co);
 using ExecuteFn = void(__fastcall*)(void* player, void* trigger, UseInfo* info);
 using ActionFn = int(__fastcall*)(void* trigger, UseInfo* info);
+using PlayStageFn = char(__fastcall*)(void* obj, int key, int a3, char jump, char force);
+using StageKeyFn = int(__fastcall*)(void* obj);
 
 SetLocalFn      g_setLocal = nullptr;
 GetLocalFn      g_getLocal = nullptr;
@@ -123,6 +133,7 @@ GetXformFn      g_getXform = nullptr;
 GetParentMeshFn g_getParentMesh = nullptr;
 GetExtentsFn    g_getExtents = nullptr;
 ExecuteFn       g_execute = nullptr;
+PlayStageFn     g_playStage = nullptr;   // null = the open jump is off (head check failed) - the open behaves as before
 uintptr_t       g_vtContainer = 0, g_vtItem = 0;
 volatile LONG   g_ready = 0;      // 0 not tried, 1 ready, -1 refused (named once)
 void* volatile  g_player = nullptr;   // the PlayerDI NearbyHook was called with (the execute's actor)
@@ -149,6 +160,11 @@ struct LidState {
     bool  writing = false;      // write every tick (off rest, owned, or released off rest)
     bool  gameClip = false;     // the game's own clip took it at the open (option A) - no write until the next grab
     bool  overwriteSaid = false;
+    // the open (trace 20261119_1310): the game's pose jumped to OPEN, our write eases from the hand's angle to it, then stops
+    bool  easing = false;
+    float easeFrom = 0.0f;
+    LONGLONG easeT0 = 0;        // QPC
+    bool  checkHold = false;    // the first tick after the ease: log the game's own pose once
 };
 LidState g_lids[kMaxLids];
 struct HandState {
@@ -163,6 +179,7 @@ struct HandState {
 HandState g_hand[2];            // 0 = right, 1 = left (RigGripWorldRead's sides)
 volatile LONG g_busy[2] = {};   // tick -> pad: this hand owns a lid / item, or is next to one
 volatile LONG g_padOwned[2] = {};   // pad -> tick: an earlier poller owns this press
+volatile LONG g_zone[2] = {};       // tick -> pad: this hand is in a lid's edge / an item's zone, or owns one (the hip yield, trace 20261119_1215)
 void* volatile g_carried[2] = {};   // tick -> HUD: the items carried (their pick is nulled)
 volatile LONG g_nGrab = 0, g_nOpen = 0, g_nTake = 0, g_nStow = 0, g_nGiveBack = 0, g_nForgot = 0, g_nOverwrite = 0, g_nNull = 0;
 
@@ -248,6 +265,22 @@ bool SafeExecute(void* player, void* trig)
     __try { g_execute(player, trig, &info); return true; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
+// The open jump (trace 20261119_1310): the key the state setter itself uses (vfunc +1416), then +EF4340 with jump + force -> the
+// container's own Open stage at its END pose. *key = -1 when the read faulted.
+bool SafeOpenJump(void* obj, int* key)
+{
+    *key = -1;
+    if (!g_playStage) { return false; }
+    __try {
+        const uintptr_t vt = *reinterpret_cast<const uintptr_t*>(obj);
+        const StageKeyFn kf = *reinterpret_cast<const StageKeyFn*>(vt + kStageKeySlotOff);
+        *key = kf(obj);
+        if (*key <= 0) { return false; }
+        g_playStage(obj, *key, 0, 1, 1);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
 bool SafeAction(void* trig, void* player, int* out)
 {
     UseInfo info{};
@@ -300,6 +333,20 @@ bool ExecHeadOk(const unsigned char* p)
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
+// +EF4340's first 14 bytes (set-aside gamedll 97046bba, read 2026-11-19 with scratchpad rvabytes.py; the same read of +B9B930 matched
+// kHead above = the control): mov [rsp+20h],rbx / push rbp / push r14 / push r15 / sub rsp,30h. Mismatch = the jump is off, named.
+bool PlayStageHeadOk(const unsigned char* p)
+{
+    static const unsigned char kHead[14] = { 0x48, 0x89, 0x5C, 0x24, 0x20, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xEC, 0x30 };
+    __try {
+        for (int i = 0; i < 14; ++i) {
+            if (p[i] != kHead[i]) { return false; }
+        }
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 // Resolve once: the engine exports by name, the execute, the two vtables by RTTI name. Refuses by name.
 bool Ready()
 {
@@ -322,6 +369,10 @@ bool Ready()
     g_vtItem = RttiFindVtable(gdb, ".?AVContainerItem@@", 0, &s2);
     g_execute = reinterpret_cast<ExecuteFn>(gdb + DLVR_LID_GD_RVA(kExecuteRva));
     const bool headOk = ExecHeadOk(reinterpret_cast<const unsigned char*>(g_execute));
+    {
+        void* ps = reinterpret_cast<void*>(gdb + DLVR_LID_GD_RVA(kPlayStageRva));
+        g_playStage = PlayStageHeadOk(static_cast<const unsigned char*>(ps)) ? reinterpret_cast<PlayStageFn>(ps) : nullptr;
+    }
     const char* missing = !g_setLocal ? "SetElementLocalMatrix" : !g_getLocal ? "GetElementLocalMatrix" : !g_getId ? "GetElementID"
                         : !g_getWorldElem ? "GetElementWorldMatrix" : !g_getParent ? "GetElementParent"
                         : !g_getMeshName ? "GetMeshName" : !g_getXform ? "GetWorldXform" : !g_getParentMesh ? "GetParentMeshElement"
@@ -336,9 +387,11 @@ bool Ready()
     InterlockedExchange(&g_ready, 1);
     // [PROBE: LIDHAND] gate=lid_by_hand  site=FLAT  log-only=no
     LOG("lidhand: [LIDHAND] READY - ComplexContainer vt +%llX (want +165A950 Steam), ContainerItem vt +%llX (want +165BA58), execute "
-        "+%llX, %d lid rows (lid_open_frac %.2f)", static_cast<unsigned long long>(g_vtContainer - gdb),
+        "+%llX, %d lid rows (lid_open_frac %.2f) | open jump +%llX %s", static_cast<unsigned long long>(g_vtContainer - gdb),
         static_cast<unsigned long long>(g_vtItem - gdb), static_cast<unsigned long long>(DLVR_LID_GD_RVA(kExecuteRva)), kRows,
-        LidOpenFrac);
+        LidOpenFrac, static_cast<unsigned long long>(DLVR_LID_GD_RVA(kPlayStageRva)),
+        g_playStage ? "ON (the lid's pose goes straight to open at the open point, ours eases it there)"
+                    : "OFF - its code does not match the Steam bytes (EGL has no row): the open plays the game's clip from its start");
     return true;
 }
 
@@ -616,7 +669,26 @@ bool LidHandOnNearby(void* player, void* const* gameData, unsigned gameCount, vo
     const uintptr_t pl = reinterpret_cast<uintptr_t>(player);
     if (!ReadPtr(pl + 5272, &h) || !h || !ReadPtr(pl + 5280, &pick) || !pick) { return false; }
     bool nullIt = pick == reinterpret_cast<uintptr_t>(g_carried[0]) || pick == reinterpret_cast<uintptr_t>(g_carried[1]);
-    for (int k = 0; k < nl && !nullIt; ++k) { nullIt = reinterpret_cast<uintptr_t>(lids[k]) == pick; }
+    for (int k = 0; k < nl && !nullIt; ++k) {
+        if (reinterpret_cast<uintptr_t>(lids[k]) != pick) { continue; }
+        // A LOCKED lid container keeps the game's own prompt (trace 20261119_1135, Jay "Go ahead"): X runs the game's lockpick
+        // (OnExecuteTrigger action 60 in state 10 -> +EF79F0); a successful pick sets state 2 (+A6E520) -> nulled again, the hand opens it.
+        if (State(lids[k]) == kStateLocked) {
+            static void* s_lockedSaid[4] = {};
+            static LONG  s_lockedPass = 0;
+            bool said = false;
+            for (void* p : s_lockedSaid) { said = said || p == lids[k]; }
+            if (!said && s_lockedPass < 4) {
+                s_lockedSaid[s_lockedPass++] = lids[k];
+                // [PROBE: LIDHAND] gate=lid_by_hand  site=HEADSET  log-only=no
+                LOG("lidhand: [LIDHAND] LOCKED - %s %p is locked (state 10): its prompt is left to the game (the lockpick); after a "
+                    "successful pick it is closed (state 2) and opens by hand (%ld of 4 objects logged)",
+                    kLidHinges[rows[k]].object, lids[k], s_lockedPass);
+            }
+            continue;
+        }
+        nullIt = true;
+    }
     if (nullIt && InterlockedIncrement(&g_nNull) == 1) {
         // [PROBE: LIDHAND] gate=lid_by_hand  site=HEADSET  log-only=no
         LOG("lidhand: [LIDHAND] FIRST NULL PICK - the game picked %p (a lid container / a carried item): its prompt and X are "
@@ -629,6 +701,7 @@ void LidHandTick()
 {
     if (!LidByHand || g_ready != 1 || !g_player) {
         g_busy[0] = g_busy[1] = 0;
+        g_zone[0] = g_zone[1] = 0;
         return;
     }
     Snapshot s;
@@ -653,6 +726,7 @@ void LidHandTick()
         float hw[3];
         const bool haveHand = HandWorldPos(side, hw);
         bool isNear = false;   // (not `near`: windows.h defines near / far as empty macros)
+        bool inZone = false;   // g_zone[side] at the end of this tick (trace 20261119_1215: the hip holsters yield to it)
         // ---- a carried item ----
         if (H.item) {
             if (!IsVt(H.itemOwner, g_vtContainer) || State(H.itemOwner) != kStateOpened || !HandCarryStillOn(H.carry)) {
@@ -661,6 +735,7 @@ void LidHandTick()
                 ReleaseItem(side, false);
             }
             isNear = H.item != nullptr;
+            inZone = isNear;
         }
         // ---- an owned lid ----
         if (H.lid >= 0) {
@@ -677,16 +752,35 @@ void LidHandTick()
                 const float deg = lh::ClampLid(H.lidAtGrab + lh::HandAngleDeg(pivotW, axisW, H.grabW, hw), openDeg);
                 WriteLid(L, deg);
                 isNear = true;
+                inZone = true;
                 if (lh::CrossesOpenPoint(prev, deg, openDeg, LidOpenFrac) && State(L.obj) == kStateClosed) {
                     const bool ok = SafeExecute(g_player, L.obj);
                     const int st = State(L.obj);
                     InterlockedIncrement(&g_nOpen);
+                    // trace 20261119_1310 (RUN LH7: "It'll open to X height, then close and do the games open animation again"): the
+                    // execute's setter plays the lid's Open stage FROM ITS START; jump it to its END pose and ease ours there instead.
+                    int key = -1;
+                    const bool jumped = ok && st == kStateOpened && SafeOpenJump(L.obj, &key);
                     // [PROBE: LIDHAND] gate=lid_by_hand  site=HEADSET  log-only=no
                     LOG("lidhand: [LIDHAND] OPEN CALL %s %p at %.1f deg (open point %.1f): the game's own execute (+B9B930, action 6) %s"
-                        " -> state %d (want 1) - option A: the hand lets go, the game's own lid clip finishes the swing",
-                        kLidHinges[L.row].object, L.obj, deg, LidOpenFrac * openDeg, ok ? "called" : "*** FAULTED ***", st);
-                    L.gameClip = true;
-                    L.writing = false;
+                        " -> state %d (want 1) | open jump (stage key %d): %s - the hand lets go",
+                        kLidHinges[L.row].object, L.obj, deg, LidOpenFrac * openDeg, ok ? "called" : "*** FAULTED ***", st, key,
+                        jumped ? "the game's pose JUMPED to open, ours eases there from the hand's angle"
+                        : !g_playStage ? "OFF (see READY) - the game's clip plays from its start"
+                        : st != kStateOpened ? "not tried (state is not 1)"
+                        : "*** REFUSED / FAULTED (no stage key or the call faulted) *** - the game's clip plays from its start");
+                    if (jumped) {
+                        L.easing = true;
+                        L.easeFrom = deg;
+                        LARGE_INTEGER q;
+                        QueryPerformanceCounter(&q);
+                        L.easeT0 = q.QuadPart;
+                        L.writing = true;
+                        L.gameClip = false;
+                    } else {
+                        L.gameClip = true;
+                        L.writing = false;
+                    }
                     H.lid = -1;
                 }
             }
@@ -714,7 +808,18 @@ void LidHandTick()
             for (int i = 0; i < s.nl; ++i) {
                 dl[i] = -1.0f;
                 const int st = State(s.lid[i]);
-                if (st == kStateLocked || (st != kStateClosed && st != kStateOpened)) { continue; }
+                if (st == kStateLocked) {
+                    // the grab stays refused on a locked lid - and now says so (trace 20261119_1135; it was silent in RUN LH3)
+                    static LONG s_lockedGrab = 0;
+                    if (edge && haveEdge[i] && lh::SegDist(edgeA[i], edgeB[i], hw) <= kLidEdgeReachM &&
+                        InterlockedIncrement(&s_lockedGrab) <= 8) {
+                        // [PROBE: LIDHAND] gate=lid_by_hand  site=HEADSET  log-only=no
+                        LOG("lidhand: [LIDHAND] GRAB REFUSED - LOCKED: %s hand on %s %p (state 10) - pick the lock first (the game's "
+                            "prompt) (%ld of 8 logged)", kSideName[side], kLidHinges[s.row[i]].object, s.lid[i], s_lockedGrab);
+                    }
+                    continue;
+                }
+                if (st != kStateClosed && st != kStateOpened) { continue; }
                 // THE LID ZONE (trace 20261118_2010): within kLidEdgeReachM of the lid's far edge, wherever the lid is now
                 if (!haveEdge[i]) { continue; }
                 dl[i] = lh::SegDist(edgeA[i], edgeB[i], hw);
@@ -728,6 +833,7 @@ void LidHandTick()
                 PulseController(side == 0 ? kRightHand : kLeftHand, RigTwoHandHaptic * 0.35f, 15);
             }
             H.prevZone = zone;
+            inZone = inZone || zone;
             if (edge && !g_padOwned[side] && bi >= 0 && body) {
                 void* item = s.item[bi];
                 uintptr_t owner = 0;
@@ -761,6 +867,8 @@ void LidHandTick()
                     L.deg = H.lidAtGrab;
                     L.gameClip = false;
                     L.writing = true;
+                    L.easing = false;      // a grab mid-ease takes the lid from our eased angle (trace 20261119_1310)
+                    L.checkHold = false;
                     InterlockedIncrement(&g_nGrab);
                     if (RigTwoHandHaptic > 0.0f) { PulseController(side == 0 ? kRightHand : kLeftHand, RigTwoHandHaptic, 40); }
                     const float em[3] = { (edgeA[bl][0] + edgeB[bl][0]) / 2, (edgeA[bl][1] + edgeB[bl][1]) / 2,
@@ -776,8 +884,34 @@ void LidHandTick()
                         k < 0 ? "no free lid slot" : "the hinge / lid local did not read");
                 }
             }
+            // A MISS names itself (trace 20261119_1215; RUN LH5's 13 unowned presses logged nothing): a grip edge that started no
+            // grab / take with a lid edge or an item within 1.5 m. Raw distances (every published lid / item, whatever its state).
+            if (edge && H.lid < 0 && !H.item) {
+                float ml = -1.0f, mi = -1.0f;
+                int li = -1;
+                for (int i = 0; i < s.nl; ++i) {
+                    if (!haveEdge[i]) { continue; }
+                    const float d = lh::SegDist(edgeA[i], edgeB[i], hw);
+                    if (ml < 0.0f || d < ml) { ml = d; li = i; }
+                }
+                for (int i = 0; i < s.ni; ++i) {
+                    const float d = looting::BoxDist(s.ibox[i], hw);
+                    if (mi < 0.0f || d < mi) { mi = d; }
+                }
+                static LONG s_miss = 0;
+                if (((ml >= 0.0f && ml < 1.5f) || (mi >= 0.0f && mi < 1.5f)) && InterlockedIncrement(&s_miss) <= 40) {
+                    // [PROBE: LIDHAND] gate=lid_by_hand  site=HEADSET  log-only=no
+                    LOG("lidhand: [LIDHAND] MISS %s hand press: nearest lid edge %.3f m (%s, state %d; zone %.2f), nearest item %.3f m "
+                        "(reach %.2f; item %s) | press owned elsewhere %ld (a holster / two-hand / reload / loot took it) | in a zone %d "
+                        "(%ld of 40 logged)", kSideName[side], ml, li >= 0 ? kLidHinges[s.row[li]].object : "none",
+                        li >= 0 ? State(s.lid[li]) : -1, kLidEdgeReachM, mi, LootReachM,
+                        bi >= 0 ? "in reach" : "none in reach (closed / below the open point / not open)", g_padOwned[side],
+                        zone ? 1 : 0, s_miss);
+                }
+            }
         }
         InterlockedExchange(&g_busy[side], isNear ? 1 : 0);
+        InterlockedExchange(&g_zone[side], inZone ? 1 : 0);
     }
     // ---- lids released off rest keep their angle (visual only), until the game's clip owns them or they are far ----
     float any[3];
@@ -786,6 +920,38 @@ void LidHandTick()
         LidState& L = g_lids[i];
         if (!L.obj || g_hand[0].lid == i || g_hand[1].lid == i) { continue; }
         if (!IsVt(L.obj, g_vtContainer)) { L = LidState{}; continue; }
+        // the tick after the ease (nothing of ours written since): the game's own pose, once per object (trace 20261119_1310)
+        if (L.checkHold) {
+            L.checkHold = false;
+            float gameDeg = -1.0f;
+            const bool read = LidNowDeg(L, &gameDeg);
+            static LONG s_hold = 0;
+            if (InterlockedIncrement(&s_hold) <= 8) {
+                // [PROBE: LIDHAND] gate=lid_by_hand  site=HEADSET  log-only=no
+                LOG("lidhand: [LIDHAND] HOLD %s %p - after the ease the game's own pose reads %s%.1f deg (open angle %.1f; ~open = the "
+                    "jump held, ~0 = it fell back closed) | state %d (%ld of 8 logged)", kLidHinges[L.row].object, L.obj,
+                    read ? "" : "*** UNREAD *** ", gameDeg, kLidHinges[L.row].openDeg, State(L.obj), s_hold);
+            }
+        }
+        if (L.easing) {
+            // from the hand's angle to the open angle over kOpenEaseS (smoothstep), then the game's jumped pose holds it
+            static LONGLONG s_freq = 0;
+            if (!s_freq) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); s_freq = f.QuadPart; }
+            LARGE_INTEGER q;
+            QueryPerformanceCounter(&q);
+            const float t = static_cast<float>(static_cast<double>(q.QuadPart - L.easeT0) / static_cast<double>(s_freq)) / kOpenEaseS;
+            if (t >= 1.0f) {
+                L.easing = false;
+                L.writing = false;
+                L.gameClip = true;
+                L.checkHold = true;
+                continue;
+            }
+            const float u = t <= 0.0f ? 0.0f : t * t * (3.0f - 2.0f * t);
+            L.deg = L.easeFrom + (kLidHinges[L.row].openDeg - L.easeFrom) * u;
+            WriteLid(L, L.deg);
+            continue;
+        }
         if (!L.writing || L.gameClip) { continue; }
         float box[6];
         if (haveAny && SafeBox(L.obj, box) && looting::BoxDist(box, any) > kDropDistM) { L.writing = false; continue; }
@@ -804,6 +970,12 @@ void LidHandPoll(bool vrGrip, bool leftOwned, bool rightOwned, bool& withholdL1,
     InterlockedExchange(&g_padOwned[0], downR && rightOwned ? 1 : 0);
     withholdL1 = downL && !leftOwned && g_busy[1] != 0;
     withholdR1 = downR && !rightOwned && g_busy[0] != 0;
+}
+
+bool LidHandHandInZone(int side)
+{
+    if (!LidByHand || g_ready != 1 || side < 0 || side > 1) { return false; }
+    return g_zone[side] != 0;
 }
 
 }  // namespace dlvr

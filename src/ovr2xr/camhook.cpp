@@ -25,6 +25,7 @@
 #include "swing.h"
 #include "meleethrow.h"
 #include "lockpitch.h"  // LockPitchInstall - lockpick position P1 (the lockpick look asks for the head's pitch)
+#include "pelvisturn.h" // PelvisTurnInstall - the lower body turns with the stick when looking down (INV-749)
 #include "dlgview.h"    // DlgViewInstall - a dialogue's view gets the cam_eye_* offset it gets on foot (INV-619)
 #include "boltwheel.h"  // BoltWheelInstall - the crossbow bolt wheel from the bolt holster (INV-678)
 #include "invkeep.h"    // InvKeepInstall - the inventory keeps its built list between unchanged opens (INV-526 addendum 2026-11-14)
@@ -5702,6 +5703,9 @@ DWORD WINAPI Thread(LPVOID)
         dlvr::ThrowTick();
         // Lockpick position P1 (lockpitch.cpp): one vtable slot swap, once; retried here until the gamedll is mapped.
         dlvr::LockPitchInstall();
+        // The lower body turns with the stick when looking down (pelvisturn.cpp, INV-749, trace 20261119_1530): one vtable slot swap,
+        // once; retried here until the gamedll is mapped. A fix, no key.
+        dlvr::PelvisTurnInstall();
         // The dialogue view offset (dlgview.cpp, INV-619): one vtable slot swap, once; retried here until the gamedll is mapped.
         dlvr::DlgViewInstall();
         // The crossbow bolt wheel (boltwheel.cpp, INV-678): one detour + one vtable slot swap, once; retried here until the gamedll is

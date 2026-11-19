@@ -54,6 +54,9 @@ struct Feed {
     Vec3 back{ 0.0f, 0.0f, 0.0f };   // "toward the body" in the Feed's space; zero = unknown (every older test)
     bool ruleOff = false;             // true = melee_swing_return_ms 0
     bool towardOn = false;            // true = melee_swing_refuse_toward_body 1 (Option A)
+    bool gripKnown = false;           // fix 5: the right grip state fed to Sample (false = unknown, every older test)
+    bool gripDown = false;
+    ZoneExit lastZoneExit = ZoneExit::None;   // fix 5: the LAST step's non-None zoneExit
     Step Go(const Vec3& velMps, int n, bool holster = false, bool poseOk = true)
     {
         Step st{};
@@ -63,10 +66,12 @@ struct Feed {
             p = { p.x + velMps.x * static_cast<float>(kDt / 1000.0) + j,
                   p.y + velMps.y * static_cast<float>(kDt / 1000.0),
                   p.z + velMps.z * static_cast<float>(kDt / 1000.0) };
-            st = d.Update({ t, p, poseOk, holster, back }, towardOn ? PTow() : (ruleOff ? POff() : P()));
+            st = d.Update({ t, p, poseOk, holster, back, gripKnown, gripDown },
+                          towardOn ? PTow() : (ruleOff ? POff() : P()));
             if (st.fired) { ++fires; fireTravel = st.travelM; }
             if (st.ended) { ++ends; reasons.push_back(st.reason); }
             if (st.dropped) { ++dropped; lastDrop = st; }
+            if (st.zoneExit != ZoneExit::None) { lastZoneExit = st.zoneExit; }
         }
         return st;
     }
@@ -183,6 +188,107 @@ static void holster_zone_never_fires_and_ends_active()
     SlashUntilFire(g);
     const Step st = g.Go(kSlashR, 1, true);
     CHECK(st.ended && st.reason == End::Holster && st.holsterRefused);
+}
+
+// Fix 5 (HANDOFF-MELEE-FIXES-2026-11-19 #5): a wind-up through the shoulder zone, grip known and never pressed, that leaves
+// the zone already fast - the exit is ARMED and the stroke fires. Before the fix: Idle, 0 fires (the mutation check below).
+static void zone_exit_without_press_fires_a_fast_stroke()
+{
+    Feed f;
+    f.gripKnown = true;
+    f.Go(kStill, 20);
+    f.Go(kSlashR, 8, true);                  // moving fast inside the zone
+    const Step ex = f.Go(kSlashR, 1);         // the first sample out
+    CHECK(ex.zoneExit == ZoneExit::Armed);
+    CHECK(ex.state == State::Armed);
+    CHECK(!ex.speedValid);                    // the ring was cleared in the zone - no verdict on the exit sample
+    f.Go(kSlashR, 25);                        // never slows below armSpeed
+    CHECK(f.fires == 1);
+}
+
+// A grip PRESS inside the zone (a draw / stow) keeps the old rule: Idle on exit, the fast pull out never fires; a later
+// slash after the hand slows does.
+static void zone_exit_after_a_press_stays_idle()
+{
+    Feed f;
+    f.gripKnown = true;
+    f.Go(kStill, 20);
+    f.Go(kStill, 5, true);
+    f.gripDown = true;                        // press inside the zone
+    f.Go(kStill, 5, true);
+    f.Go(kSlashR, 3, true);
+    const Step ex = f.Go(kSlashR, 1);
+    CHECK(ex.zoneExit == ZoneExit::IdlePressed);
+    CHECK(ex.state == State::Idle);
+    f.Go(kSlashR, 25);
+    CHECK(f.fires == 0);
+    f.gripDown = false;
+    f.Go(kStill, 20);
+    f.Go(kSlashR, 25);
+    CHECK(f.fires == 1);
+}
+
+// A grip already held when the hand enters is not a press (the holster treats it as a normal press too): exit ARMED.
+static void zone_exit_with_a_held_grip_entering_is_armed()
+{
+    Feed f;
+    f.gripKnown = true;
+    f.gripDown = true;
+    f.Go(kStill, 20);
+    f.Go(kSlashR, 8, true);
+    f.Go(kSlashR, 25);
+    CHECK(f.lastZoneExit == ZoneExit::Armed);
+    CHECK(f.fires == 1);
+}
+
+// The grip state unknown inside the zone (every older test's Feed) keeps the old rule.
+static void zone_exit_with_unknown_grip_stays_idle()
+{
+    Feed f;
+    f.Go(kStill, 20);
+    f.Go(kSlashR, 8, true);
+    f.Go(kSlashR, 25);
+    CHECK(f.lastZoneExit == ZoneExit::IdleUnknown);
+    CHECK(f.fires == 0);
+
+    // unknown on only ONE in-zone sample is enough
+    Feed g;
+    g.gripKnown = true;
+    g.Go(kStill, 20);
+    g.Go(kSlashR, 4, true);
+    g.gripKnown = false;
+    g.Go(kSlashR, 1, true);
+    g.gripKnown = true;
+    g.Go(kSlashR, 3, true);
+    g.Go(kSlashR, 25);
+    CHECK(g.lastZoneExit == ZoneExit::IdleUnknown);
+    CHECK(g.fires == 0);
+}
+
+// A pose loss after the zone visit: tracking resumes Idle (spec §2.1) - no zone exit is reported, nothing fires in motion.
+static void pose_lost_after_zone_visit_resumes_idle()
+{
+    Feed f;
+    f.gripKnown = true;
+    f.Go(kStill, 20);
+    f.Go(kSlashR, 8, true);
+    f.Go(kSlashR, 2, false, false);
+    f.Go(kSlashR, 25);
+    CHECK(f.lastZoneExit == ZoneExit::None);
+    CHECK(f.fires == 0);
+}
+
+// A plain visit with a still hand exits ARMED, and a still hand never fires.
+static void zone_exit_armed_still_hand_never_fires()
+{
+    Feed f;
+    f.gripKnown = true;
+    f.Go(kStill, 20);
+    f.Go(kStill, 10, true);
+    f.Go(kStill, 60);
+    CHECK(f.lastZoneExit == ZoneExit::Armed);
+    CHECK(f.fires == 0);
+    CHECK(f.d.state() == State::Armed);
 }
 
 static void pose_lost_ends_swing_and_needs_rearm()
@@ -690,6 +796,12 @@ int main()
     reversal_is_two_swings();
     max_duration_ends_and_does_not_refire_while_moving();
     holster_zone_never_fires_and_ends_active();
+    zone_exit_without_press_fires_a_fast_stroke();
+    zone_exit_after_a_press_stays_idle();
+    zone_exit_with_a_held_grip_entering_is_armed();
+    zone_exit_with_unknown_grip_stays_idle();
+    pose_lost_after_zone_visit_resumes_idle();
+    zone_exit_armed_still_hand_never_fires();
     pose_lost_ends_swing_and_needs_rearm();
     non_finite_is_refused_like_pose_loss();
     blocked_ends_swing_and_needs_rearm();

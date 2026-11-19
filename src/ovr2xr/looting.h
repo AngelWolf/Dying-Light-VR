@@ -26,7 +26,7 @@ void LootPoll(bool vrGrip, bool leftOwned, bool rightOwned, bool& withholdL1, bo
 // LootPoll), on a hip press edge (pressEdge true - starts the wait clock) and while that press is Pending. hand 0 = LEFT, 1 = RIGHT.
 // Yes = a body / severed limb under the hand takes the press; Pending = the limb reading is due; No = the holster fires (also
 // loot_by_hand off / not installed / no hand pose). outDist = that body's / limb's distance (-1 = none), outLimb = it is a limb,
-// outWaitS = seconds since the edge.
+// outWaitS = seconds since the edge. (A lid / chest item under the hand is asked of lidhand by the hips BEFORE this - trace 20261119_1240.)
 holster::Yield LootYieldAt(int hand, bool pressEdge, float* outDist, bool* outLimb, double* outWaitS);
 
 // Right grip camouflage block (Jay 10-23 (3), option 1; no key - always on): once per scePad poll, AFTER LootPoll and BEFORE the grip

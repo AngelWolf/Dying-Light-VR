@@ -10541,6 +10541,11 @@ HOut VSRigidHeldB(RInB v) { return heldOf(v.pos, v.w0, v.w1, v.w2, v.iid); }
 HOut VSRigidHeldC(RInC v) { return heldOf(v.pos, v.w0, v.w1, v.w2, v.iid); }
 HOut VSRigidHeldD(RInD v) { return heldOf(v.pos, v.w0, v.w1, v.w2, v.iid); }
 HOut VSRigidHeldE(RInE v) { return heldOf(v.pos, v.w0, v.w1, v.w2, v.iid); }
+// form C1 (2026-11-19, INV-751): form C with TEXCOORD1 at v3, so the rows TEXCOORD4..6 sit at v4..v6 - the 36 C1 shaders' signature
+// copied register for register (OUR pack, e.g. the machete's bloody blade dc9f5576)
+struct RInC1 { float4 pos : POSITION; float3 n : NORMAL; float2 uv : TEXCOORD0; float2 uv1 : TEXCOORD1;
+               float4 w0 : TEXCOORD4; float4 w1 : TEXCOORD5; float4 w2 : TEXCOORD6; float4 w3 : TEXCOORD7; uint iid : SV_InstanceID; };
+HOut VSRigidHeldC1(RInC1 v) { return heldOf(v.pos, v.w0, v.w1, v.w2, v.iid); }
 struct SOut { float4 p : SV_Position; nointerpolation float4 r0 : TEXCOORD0; nointerpolation float4 r1 : TEXCOORD1;
               nointerpolation float4 r2 : TEXCOORD2; };
 SOut saveOf(float4 w0, float4 w1, float4 w2, uint iid) {
@@ -10555,6 +10560,7 @@ SOut VSRowSaveB(RInB v) { return saveOf(v.w0, v.w1, v.w2, v.iid); }
 SOut VSRowSaveC(RInC v) { return saveOf(v.w0, v.w1, v.w2, v.iid); }
 SOut VSRowSaveD(RInD v) { return saveOf(v.w0, v.w1, v.w2, v.iid); }
 SOut VSRowSaveE(RInE v) { return saveOf(v.w0, v.w1, v.w2, v.iid); }
+SOut VSRowSaveC1(RInC1 v) { return saveOf(v.w0, v.w1, v.w2, v.iid); }
 struct SPs { float4 a : SV_Target0; float4 b : SV_Target1; float4 c : SV_Target2; };
 SPs PSRowSave(SOut i) { SPs o; o.a = i.r0; o.b = i.r1; o.c = i.r2; return o; }
 )";
@@ -10569,6 +10575,8 @@ ID3D11VertexShader*       g_rwHeldVSD = nullptr;   // forms D / E (the buggy, 20
 ID3D11VertexShader*       g_rwSaveVSD = nullptr;   // stays world, the other forms are untouched
 ID3D11VertexShader*       g_rwHeldVSE = nullptr;
 ID3D11VertexShader*       g_rwSaveVSE = nullptr;
+ID3D11VertexShader*       g_rwHeldVSC1 = nullptr;  // form C1 (INV-751) - compiled on its own: null = that form stays world
+ID3D11VertexShader*       g_rwSaveVSC1 = nullptr;
 ID3D11PixelShader*        g_rwSavePS = nullptr;
 ID3D11Buffer*             g_rwCb = nullptr;
 ID3D11RasterizerState*    g_rwRs = nullptr;
@@ -10705,6 +10713,29 @@ bool RwEnsure()
                 SUCCEEDED(hde) ? "CREATED" : "REFUSED - those two forms stay world", static_cast<unsigned long>(hde),
                 FAILED(hde) ? " at " : "", whatDE);
         }
+        // form C1 (INV-751, trace 20261119_1840): its own compile, as D / E - a failure leaves C1 world and nothing else
+        if (SUCCEEDED(hr)) {
+            static const char* const kEpC1[2] = { "VSRigidHeldC1", "VSRowSaveC1" };
+            ID3D11VertexShader** const outC1[2] = { &g_rwHeldVSC1, &g_rwSaveVSC1 };
+            HRESULT hc1 = S_OK;
+            const char* whatC1 = "";
+            for (int i = 0; i < 2 && SUCCEEDED(hc1); ++i) {
+                ID3DBlob* b = nullptr;
+                ID3DBlob* e = nullptr;
+                hc1 = ::dlvr::shaderbin::Compile(kRwHlsl, strlen(kRwHlsl), "afwrw", nullptr, nullptr, kEpC1[i], "vs_5_0", 0, 0, &b, &e);
+                if (SUCCEEDED(hc1)) { hc1 = g_device->CreateVertexShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, outC1[i]); }
+                if (FAILED(hc1)) { whatC1 = kEpC1[i]; }
+                if (b) { b->Release(); }
+                if (e) { e->Release(); }
+            }
+            if (FAILED(hc1)) {
+                for (int i = 0; i < 2; ++i) { if (*outC1[i]) { (*outC1[i])->Release(); *outC1[i] = nullptr; } }
+            }
+            // [PROBE: AFWHM] gate=afw_rb_fg_move_weapon + afw_rb_fg_mask + afw_rebuild + afw_alt_eye (once, at the weapon resources)  site=HEADSET  log-only=yes
+            LOG("[AFWHM] rigid C1 held-pose VS (TEXCOORD1 at v3, rows v4..v6 - INV-751): %s 0x%08lX%s%s",
+                SUCCEEDED(hc1) ? "CREATED" : "REFUSED - that form stays world", static_cast<unsigned long>(hc1),
+                FAILED(hc1) ? " at " : "", whatC1);
+        }
         if (SUCCEEDED(hr) && !g_rwCb) {   // HmEnsure makes it first when the morph VS compiled (audit S04 4e-1) - reuse that one
             what = "constant buffer";
             D3D11_BUFFER_DESC bd = {};
@@ -10757,10 +10788,11 @@ void RwDraw(ID3D11DeviceContext* ctx, int slot, int hs, bool heldOk, int form, i
     // rigid weapon draw both were null, the row-save draw ran with NO vertex shader bound, and NVIDIA's driver crashed
     // (nvwgf2umx.dll +0x1E5EFF, 2026-10-07 13:11:44, ~100 ms after "WEAPON held-pose resources CREATED"). Never draw without one.
     // form 3 = rigid D, 4 = rigid E (the buggy, 2026-10-28; null when their own compile failed -> counted below, not drawn)
-    ID3D11VertexShader* const heldVs = form == 4 ? g_rwHeldVSE : form == 3 ? g_rwHeldVSD : form == 2 ? g_rwHeldVSC
-                                     : form == 1 ? g_rwHeldVSB : g_rwHeldVS;
-    ID3D11VertexShader* const saveVs = form == 4 ? g_rwSaveVSE : form == 3 ? g_rwSaveVSD : form == 2 ? g_rwSaveVSC
-                                     : form == 1 ? g_rwSaveVSB : g_rwSaveVS;
+    // form 5 = rigid C1 (INV-751; null when its own compile failed -> counted below, not drawn)
+    ID3D11VertexShader* const heldVs = form == 5 ? g_rwHeldVSC1 : form == 4 ? g_rwHeldVSE : form == 3 ? g_rwHeldVSD
+                                     : form == 2 ? g_rwHeldVSC : form == 1 ? g_rwHeldVSB : g_rwHeldVS;
+    ID3D11VertexShader* const saveVs = form == 5 ? g_rwSaveVSC1 : form == 4 ? g_rwSaveVSE : form == 3 ? g_rwSaveVSD
+                                     : form == 2 ? g_rwSaveVSC : form == 1 ? g_rwSaveVSB : g_rwSaveVS;
     if (!heldVs || !saveVs || !g_rwSavePS || !g_hmPS) { ++g_rwTooMany; return; }
     if (idx < 0 || idx >= kMax || instances > static_cast<UINT>(kRwInst)) { ++g_rwTooMany; return; }
     D3D11_MAPPED_SUBRESOURCE m = {};
@@ -10992,7 +11024,9 @@ void HmDraw(ID3D11DeviceContext* ctx, int slot, int idx, UINT count, UINT start,
     constexpr bool kSkinColorHeld = false;
     const bool formD = !kColorFormsHeld && items && !listed && cls == vsclass::kRigidD && g_rwHeldVSD != nullptr;
     const bool formE = !kColorFormsHeld && items && !listed && cls == vsclass::kRigidE && g_rwHeldVSE != nullptr;
-    const bool rigid = formA || formB || formC || formD || formE;
+    // INV-751: form C1 (TEXCOORD1 at v3, rows v4..v6) - only when its own compile succeeded
+    const bool formC1 = items && !listed && cls == vsclass::kRigidC1 && g_rwHeldVSC1 != nullptr;
+    const bool rigid = formA || formB || formC || formD || formE || formC1;
     // INV-474: s3875's form (the revolver's body) - one bone, weight 1, via VSHeld1 (only if it compiled)
     const bool skin1 = items && !listed && cls == vsclass::kSkinned1 && g_hmVS1 != nullptr;
     // 2026-10-28: the buggy's skinned-colour form (e40d02f6) via VSHeldC (only if it compiled)
@@ -11014,6 +11048,7 @@ void HmDraw(ID3D11DeviceContext* ctx, int slot, int idx, UINT count, UINT start,
             : formC ? "moved - rigid C (classifier)"
             : formD ? "moved - rigid D (classifier)"
             : formE ? "moved - rigid E (classifier)"
+            : formC1 ? "moved - rigid C1 (classifier)"
             : skin1 ? "moved - single-bone skinned (classifier)"
             : skinC ? "moved - skinned-colour (classifier)"
             : skinItem ? (listS ? "moved - skinned (hand-read list)" : "moved - skinned (classifier)")
@@ -11095,7 +11130,7 @@ void HmDraw(ID3D11DeviceContext* ctx, int slot, int idx, UINT count, UINT start,
     if (rigid && g_npcRedraw) { ++g_npcRigid; return; }   // an NPC draw has no row column
     // the weapon saves its rows even when the held matrix is missing - the NEXT image needs them
     if (rigid) {
-        const int form = formE ? 4 : formD ? 3 : formC ? 2 : formB ? 1 : 0;
+        const int form = formC1 ? 5 : formE ? 4 : formD ? 3 : formC ? 2 : formB ? 1 : 0;
         RwDraw(ctx, slot, hs, heldOk, form, idx, count, start, base, instances, startInstance);
         return;
     }

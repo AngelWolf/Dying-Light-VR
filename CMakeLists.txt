@@ -174,6 +174,8 @@ add_library(LibOVRRT64_1 SHARED
     ${SRC_ROOT}/ovr2xr/buggywheel.cpp
     # Lockpick position P1 (spec 2026-10-25-lockpick-position-p1-design): the lockpick look asks for the head's pitch.
     ${SRC_ROOT}/ovr2xr/lockpitch.cpp
+    # The lower body turns with the stick when looking down (INV-749, trace 20261119_1530): PlayerFppVis slot 270 swap.
+    ${SRC_ROOT}/ovr2xr/pelvisturn.cpp
     # Dialogue view offset (spec 2026-10-25-dialogue-view-offset-design, INV-619): DialogController's look position gets the
     # cam_eye_* offset the camera base gets on foot.
     ${SRC_ROOT}/ovr2xr/dlgview.cpp
@@ -234,6 +236,19 @@ target_compile_definitions(LibOVRRT64_1 PRIVATE
     WIN32_LEAN_AND_MEAN
     NOMINMAX
 )
+# The swing probe (trace docs/traces/20261119_1730_swing_probe.md, Jay 2026-11-19: "Setup the probe then. We need everything from
+# this run"): a SEPARATE build folder (src_beta/build_probe, tools/deploy_variant.py probe) configured with -DDLVR_SWING_PROBE=ON
+# compiles diag_swing_shadow ([SWINGSHADOW] / [SWINGMISS] / [SWINGAI]) back into the layer; the normal BETA build (OFF) is unchanged.
+option(DLVR_SWING_PROBE "Diagnostic build only: the melee swing shadow / miss / AI-list probe in the layer" OFF)
+if(DLVR_SWING_PROBE)
+    target_compile_definitions(LibOVRRT64_1 PRIVATE DLVR_SWING_PROBE=1)
+endif()
+# The yaw-step probe (trace docs/traces/20261119_2145_yawstep_probe.md, RUN WK1 - the wall-kick spin; Jay: "Beta probe."): the same
+# build_probe folder, configured -DDLVR_SWING_PROBE=OFF -DDLVR_YAW_PROBE=ON, compiles diag_cam_yaw ([YAWSTEP] / [CAMYAW]) back in.
+option(DLVR_YAW_PROBE "Diagnostic build only: the [YAWSTEP] / [CAMYAW] yaw probe (diag_cam_yaw) in the layer" OFF)
+if(DLVR_YAW_PROBE)
+    target_compile_definitions(LibOVRRT64_1 PRIVATE DLVR_YAW_PROBE=1)
+endif()
 # BETA LEAN (spec docs/superpowers/specs/2026-10-18-beta-leak-hardening-design.md section 6.1): compiles the periodic logs,
 # help text and arm capture out. BOTH DLLs; only this tree's CMakeLists has it. (Log lines are plain text since 2026-11-14.)
 if(DLVR_BETA_BUILD)

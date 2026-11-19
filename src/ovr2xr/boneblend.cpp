@@ -45,6 +45,7 @@
 #include "headpose.h"
 #include "cinlook.h"         // CinLookArmed / CinLookReport - the cutscene look fix (INV-620 (a)); (c) refuses without it
 #include "cinyaw_logic.h"    // cinyaw::Update - the cutscene head turn's snap and hand-back (INV-620 (c))
+#include "heldmesh_logic.h"  // heldmesh::Step - element-number caches follow an in-place damage-stage swap (INV-751, trace 20261119_1840)
 #include "holster.h"         // HolsterPelvisPublish - the holster body-lock (2026-10-20)
 #include "holster_logic.h"   // holster::TrackingFromWorld
 #include "meleethrow.h"   // ThrowViewPhase - the VIEWBODY probe's throw buckets
@@ -1719,7 +1720,7 @@ bool  DiagHeadTurn = false;
 //      ALSO required-for=[YAWSTEP] (2026-10-01, INV-328: does the engine copy the head-inclusive +4460 back onto the
 //      body look / facing?). Log-only: two engine selector calls (BA0F70, BB7BF0) + four float reads per local player
 //      update while ON; nothing while OFF. Needs snap::g_select resolved by camyaw::Install - refuses by name otherwise.
-#if !defined(DLVR_BETA_LEAN)   // BETA lean: constexpr false in boneblend.h (docs/BETA_CENSUS.md)
+#if !defined(DLVR_BETA_LEAN) || defined(DLVR_YAW_PROBE)   // BETA lean: constexpr false in boneblend.h; back in the yaw probe variant (trace 20261119_2145)
 bool  DiagCamYaw = false;
 #endif
 // [DEP: head_yaw_look_enable_fix] required-for=design D keeping the BODY look free of the head yaw across player state
@@ -9862,6 +9863,40 @@ void GunHandPublish(uintptr_t item, int holderId, const char* cls, const float* 
     InterlockedIncrement(&g_ghSeq);   // even: done
 }
 
+// [PROBE: REACTGRIP] gate=diag_rel_dev,diag_bone_dump,diag_bone_blend_probe,diag_bone_blend_verbose  site=HEADSET  log-only=yes
+// [REACTGRIP] (rides diag_rel_dev; Jay 2026-11-19 "Go ahead"; trace docs/traces/20261119_2025_reactgrip_probe.md) - THE WEAPON vs THE
+// HAND WHILE THE PLAYER IS HIT / KNOCKED DOWN / DODGING. Shared state between the player update (reldev::RgxStep owns the event), the
+// right arm solve (publishes the camera yaw and the final bodyYaw) and the render thread (ReactGripGunSample adds the weapon-vs-drawn-
+// hand peaks while an event runs). Single-word atomics only, no locks. Peaks are stored as mm x 10 / deg x 100.
+volatile LONG   g_rgxActive   = 0;            // 1 while an event runs (player update writes, render thread reads)
+volatile LONG64 g_rgxYaw      = 0;            // low 32 bits = the raw camera yaw (camYawAtEntry), high 32 = the FINAL bodyYaw (rad)
+volatile LONG   g_rgxYawSeen  = 0;            // 1 once the right arm solve has published
+volatile LONG   g_rgxGunN     = 0;            // render samples added inside the current event
+volatile LONG   g_rgxGunMm[3] = {};           // peak |Holder - rel on the DRAWN hand|: 0 = what we WROTE, 1 / 2 = the item's drawn slot buf0 / buf1
+volatile LONG   g_rgxGunDeg   = 0;            // peak rotation of source 0 vs rel on the drawn hand
+volatile LONG   g_rgxHandWrMm = 0;            // peak |the DRAWN hand - the solve's wrist|
+
+void RgxAtomicMax(volatile LONG* p, LONG v)
+{
+    LONG o = *p;
+    while (v > o) {
+        const LONG r = InterlockedCompareExchange(p, v, o);
+        if (r == o) { break; }
+        o = r;
+    }
+}
+
+// Right arm solve, at the point bodyYaw is final. COST (diag_rel_dev on): two bit copies, one 64-bit exchange, one flag store.
+void ReactGripNoteYaw(bool isLeft, float bodyYaw, float camYaw)
+{
+    if (isLeft) { return; }
+    uint32_t a = 0, b = 0;
+    memcpy(&a, &camYaw, 4);
+    memcpy(&b, &bodyYaw, 4);
+    InterlockedExchange64(&g_rgxYaw, static_cast<LONG64>((static_cast<uint64_t>(b) << 32) | a));
+    InterlockedExchange(&g_rgxYawSeen, 1);
+}
+
 // ===== The HANDGAP probe - the drawn palm vs the controller's grip point (trace docs/traces/20261116_1245_handgap_probe.md) =====
 // [PROBE: HANDGAP] gate=the rig solving with a hand (the three master enables + a grip; no setting)  site=HEADSET  log-only=yes
 // Per solve with a hand: |achievedGrip - (controller grip point)|, where achievedGrip = the solve's drawn wrist + its drawn hand basis x
@@ -10540,6 +10575,8 @@ bool SolveArmIk(const ArmSide& side)
     // [BODYWRITERS] bodyYaw final here. Off: one bool test. On: a few flops, right side only (inside).
     // camYawAtEntry = the RAW camera yaw (camhook), before the root overwrote bodyYaw - the YAW CAMERA column.
     if (DiagBodyWriters) { BodyWritersYaw(side.isLeft, bodyYawRoot, bodyYaw, camYawAtEntry); }
+    // [REACTGRIP] (diag_rel_dev): the hands' yaw vs the camera's, for the hit / dodge events. Off: one bool test. Reads only.
+    if (DiagRelDev) { ReactGripNoteYaw(side.isLeft, bodyYaw, camYawAtEntry); }
     // anim_hold_clavicles' still gate: the root speed from THIS solve's element-0 read. Off: one bool test.
     if (AnimHoldClavicles && !side.isLeft) { AnimHoldPublishRootSpeed(yawGateRootOk ? yawGateRootPos : nullptr); }
 
@@ -17106,6 +17143,7 @@ struct PlaceCache {
     int       gripSide;   // which hand's grip the ENGINE places this item from
     char      cls[64];
     bool      virt;       // item_place_virtual_holder: no grip element, holderId -1, only the root-level elements are written
+    heldmesh::Track mesh; // INV-751: the held mesh holderId / virt were resolved on ([ITEMCTL] only; [ITEMPLACE] is a probe)
 };
 
 // >>> THE TWO-HANDED OVERRIDE, REPLICATED FROM THE ENGINE RATHER THAN GUESSED.
@@ -17483,6 +17521,9 @@ struct Last {
     float         orphT[kMaxOrph][3];    // holder-frame translation, metres
     float         orphLen[kMaxOrph][3];  // the element's OWN column lengths
     bool          orphOk[kMaxOrph];
+    // INV-751: the HELD MESH the list was built on. A damage-stage swap keeps item + InventoryItem but brings another mesh with
+    // other root-level elements (wn_machete_a 3 / 12 / 3) - the list is rebuilt on it (twice: the swap update and the next).
+    heldmesh::Track mesh;
 };
 Last g_last[2] = {};
 volatile LONG64 g_orphCaptured = 0;
@@ -17578,6 +17619,13 @@ bool RhMeshName(uintptr_t item, char* out, size_t n)
     } __except (EXCEPTION_EXECUTE_HANDLER) { out[0] = 0; return false; }
     out[0] = 0;   // no terminator within the bound
     return false;
+}
+// INV-751 (trace 20261119_1840): the held item's MESH key - heldmesh::KeyOf of the name above. COST: one guarded <= 96-byte read and
+// a hash; called once per hand per update by Capture, ItemCtlPlace and the two-hand pin. No element address (INV-178).
+unsigned long long HeldMeshKeyNow(uintptr_t item)
+{
+    char m[96] = {};
+    return heldmesh::KeyOf(RhMeshName(item, m, sizeof(m)) ? m : nullptr);
 }
 int RhMemFind(const char* mesh)
 {
@@ -17935,7 +17983,11 @@ void Capture(int hand, uintptr_t item, uintptr_t body, int holderId, uintptr_t v
     // only when the item pointer changes, i.e. on a weapon swap - or the same pointer carries another InventoryItem (the game reuses
     // the model address on a swap, a tester 2026-11-08: the old list named the PREVIOUS item's elements). COST: two guarded reads.
     const uintptr_t inv = HeldItemInventoryItem(item);
-    if (L.item != item || L.inv != inv || relatch) {
+    const bool itemChanged = L.item != item || L.inv != inv;
+    // [LOADBEARING: item_place_orphans] INV-751 (trace 20261119_1840): the same item with ANOTHER mesh (a damage-stage swap / a repair)
+    // rebuilds the list too - on the swap update and again on the next (heldmesh::Step). COST: HeldMeshKeyNow, one name read.
+    const bool meshResolve = heldmesh::Step(L.mesh, HeldMeshKeyNow(item), itemChanged);
+    if (itemChanged || relatch || meshResolve) {
         L.inv = inv;
         L.nOrph = 0;
         L.nOrphTotal = 0;
@@ -17962,6 +18014,19 @@ void Capture(int hand, uintptr_t item, uintptr_t body, int holderId, uintptr_t v
                 LOG("boneblend: [ITEMREL %s] item %p mesh '%s': root-level elements (not under the holder) %d, carried %d (cap %d)%s",
                     hand ? "L" : "R", reinterpret_cast<void*>(item), haveOm ? om : "?", L.nOrphTotal, L.nOrph, kMaxOrph,
                     L.nOrphTotal > L.nOrph ? " - *** THE REST STAY WHERE THE ENGINE PUTS THEM ***" : "");
+            }
+        }
+        if (meshResolve && !itemChanged) {
+            static long s_meshLines = 0;
+            if (s_meshLines < 60) {
+                ++s_meshLines;
+                char mm[96] = {};
+                const bool haveMm = RhMeshName(item, mm, sizeof(mm));
+                // [PROBE: ITEMREL] gate=item_place_orphans,item_place_rel  site=HEADSET  log-only=yes
+                LOG("boneblend: [ITEMREL %s] item %p: the HELD MESH changed in place -> '%s' (%s) - root-level elements %d, carried %d"
+                    "%s", hand ? "L" : "R", reinterpret_cast<void*>(item), haveMm ? mm : "?",
+                    L.mesh.again ? "the swap update: list rebuilt, positions NOT latched, nothing written" : "second pass: latched",
+                    L.nOrphTotal, L.nOrph, s_meshLines == 60 ? " (60 lines - later changes are silent)" : "");
             }
         }
     }
@@ -17993,7 +18058,9 @@ void Capture(int hand, uintptr_t item, uintptr_t body, int holderId, uintptr_t v
     // first write in HookTail, so the latched value is always the engine's.
     float oT[9];
     Mat3Transpose(oN, oT);
-    for (int k = 0; k < L.nOrph; ++k) {
+    // INV-751: on the swap update of an in-place mesh change NOTHING is latched (the read may still see the old mesh); the next
+    // update rebuilds the list again and latches from the engine's own worlds (the writer refuses meanwhile - GetOrphans).
+    for (int k = 0; k < L.nOrph && !L.mesh.again; ++k) {
         if (L.orphOk[k]) { continue; }        // already latched for this item
         const float* E = SafeGetWorldPtr(item, L.orphElem[k]);
         if (!E) { L.orphOk[k] = false; InterlockedIncrement64(&g_orphNoWorld); continue; }
@@ -18182,6 +18249,251 @@ void EndEvent(int hand, ULONGLONG now, const char* why)
         g_evLines == kMaxEvLines ? "  (event line cap reached - later events counted only)" : "");
 }
 
+// ---- [REACTGRIP] (diag_rel_dev; Jay 2026-11-19: "WEAPON LEAVING HAND WHILST BEING STAGGERED/TAKING DAMAGE" -> "Go ahead") ----
+// Trace docs/traces/20261119_2025_reactgrip_probe.md. Our clips hold the hand -> holder rel CONSTANT through every TakeDamage and
+// melee dodge clip while the hand is thrown 66-563 mm, so the rel alone does not explain the symptom; this separates the readings.
+// Trigger states, OUR binary: the player's active controller group PlayerDI+3324 (30 = the light stagger's group, 16 = knockdown -
+// INV-639, the read swing.cpp's LIGHT STAGGER line uses) and the MoveController's jump type *(PlayerDI+2976)+448 (8 / 9 / 10 = dodge
+// left / right / back - INV-652 addendum 3, INV-306, INV-327). The MoveController's class is RTTI-checked once per pointer: the dodge
+// column is REFUSED, named, unless it reads 'MoveController'. One event = the first update in any trigger state until 500 ms after the
+// last (the rel outlives the state, INV-491), cut at 10 s. Per event, beside each value at the event's START:
+//   (a) the rel vs the standing ref, per hand (this namespace's own comparison, from THIS Note call only)
+//   (b) |raw camera yaw - the final bodyYaw|: the hands' yaw error in the view (published by the right arm solve, ReactGripNoteYaw)
+//   (c) the right arm's reach shortfall |achieved - asked| (the grip snapshot, MeleeGripRead)
+//   (d) the weapon vs the DRAWN hand as rendered (ReactGripGunSample, render thread; needs diag_view_body + diag_gun_hand)
+// COST with diag_rel_dev on: two guarded pointer reads + two guarded ints per Note; RttiClassNameOf only on a MoveController pointer
+// change; inside an event one seqlock grip read + a few flops per Note. Off: nothing (Note is not called).
+constexpr uintptr_t kRgxGroupOff = 3324;     // PlayerDI: the active controller group (INV-639)
+constexpr uintptr_t kRgxMoveSlot = 2976;     // PlayerDI: controller id 0 = MoveController (INV-327)
+constexpr uintptr_t kRgxJumpOff  = 448;      // MoveController: the jump type (INV-306, INV-652 addendum 3)
+constexpr ULONGLONG kRgxTailMs   = 500;
+constexpr ULONGLONG kRgxCapMs    = 10000;
+constexpr long      kRgxMaxLines = 300;      // INV-9: per line family
+struct Rgx {
+    bool      said, inEv, haveState;
+    ULONGLONG start, lastTrig;
+    long      evN, evLines, stateLines;
+    unsigned  kinds;                         // 1 light stagger, 2 knockdown, 4 dodge left, 8 dodge right, 16 dodge back
+    int       lastGroup, lastJump;
+    float     relStartDeg[2], relStartMm[2], relPeakDeg[2], relPeakMm[2];
+    bool      relHaveStart[2];
+    long      relN[2], relNoCmp[2];
+    bool      yawHave;
+    float     yawStart, yawPeak, yawPeakChg, camStart, camTravel;
+    ULONGLONG yawPeakMs;
+    long      yawN;
+    bool      sfHave;
+    float     sfStart, sfPeak;
+    long      sfN, sfNone;
+};
+Rgx       g_rgx = {};
+uintptr_t g_rgxMovePtr = 0;
+int       g_rgxMoveOk = 0;                   // 1 = MoveController, -1 = wrong class / unreadable, 0 = not seen yet
+
+float RgxWrapDeg(float r)
+{
+    while (r >  3.14159265f) { r -= 6.28318531f; }
+    while (r < -3.14159265f) { r += 6.28318531f; }
+    return r * 57.2957795f;
+}
+// The group and the jump type this update; -99 = not read, *why names the first failure.
+void RgxRead(uintptr_t vis, int& group, int& jump, const char*& why)
+{
+    group = -99;
+    jump = -99;
+    why = "read";
+    const uintptr_t pd = vis ? SafeReadPtr(vis + kRdPlayerDiOff) : 0;
+    if (!pd) { why = "PlayerDI (vis+0x50) unreadable"; return; }
+    if (!RdSafeInt(pd + kRgxGroupOff, group)) { group = -99; why = "the controller group (PlayerDI+3324) unreadable"; }
+    const uintptr_t mc = SafeReadPtr(pd + kRgxMoveSlot);
+    if (!mc) { why = "PlayerDI+2976 is null - no dodge column"; return; }
+    if (mc != g_rgxMovePtr) {
+        g_rgxMovePtr = mc;
+        char cls[64] = {};
+        const bool got = RttiClassNameOf(mc, cls, sizeof(cls));
+        g_rgxMoveOk = (got && strcmp(cls, "MoveController") == 0) ? 1 : -1;
+        // [PROBE: REACTGRIP] gate=diag_rel_dev,diag_bone_dump,diag_bone_blend_probe,diag_bone_blend_verbose  site=HEADSET  log-only=yes
+        LOG("boneblend: [REACTGRIP] MOVE controller at PlayerDI+2976 = %p class '%s' -> %s", reinterpret_cast<void*>(mc),
+            got ? cls : "<RTTI unreadable>",
+            g_rgxMoveOk == 1 ? "VERIFIED - the dodge column (jump type +448) is live"
+                             : "*** NOT THE EXPECTED CLASS - THE DODGE COLUMN IS REFUSED; jump type NOT READ on every line ***");
+    }
+    if (g_rgxMoveOk != 1) { why = "PlayerDI+2976 is not MoveController - no dodge column"; return; }
+    if (!RdSafeInt(mc + kRgxJumpOff, jump)) { jump = -99; why = "the jump type (+448) unreadable"; }
+}
+void RgxKindsStr(unsigned k, char* out, size_t n)
+{
+    out[0] = 0;
+    static const char* const kName[5] = { "light stagger", "knockdown", "dodge left", "dodge right", "dodge back" };
+    for (int i = 0; i < 5; ++i) {
+        if (!(k & (1u << i))) { continue; }
+        if (out[0]) { strncat_s(out, n, ", ", _TRUNCATE); }
+        strncat_s(out, n, kName[i], _TRUNCATE);
+    }
+    if (!out[0]) { strncpy_s(out, n, "none", _TRUNCATE); }
+}
+bool RgxYaw(float& diffDeg, float& camRad)
+{
+    if (!g_rgxYawSeen) { return false; }
+    const LONG64 p = g_rgxYaw;
+    const uint32_t a = static_cast<uint32_t>(static_cast<uint64_t>(p) & 0xFFFFFFFFu);
+    const uint32_t b = static_cast<uint32_t>(static_cast<uint64_t>(p) >> 32);
+    float cam = 0.0f, body = 0.0f;
+    memcpy(&cam, &a, 4);
+    memcpy(&body, &b, 4);
+    camRad = cam;
+    diffDeg = RgxWrapDeg(cam - body);
+    return true;
+}
+bool RgxShortfall(float& mm)
+{
+    MeleeGripSnapshot s{};
+    if (!MeleeGripRead(kGripSideR, &s) || !s.haveAchieved) { return false; }
+    mm = 1000.0f * VecLen(s.achieved[0] - s.pos[0], s.achieved[1] - s.pos[1], s.achieved[2] - s.pos[2]);
+    return true;
+}
+void RgxEnd(ULONGLONG now, const char* why)
+{
+    Rgx& G = g_rgx;
+    G.inEv = false;
+    InterlockedExchange(&g_rgxActive, 0);
+    MemoryBarrier();
+    const long gunN = g_rgxGunN;
+    const float gw = g_rgxGunMm[0] / 10.0f, g0 = g_rgxGunMm[1] / 10.0f, g1 = g_rgxGunMm[2] / 10.0f;
+    const float gdeg = g_rgxGunDeg / 100.0f, hwr = g_rgxHandWrMm / 10.0f;
+    if (G.evLines >= kRgxMaxLines) { return; }
+    ++G.evLines;
+    char kinds[96];
+    RgxKindsStr(G.kinds, kinds, sizeof(kinds));
+    char relS[2][160];
+    for (int h = 0; h < 2; ++h) {
+        if (G.relN[h] == 0) {
+            _snprintf_s(relS[h], sizeof(relS[h]), _TRUNCATE, "NOT COMPARED (no item with a standing grip in this hand; %ld updates)",
+                        G.relNoCmp[h]);
+        } else {
+            _snprintf_s(relS[h], sizeof(relS[h]), _TRUNCATE, "start %.1f deg / %.1f mm, PEAK %.1f deg / %.1f mm (n %ld, not compared %ld)",
+                        G.relHaveStart[h] ? G.relStartDeg[h] : -1.0f, G.relHaveStart[h] ? G.relStartMm[h] : -1.0f,
+                        G.relPeakDeg[h], G.relPeakMm[h], G.relN[h], G.relNoCmp[h]);
+        }
+    }
+    // [PROBE: REACTGRIP] gate=diag_rel_dev,diag_bone_dump,diag_bone_blend_probe,diag_bone_blend_verbose  site=HEADSET  log-only=yes
+    LOG("boneblend: [REACTGRIP] EVENT #%ld END (%s) | %llu ms | states seen: %s | (a) weapon grip offset vs standing: R %s; L %s | "
+        "(b) hand yaw vs camera yaw |camera - body|: %s start %.2f deg, PEAK %.2f deg (+%llu ms), largest change from start %.2f deg, "
+        "camera yaw travel %.1f deg (n %ld) | (c) right arm reach shortfall: %s start %.1f mm, PEAK %.1f mm (n %ld, no grip %ld) | "
+        "(d) weapon vs the DRAWN right hand as rendered: %s written %.1f mm / %.2f deg, drawn slot buf0 %.1f mm buf1 %.1f mm, drawn "
+        "hand vs the solve's wrist %.1f mm (render samples %ld)%s",
+        G.evN, why, static_cast<unsigned long long>(now - G.start), kinds, relS[0], relS[1],
+        G.yawHave ? "" : "NOT READ (the right arm solve has not published) -", G.yawStart, G.yawPeak,
+        static_cast<unsigned long long>(G.yawPeakMs), G.yawPeakChg, G.camTravel, G.yawN,
+        G.sfHave ? "" : "NOT READ (no grip snapshot) -", G.sfStart, G.sfPeak, G.sfN, G.sfNone,
+        gunN > 0 ? "" : "NOT MEASURED (needs diag_view_body=1 + diag_gun_hand=1, latched, a right item placed with item_place_rel) -",
+        gw, gdeg, g0, g1, hwr, gunN, G.evLines == kRgxMaxLines ? "  (event line cap reached)" : "");
+}
+// Called at the end of every Note (both hands, same update). Transitions act once; per-hand values from THIS call only.
+void RgxStep(int hand, uintptr_t vis, ULONGLONG now)
+{
+    Rgx& G = g_rgx;
+    int group = -99, jump = -99;
+    const char* why = "read";
+    RgxRead(vis, group, jump, why);
+    if (!G.said) {
+        G.said = true;
+        float yd = 0.0f, yc = 0.0f, sf = 0.0f;
+        const bool hy = RgxYaw(yd, yc), hs = RgxShortfall(sf);
+        // [PROBE: REACTGRIP] gate=diag_rel_dev,diag_bone_dump,diag_bone_blend_probe,diag_bone_blend_verbose  site=HEADSET  log-only=yes
+        LOG("boneblend: [REACTGRIP] FIRST SAMPLE (logged unconditionally with diag_rel_dev=1) - controller group %d, jump type %d (%s) | "
+            "camera - body yaw %s %.2f deg | reach shortfall %s %.1f mm | events are measured only while a hand holds an item with a "
+            "Holder; (d) needs diag_view_body=1 + diag_gun_hand=1", group, jump, why, hy ? "" : "NOT READ", yd, hs ? "" : "NOT READ", sf);
+    }
+    if (!G.haveState || group != G.lastGroup || jump != G.lastJump) {
+        if (G.stateLines < kRgxMaxLines) {
+            ++G.stateLines;
+            // [PROBE: REACTGRIP] gate=diag_rel_dev,diag_bone_dump,diag_bone_blend_probe,diag_bone_blend_verbose  site=HEADSET  log-only=yes
+            const bool readOk = strcmp(why, "read") == 0;
+            LOG("boneblend: [REACTGRIP] STATE controller group %d -> %d, jump type %d -> %d%s%s | %s%s", G.haveState ? G.lastGroup : -100,
+                group, G.haveState ? G.lastJump : -100, jump, readOk ? "" : " - ", readOk ? "" : why,
+                G.inEv ? "IN AN EVENT" : "not in an event",
+                G.stateLines == kRgxMaxLines ? "  (state line cap reached)" : "");
+        }
+        G.haveState = true;
+        G.lastGroup = group;
+        G.lastJump = jump;
+    }
+    unsigned k = 0;
+    if (group == 30) { k |= 1u; }
+    if (group == 16) { k |= 2u; }
+    if (jump == 8)   { k |= 4u; }
+    if (jump == 9)   { k |= 8u; }
+    if (jump == 10)  { k |= 16u; }
+    if (k) { G.lastTrig = now; }
+    if (!G.inEv && k) {
+        // START: zero the render peaks, THEN arm them. A render sample in flight across this can land one value from the frame
+        // before the start - a peak, never a count error that changes the verdict.
+        InterlockedExchange(&g_rgxGunN, 0);
+        for (int s = 0; s < 3; ++s) { InterlockedExchange(&g_rgxGunMm[s], 0); }
+        InterlockedExchange(&g_rgxGunDeg, 0);
+        InterlockedExchange(&g_rgxHandWrMm, 0);
+        MemoryBarrier();
+        InterlockedExchange(&g_rgxActive, 1);
+        const long evN = G.evN + 1, evL = G.evLines, stL = G.stateLines;
+        const bool said = G.said;
+        const int lg = G.lastGroup, lj = G.lastJump;
+        G = Rgx{};
+        G.said = said; G.haveState = true; G.lastGroup = lg; G.lastJump = lj;
+        G.evN = evN; G.evLines = evL; G.stateLines = stL;
+        G.inEv = true;
+        G.start = G.lastTrig = now;
+        float yd = 0.0f, yc = 0.0f;
+        G.yawHave = RgxYaw(yd, yc);
+        G.yawStart = G.yawHave ? fabsf(yd) : 0.0f;
+        G.camStart = yc;
+        G.sfHave = RgxShortfall(G.sfStart);
+        char kinds[96];
+        RgxKindsStr(k, kinds, sizeof(kinds));
+        if (G.evLines < kRgxMaxLines) {
+            ++G.evLines;
+            // [PROBE: REACTGRIP] gate=diag_rel_dev,diag_bone_dump,diag_bone_blend_probe,diag_bone_blend_verbose  site=HEADSET  log-only=yes
+            LOG("boneblend: [REACTGRIP] EVENT #%ld START - %s (controller group %d, jump type %d) | camera - body yaw %s%.2f deg | reach "
+                "shortfall %s%.1f mm", G.evN, kinds, group, jump, G.yawHave ? "" : "NOT READ ", G.yawStart,
+                G.sfHave ? "" : "NOT READ ", G.sfStart);
+        }
+    }
+    if (!G.inEv) { return; }
+    G.kinds |= k;
+    // (a) this hand's rel vs its standing ref - only when THIS Note call compared it
+    const Rd& R = g_rd[hand];
+    if (R.lastValid && R.lastMs == now) {
+        if (!G.relHaveStart[hand]) { G.relHaveStart[hand] = true; G.relStartDeg[hand] = R.lastDeg; G.relStartMm[hand] = R.lastMm; }
+        if (R.lastDeg > G.relPeakDeg[hand]) { G.relPeakDeg[hand] = R.lastDeg; }
+        if (R.lastMm > G.relPeakMm[hand]) { G.relPeakMm[hand] = R.lastMm; }
+        ++G.relN[hand];
+    } else {
+        ++G.relNoCmp[hand];
+    }
+    // (b) / (c) once per call (both hands call in one update: n counts calls, the peaks are unaffected)
+    float yd = 0.0f, yc = 0.0f;
+    if (RgxYaw(yd, yc)) {
+        if (!G.yawHave) { G.yawHave = true; G.yawStart = fabsf(yd); G.camStart = yc; }
+        const float ad = fabsf(yd);
+        if (ad > G.yawPeak) { G.yawPeak = ad; G.yawPeakMs = now - G.start; }
+        const float chg = fabsf(ad - G.yawStart);
+        if (chg > G.yawPeakChg) { G.yawPeakChg = chg; }
+        const float trav = fabsf(RgxWrapDeg(yc - G.camStart));
+        if (trav > G.camTravel) { G.camTravel = trav; }
+        ++G.yawN;
+    }
+    float sf = 0.0f;
+    if (RgxShortfall(sf)) {
+        if (!G.sfHave) { G.sfHave = true; G.sfStart = sf; }
+        if (sf > G.sfPeak) { G.sfPeak = sf; }
+        ++G.sfN;
+    } else {
+        ++G.sfNone;
+    }
+    if (now - G.lastTrig >= kRgxTailMs) { RgxEnd(now, "500 ms after the last trigger state"); }
+    else if (now - G.start >= kRgxCapMs) { RgxEnd(now, "CUT at 10 s - the trigger state did not clear"); }
+}
+
 void Note(int hand, uintptr_t item, uintptr_t body, int holderId, uintptr_t vis)
 {
     if (hand < 0 || hand >= 2 || !item || !body || holderId < 0) { return; }
@@ -18308,6 +18620,8 @@ void Note(int hand, uintptr_t item, uintptr_t body, int holderId, uintptr_t vis)
             }
         }
     }
+    // [REACTGRIP] the hit / knockdown / dodge event - after this call's comparison, so (a) reads THIS update's value
+    RgxStep(hand, vis, now);
     if (now - g_winStart >= 1000) { Flush(now); }
 }
 
@@ -18533,11 +18847,15 @@ bool VhExcludedMesh(const char* mesh)
 }
 
 int GetOrphans(int hand, uintptr_t item, int* elemOut, float* rOut9, float* tOut3,
-               float* lenOut3, int maxOut)
+               float* lenOut3, int maxOut, unsigned long long meshKeyNow)
 {
     if (hand < 0 || hand >= 2 || !item) { return 0; }
     Last& L = g_last[hand];
     if (!L.have || L.item != item) { return 0; }
+    // [LOADBEARING: item_place_orphans] INV-751 (trace 20261119_1840): never write a list onto a mesh it was not built on, and never
+    // while an in-place mesh change is settling - so a later latch can never read OUR write (D-93), whatever the order of the
+    // game's swap, Capture and this writer. meshKeyNow = HeldMeshKeyNow(item) read by the caller this update.
+    if (!heldmesh::WriterMayWrite(L.mesh, meshKeyNow)) { return 0; }
     int n = 0;
     for (int k = 0; k < L.nOrph && n < maxOut; ++k) {
         if (!L.orphOk[k]) { continue; }
@@ -18845,6 +19163,10 @@ void ItemCtlPlace(void* ent)
         // on a swap (heal / eat / throwable / a switch - 58 archived cases), and a pointer-only key kept the PREVIOUS item's holder,
         // grip side, two-handed class, finger row and pump eye hold (a tester, 2026-11-08). COST: two guarded reads per update, per hand.
         const uintptr_t inv = HeldItemInventoryItem(item);
+        // [LOADBEARING: item_place_from_controller] INV-751 (trace 20261119_1840): the held MESH key, read once per hand per update - the
+        // grip-element re-resolve below and the loose-part writer's refusal (GetOrphans) both use THIS update's value. COST: one name read.
+        const unsigned long long meshNow = itemrel::HeldMeshKeyNow(item);
+        bool itemBlockRan = false;
         if (C.item != item || C.inv != inv) {
             // g_elemId has a resolver (HolderIdProbe's) that does not set g_elemNum - resolve the count export here, once, rather
             // than depend on which resolver ran first. Same export string as ResolveAccessors.
@@ -18883,6 +19205,8 @@ void ItemCtlPlace(void* ent)
             }
             C.item = item;
             C.inv = inv;
+            heldmesh::Step(C.mesh, meshNow, true);   // INV-751: this item's mesh, so an in-place change is seen from the next update
+            itemBlockRan = true;
             bool ok = false;
             C.holderId = SafeElemId(reinterpret_cast<void*>(item), "Holder", &ok);
             if (!ok) { C.holderId = -1; }
@@ -19017,6 +19341,51 @@ void ItemCtlPlace(void* ent)
                                                               : "' - *** throwable_hand_enable=0: NOT applied ***") : "");
                     }
                 }
+            }
+        }
+        // [LOADBEARING: item_place_from_controller] INV-751 (trace 20261119_1840): the SAME item now carries another mesh (a damage-stage
+        // swap / a repair - wn_hl_axe_gaas "Holder" 0 -> 1, wn_polearm_b's _dm_b has none): the grip element is resolved again on
+        // THIS mesh, on the swap update and on the next (heldmesh::Step). Only the element numbers: gripSide (item desc), the class,
+        // the two-handed classification, the finger / throwable rows and the melee save type stay as the item gave them.
+        if (!itemBlockRan && heldmesh::Step(C.mesh, meshNow, false)) {
+            bool ok = false;
+            int hid = SafeElemId(reinterpret_cast<void*>(item), "Holder", &ok);
+            if (!ok) { hid = -1; }
+            int h0 = -1;
+            if (ok && hid < 0) {
+                bool ok0 = false;
+                const int r0 = SafeElemId(reinterpret_cast<void*>(item), "holder_0", &ok0);
+                h0 = (ok0 && r0 >= 0) ? r0 : -1;
+                if (h0 >= 0 && ItemPlaceHolder0) { hid = h0; }
+            }
+            char mesh[96] = {};
+            const bool haveMesh = itemrel::RhMeshName(item, mesh, sizeof(mesh));
+            bool virt = false;
+            const char* why = "it has a grip element";
+            if (ok && hid < 0 && h0 < 0 && ItemPlaceVirtualHolder) {
+                why =   !haveMesh                          ? "mesh name UNREADABLE, so the throwable guard cannot clear it"
+                      : itemrel::VhExcludedMesh(mesh)      ? "THROWABLE-named mesh (separate plan)"
+                      : !ItemPlaceRel                      ? "item_place_rel=0 (the grip pose comes from it)"
+                      : !ItemPlaceOrphans                  ? "item_place_orphans=0 (it carries every element)"
+                      : (C.gripSide != hand)               ? "the grip side is not the slot's"
+                                                           : nullptr;
+                virt = (why == nullptr);
+            } else if (ok && hid < 0) {
+                why = h0 >= 0 ? "holder_0 present, item_place_holder0=0" : "no grip element, item_place_virtual_holder=0";
+            }
+            const int oldId = C.holderId;
+            const bool oldVirt = C.virt;
+            C.holderId = hid;
+            C.virt = virt;
+            static long s_meshLines = 0;
+            if (s_meshLines < 60) {
+                ++s_meshLines;
+                // [PROBE: ITEMCTL] gate=item_place_from_controller  site=HEADSET  log-only=yes
+                LOG("boneblend: [ITEMCTL %s] item %p: the HELD MESH changed in place -> '%s' (%s) | grip element %d%s -> %d%s%s%s",
+                    hand ? "L" : "R", reinterpret_cast<void*>(item), haveMesh ? mesh : "?",
+                    C.mesh.again ? "swap update" : "second pass", oldId, oldVirt ? " (virtual)" : "", hid,
+                    virt ? " (VIRTUAL HOLDER)" : "", (hid < 0 && !virt) ? " - NOT PLACED: " : "",
+                    (hid < 0 && !virt) ? (why ? why : "?") : "");
             }
         }
         // [LOADBEARING: rig_two_hand_grip] which item the right hand holds NOW - separate from the classify call because this
@@ -19275,7 +19644,7 @@ void ItemCtlPlace(void* ent)
         if (usedRel && ItemPlaceOrphans) {
             int   oe[itemrel::kMaxOrph];
             float orr[itemrel::kMaxOrph * 9], ort[itemrel::kMaxOrph * 3], ol[itemrel::kMaxOrph * 3];
-            const int no = itemrel::GetOrphans(hand, item, oe, orr, ort, ol, itemrel::kMaxOrph);
+            const int no = itemrel::GetOrphans(hand, item, oe, orr, ort, ol, itemrel::kMaxOrph, meshNow);
             float wN[9], wLen[3];
             float w9[9];
             Mtx34To3x3(w, w9);
@@ -20201,6 +20570,7 @@ void __fastcall HookTail(void* ent)
     // cache alternated with PublishBarrelBore's "barrel" and forced an engine GetElementID name lookup every update).
     if (RigTwoHandGrip) {
         static uintptr_t s_thItem = 0;
+        static heldmesh::Track s_thMesh;   // INV-751: the mesh the ids below were resolved on
         static int s_thId = -1, s_thBarrelId = -1;
         static int s_thHolderId = -1;
         static const char* s_thName = "holderl";
@@ -20216,7 +20586,10 @@ void __fastcall HookTail(void* ent)
         const uintptr_t thEnt = BoneProbeCapturedEntity();
         const uintptr_t thItem = thEnt ? SafeReadPtr(thEnt + 0x1020) : 0;   // the RIGHT slot, as ItemCtlPlace reads it
         if (thItem && g_getWorld) {
-            if (thItem != s_thItem) {   // once per item: at most four GetElementID lookups
+            // [LOADBEARING: rig_two_hand_grip] INV-751 (trace 20261119_1840): once per item AND again when the same item's mesh changes in
+            // place (Buzz Killer holderl 5 -> 3, the Gaas axe gains holderl at _dm_a) - on the swap update and the next. COST: one name read.
+            const bool thItemChanged = thItem != s_thItem;
+            if (heldmesh::Step(s_thMesh, itemrel::HeldMeshKeyNow(thItem), thItemChanged)) {   // at most four GetElementID lookups
                 s_thItem = thItem;
                 bool ok = false;
                 s_thName = "holderl";
@@ -21004,7 +21377,22 @@ float     g_own4468 = 0.0f, g_own4588 = 0.0f;   // at the previous owner line
 long      g_ownUpd = 0;
 float     g_prev4468 = 0.0f;
 long      g_lines = 0;
+#if defined(DLVR_YAW_PROBE)   // the yaw probe variant: uncapped, a wall kick must not fall past the cap (trace 20261119_2145)
+constexpr long kMaxLines = 0x7FFFFFFF;
+#else
 constexpr long kMaxLines = 300;            // INV-9: a flickering owner must not flood the log
+#endif
+// The MoveController jump state the engine's look window keys on (our gamedll +D44AB0 / +D57B10 read *(player+2976)+448;
+// trace 20261119_2145). -1 = unreadable. Reads only.
+int MoveJumpType(uintptr_t player)
+{
+    __try {
+        const uintptr_t mc = *reinterpret_cast<const uintptr_t*>(player + 2976);
+        return mc ? *reinterpret_cast<const int*>(mc + 448) : -1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
 ULONGLONG g_winStart = 0;
 float     g_w4468 = 0.0f, g_w4588 = 0.0f, g_wMaxStep = 0.0f, g_wHMin = 0.0f, g_wHMax = 0.0f;
 long long g_wUpd = 0, g_wNotLook = 0, g_wFaults = 0, g_wJumps = 0, g_wOwnerChanges = 0;
@@ -21110,12 +21498,12 @@ void Sample(uintptr_t a1, float addend)
             // [PROBE: YAWSTEP] gate=diag_cam_yaw  site=HEADSET  log-only=yes
             LOG("boneblend: [YAWSTEP] OWNER CHANGE #%ld look %s (vt +%llX) -> %s (vt +%llX) | facing %s (vt +%llX) -> %s "
                 "(vt +%llX) | NOW +4468 body look %+.2f, +4460 camera %+.2f (addend %+.2f, minus addend %+.2f), +4588 "
-                "facing %+.2f, +4592 target %+.2f | SINCE THE PREVIOUS OWNER LINE (%ld updates): +4468 moved %+.2f, "
-                "+4588 moved %+.2f deg%s",
+                "facing %+.2f, +4592 target %+.2f, move jump type %d | SINCE THE PREVIOUS OWNER LINE (%ld updates): +4468 "
+                "moved %+.2f, +4588 moved %+.2f deg%s",
                 g_lines, LookName(g_lookVt), static_cast<unsigned long long>(g_lookVt), LookName(lookRva),
                 static_cast<unsigned long long>(lookRva), FacName(g_facVt), static_cast<unsigned long long>(g_facVt),
                 FacName(facRva), static_cast<unsigned long long>(facRva), y4468, y4460, addend, y4460 - addend, y4588,
-                y4592, g_ownUpd, y4468 - g_own4468, y4588 - g_own4588,
+                y4592, MoveJumpType(a1), g_ownUpd, y4468 - g_own4468, y4588 - g_own4588,
                 g_lines == kMaxLines ? "  (line cap reached - further owner changes and jumps are counted only)" : "");
         }
         g_lookVt = lookRva;
@@ -21131,9 +21519,9 @@ void Sample(uintptr_t a1, float addend)
             // [PROBE: YAWSTEP] gate=diag_cam_yaw  site=HEADSET  log-only=yes
             LOG("boneblend: [YAWSTEP] JUMP #%ld +4468 body look %+.2f -> %+.2f (%+.2f deg in ONE update) | look owner %s "
                 "(vt +%llX), facing supplier %s (vt +%llX) | +4460 camera %+.2f (addend %+.2f) | +4588 facing %+.2f, "
-                "+4592 target %+.2f%s",
+                "+4592 target %+.2f | move jump type %d%s",
                 g_lines, g_prev4468, y4468, step, LookName(lookRva), static_cast<unsigned long long>(lookRva),
-                FacName(facRva), static_cast<unsigned long long>(facRva), y4460, addend, y4588, y4592,
+                FacName(facRva), static_cast<unsigned long long>(facRva), y4460, addend, y4588, y4592, MoveJumpType(a1),
                 g_lines == kMaxLines ? "  (line cap reached - further owner changes and jumps are counted only)" : "");
         }
     }
@@ -21173,8 +21561,8 @@ void Sample(uintptr_t a1, float addend)
 // [LOADBEARING: HEAD-FOLLOW] with comfort_body_follows_head=1 and head_yaw_decouple active this is the ONLY thing that
 //      turns the character's body and walking direction with the head. Proven by INV-262 (the body follows +4468 via
 //      BA1FD0 -> +4592 -> +4588) + INV-263 (the camera reads +4460) + snap's identical four-field write. Since 2026-10-29
-//      TorsoApply sets +4588/+4592 to look + the torso gap (the body faces the controllers' real body) and the walk stick is
-//      rotated by the gap (INV-652: walking is the root's frame).
+//      the facing write sets +4588/+4592 every update - to look + the torso gap until 2026-11-19, to the LOOK alone since the hand
+//      twist was removed (FacingOnLook, trace 20261119_1400; INV-652: walking is the root's frame).
 namespace follow {
 
 headfollow::State g_s;
@@ -21206,23 +21594,23 @@ void PublishFolded(float folded, unsigned long long obj)
 // replaced the pad thread's stick rotation StickForGap; it reads g_pubObj / g_pubTorsoFolding / g_pubTorsoMs). The published body
 // turn (PublishFolded) becomes folded + gap, so the arm frame (S-60), the head-position report (S-61) and the roomscale probe follow
 // the ROOT; the cutscene hand-back keeps reading g_s.folded (the camera's).
-headfollow::TorsoState g_torso;
 bool      g_torsoSaidFirst = false;
-volatile LONG     g_pubTorsoGapBits = 0;   // OpenXR degrees, + = body left of the look
+volatile LONG     g_pubTorsoGapBits = 0;   // OpenXR degrees, + = body left of the look (always 0 since trace 20261119_1400)
 volatile LONGLONG g_pubTorsoMs      = 0;   // GetTickCount64 of the publish, 0 = never
 volatile LONG     g_pubTorsoFolding = 0;   // 1 = published by an update that folded and wrote the facing
-double    g_tSum = 0.0;
-long long g_tN = 0, g_tClamped = 0, g_tHeld = 0, g_tFaults = 0, g_tNoPose = 0;
-float     g_tMin = 0.0f, g_tMax = 0.0f;
-// Run T2 (Jay: "I want you to resolve what's causing the rest of the movement"): the three causes, counted exactly per 5 s window -
-// the degrees the 40 deg limit pulled the body, which grips the reading used (none / left / right / both), and the updates the right
-// stick was turning the character (|x| > 0.20, the S-60 check's own test) - so a run splits clamp / hand switch / stick.
-double    g_tPulled = 0.0;
-long long g_tHands[4] = { 0, 0, 0, 0 };
-long long g_tStick = 0, g_tStickUnread = 0;
+long long g_tN = 0, g_tFaults = 0;         // the 5 s line: updates the facing was set on the look / write faults
+// HAND-TWIST VIEW HOLD (spec 2026-11-19-hand-twist-view-hold-design §8b-4, trace 20261119_1040): THIS update's twist G =
+// Wrap180(after - look) - the term PublishFolded adds - and the player it was written for. Game thread only: set by FacingOnLook (0),
+// read later in the SAME update by EyePointApply (HookTail, post-update; INV-747). Cleared on every PublishTorso(0, false) path.
+float     g_htvGapDeg = 0.0f;
+float     g_htvAfter  = 0.0f;   // +4588 as SetFacing wrote it (the spring-residual column of the hand-twist view line)
+uintptr_t g_htvObj    = 0;
+bool      g_htvValid  = false;
+ULONGLONG g_htvMs     = 0;
 
 void PublishTorso(float gapXrDeg, bool folding)
 {
+    if (!folding) { g_htvValid = false; }
     LONG bits = 0;
     memcpy(&bits, &gapXrDeg, sizeof(bits));
     InterlockedExchange(&g_pubTorsoGapBits, bits);
@@ -21269,85 +21657,151 @@ float ActualBodyTurn(uintptr_t a1, float folded)
     return folded + headfollow::Wrap180(facing - look);
 }
 
-// A hand counts only while the runtime TRACKS its grip position - a VALID-but-inferred or frozen pose holds (final review I4).
-bool GripTracked(Hand hand, XrPosef& pose)
+// THE HAND TWIST IS REMOVED (trace 20261119_1400, Jay 2026-11-19: "the torso being twisted from the arms in and of itself has just
+// led to so many issues"; RUN BF0 with nothing steering the body: "That feels so much better honestly" -> "2" = keep Body follows head,
+// remove the hand twist; option B). Called by Before for the LOCAL player on an update that folded without a fault: the body faces
+// look + the neck-hold gap every update (+4588 / +4592; was gap 0 in bab3b84b), publishing what walk follows the look and the view
+// hold read. Returns the body turn to publish (folded + the gap the root now carries).
+// NECK HOLD (trace 20261119_1430, Jay: "hold the root while headturning till it hits the range the body is meant to turn"; 40 deg +
+// re-centre while walking: "Yes."): the gap is headfollow::NeckHoldStep's - the body holds on head turns inside 40 deg, the head pulls
+// it round past that, walking (left stick |(x, y)| > 0.20) eases it back under the head; a stick turn keeps the gap (body turns at
+// once). COST per local update: one stick read, one exp, one float read, two reads + two writes, three interlocked stores.
+headfollow::NeckHoldState g_neck;
+long long g_nhClamped = 0, g_nhWalking = 0, g_nhResets = 0;
+float     g_nhMin = 0.0f, g_nhMax = 0.0f;
+float FacingWithNeck(uintptr_t a1, float h, float folded, float dt)
 {
-    if (!GetControllerGripPoseSteady(hand, pose)) { return false; }
-    const long f = ControllerGripFlags(hand);
-    return f >= 0 && (f & XR_SPACE_LOCATION_POSITION_TRACKED_BIT) != 0;
-}
-
-// Called by Before for the LOCAL player on an update that folded without a fault; dt = the engine's update dt (seconds). Returns
-// the body turn to publish (ActualBodyTurn after the write). COST per local update: GetHeadPose (takes the frame critical
-// section, as the arm solve's read does) + two grip seqlock copies + two flag reads, one sqrt / atan2 / exp, three float reads +
-// two writes, three interlocked stores.
-float TorsoApply(uintptr_t a1, float h, float folded, float dt)
-{
-    XrPosef head{}, gl{}, gr{};
-    const bool haveHead = GetHeadPose(head);
-    const bool haveL = GripTracked(kLeftHand, gl);
-    const bool haveR = GripTracked(kRightHand, gr);
-    if (!haveHead) {
-        ++g_tNoPose;
-        PublishTorso(0.0f, false);
-        return ActualBodyTurn(a1, folded);
-    }
-    // The true neck (eye - R n, the holster body-lock's point) - NOT NeckPivotReportedPos, which with the decouple on is the neck
-    // plus the head-YAW-rotated n, 8.4 cm forward along the heading (final review C3).
-    const XrVector3f nv = NeckOffsetM();
-    const holster::Vec3 neck = holster::NeckPoint({ head.position.x, head.position.y, head.position.z }, head.orientation.x,
-                                                  head.orientation.y, head.orientation.z, head.orientation.w,
-                                                  { nv.x, nv.y, nv.z });
+    float sx = 0.0f, sy = 0.0f;
+    const bool walking = GetControllerStick(kLeftHand, sx, sy) && (sx * sx + sy * sy) > 0.20f * 0.20f;
     const bool flip = HeadYawDecoupleFlipLatched();
-    headfollow::TorsoIn in{ neck.x, neck.z, gl.position.x, gl.position.z, gr.position.x, gr.position.z,
-                            haveL, haveR, flip ? -h : h, dt };
-    // Run T1 (Jay: "Ignore a hand at the head"): heights + the eyes, so a grip at the head or hanging at the side does not count.
-    in.neckY = neck.y;
-    in.eyeX = head.position.x;
-    in.eyeY = head.position.y;
-    in.eyeZ = head.position.z;
-    in.lY = gl.position.y;
-    in.rY = gr.position.y;
-    const headfollow::TorsoOut o = headfollow::TorsoGapStep(g_torso, a1, in);
-    const float gapField = flip ? -o.gapXrDeg : o.gapXrDeg;
+    const headfollow::NeckOut n = headfollow::NeckHoldStep(g_neck, a1, flip ? -h : h, walking, dt);
+    const float gapField = flip ? -n.gapXrDeg : n.gapXrDeg;
     float look = 0.0f, before = 0.0f, after = 0.0f;
     if (!ReadLook(a1, look) || !SetFacing(a1, look, gapField, before, after)) {
         ++g_tFaults;
         PublishTorso(0.0f, false);
         return ActualBodyTurn(a1, folded);
     }
-    if (!haveL || !haveR) { ++g_tNoPose; }
-    g_tPulled += o.pulledDeg;
-    ++g_tHands[(o.hands >= 0 && o.hands <= 3) ? o.hands : 0];
-    {
-        float sx = 0.0f, sy = 0.0f;   // COST: one stick read per local update
-        if (!GetControllerStick(kRightHand, sx, sy)) {
-            ++g_tStickUnread;
-        } else if (fabsf(sx) > 0.20f) {
-            ++g_tStick;
-        }
-    }
-    if (o.clamped) { ++g_tClamped; }
-    if (o.held) { ++g_tHeld; }
-    if (g_tN == 0 || o.gapXrDeg < g_tMin) { g_tMin = o.gapXrDeg; }
-    if (g_tN == 0 || o.gapXrDeg > g_tMax) { g_tMax = o.gapXrDeg; }
-    g_tSum += o.gapXrDeg;
+    if (g_tN == 0 || n.gapXrDeg < g_nhMin) { g_nhMin = n.gapXrDeg; }
+    if (g_tN == 0 || n.gapXrDeg > g_nhMax) { g_nhMax = n.gapXrDeg; }
     ++g_tN;
-    PublishTorso(o.gapXrDeg, true);
+    if (n.clamped) { ++g_nhClamped; }
+    if (n.recentring) { ++g_nhWalking; }
+    if (n.reset) { ++g_nhResets; }
+    PublishTorso(n.gapXrDeg, true);
+    g_htvGapDeg = headfollow::Wrap180(after - look);   // the body's turn off the look: the view hold's G
+    g_htvAfter  = after;
+    g_htvObj    = a1;
+    g_htvValid  = true;
+    g_htvMs     = GetTickCount64();
     if (!g_torsoSaidFirst) {
         g_torsoSaidFirst = true;
         // [PROBE: HEADFOLLOW] gate=comfort_body_follows_head  site=HEADSET  log-only=no
-        LOG("boneblend: [HEADFOLLOW] TORSO FIRST (logged unconditionally) - neck x/z %+.3f %+.3f | left grip %s %+.3f %+.3f | right "
-            "grip %s %+.3f %+.3f | head yaw %+.2f deg (flip %d) | raw gap %+.2f, weight %.2f, gap %+.2f deg | look %+.2f -> facing "
-            "%+.2f (was %+.2f) | player %p",
-            neck.x, neck.z, haveL ? "ok" : "MISSING", gl.position.x, gl.position.z, haveR ? "ok" : "MISSING", gr.position.x,
-            gr.position.z, h, flip ? 1 : 0, o.rawGapXrDeg, o.weight, o.gapXrDeg, look, after, before, reinterpret_cast<void*>(a1));
+        LOG("boneblend: [HEADFOLLOW] NECK HOLD FIRST (logged unconditionally) - the body holds while the head turns, range %.0f deg, "
+            "re-centre while walking tau %.2f s (trace 20261119_1430): head %+.2f (flip %d), gap %+.2f | look %+.2f -> facing %+.2f "
+            "(was %+.2f) | player %p", headfollow::kNeckRangeDeg, headfollow::kNeckRecentreTauS, h, flip ? 1 : 0, n.gapXrDeg, look,
+            after, before, reinterpret_cast<void*>(a1));
     }
     return folded + headfollow::Wrap180(after - look);
 }
 
 // Called for the LOCAL player with the decouple active, after snap and before the engine's chase. Game thread. dt = the
 // engine's update dt (Hook's argument), for the torso filter.
+// WALL-KICK SPIN FIX (trace 20261119_2215, RUN WK1 backups/20261119_run_wk1; Jay: "it does around 2 360 degree turns after it kicks
+// you from the wall" / "It's when I turn my head whilst kicking off" -> "Go ahead"). While MoveController::IsBodyVectorRefToLook
+// (+D57B10) is true, the engine's look integrator +BA1350 clamps +4468 into a window around the BODY direction (+4588; LookController
+// slot +80 = +D44AB0 -> +BB7CF0), 0..0 wide for the backward wall kick. Our facing write (look + neck gap) then moves the body, the
+// clamp moves the look onto it, one gap per update - WK1 measured -2261..+1796 deg in under 1.5 s. On those updates the facing write
+// is skipped: the engine turns the body its own way (the jump clip's turn, added back into the look) and the fold keeps every gap.
+// [LOADBEARING: HEAD-FOLLOW] this gate is part of the head-follow node: without it the wall kick spins whenever the head is turned.
+// COST per local LookController update: one pointer read + one engine call (+D57B10: three reads + a time-getter vcall); the
+// 17-byte head check once.
+using BodyRefFn = bool(__fastcall*)(uintptr_t moveCtl);
+constexpr uintptr_t kBodyRefRva = 0xD57B10;   // MoveController::IsBodyVectorRefToLook (ida/wk10_win_out.txt; EGL row in buildrva_table.h)
+constexpr unsigned char kBodyRefHead[17] = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC,
+                                             0x20, 0x48, 0x63, 0x99, 0xC0, 0x01, 0x00, 0x00 };   // ... movsxd rbx,[rcx+1C0h] (+448)
+BodyRefFn g_bodyRef = nullptr;
+int       g_bodyRefState = 0;          // 0 = not resolved yet, 1 = armed, -1 = refused (the old behaviour continues)
+bool      g_lobSkipping = false;
+long long g_lobRunUpd = 0, g_lobFaults = 0;
+int       g_lobRunType = -1;
+ULONGLONG g_lobRunStart = 0;
+long      g_lobLines = 0;
+constexpr long kLobMaxLines = 500;     // INV-9
+
+bool BodyRefHeadMatches(uintptr_t addr)
+{
+    __try {
+        return memcmp(reinterpret_cast<const void*>(addr), kBodyRefHead, sizeof(kBodyRefHead)) == 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// The engine's own test, on the MoveController the look window keys on (*(player+2976), as +D44AB0 reads it). fault = a fault in
+// the read or the call (counted; returns false = the facing write runs as before). jumpType = mc+448 for the log (-1 unreadable).
+bool CallBodyRef(uintptr_t a1, bool& fault, int& jumpType)
+{
+    fault = false;
+    jumpType = -1;
+    __try {
+        const uintptr_t mc = *reinterpret_cast<const uintptr_t*>(a1 + 2976);
+        if (!mc) { return false; }
+        jumpType = *reinterpret_cast<const int*>(mc + 448);
+        return g_bodyRef(mc);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        fault = true;
+        return false;
+    }
+}
+
+bool LookOnBody(uintptr_t a1, int& jumpType)
+{
+    jumpType = -1;
+    if (g_bodyRefState == 0) {
+        const uintptr_t addr = snap::g_gd ? snap::g_gd + ::dlvr::buildrva::Gd(kBodyRefRva) : 0;
+        const bool ok = addr && BodyRefHeadMatches(addr);
+        g_bodyRefState = ok ? 1 : -1;
+        if (ok) { g_bodyRef = reinterpret_cast<BodyRefFn>(addr); }
+        // [PROBE: HEADFOLLOW] gate=comfort_body_follows_head  site=HEADSET  log-only=no
+        LOG("boneblend: [HEADFOLLOW] LOOK-ON-BODY %s (logged unconditionally) - MoveController::IsBodyVectorRefToLook at gamedll+%llX "
+            "%s; while it is true the body-facing write is skipped (wall-kick spin fix, trace 20261119_2215)%s",
+            ok ? "ARMED" : "REFUSED", static_cast<unsigned long long>(addr ? addr - snap::g_gd : 0),
+            ok ? "head bytes match" : (addr ? "head bytes DO NOT match" : "gamedll base not resolved"),
+            ok ? "" : " - NOT ARMED: the facing write runs every update as before, the wall kick can still spin");
+    }
+    if (g_bodyRefState != 1) { return false; }
+    bool fault = false;
+    const bool r = CallBodyRef(a1, fault, jumpType);
+    if (fault) { ++g_lobFaults; }
+    return r;
+}
+
+void LookOnBodyNote(bool skipping, int jumpType)
+{
+    if (skipping) {
+        if (!g_lobSkipping) {
+            g_lobSkipping = true;
+            g_lobRunUpd = 0;
+            g_lobRunType = jumpType;
+            g_lobRunStart = GetTickCount64();
+        }
+        ++g_lobRunUpd;
+        return;
+    }
+    if (g_lobSkipping) {
+        g_lobSkipping = false;
+        if (g_lobLines < kLobMaxLines) {
+            ++g_lobLines;
+            // [PROBE: HEADFOLLOW] gate=comfort_body_follows_head  site=HEADSET  log-only=no
+            LOG("boneblend: [HEADFOLLOW] LOOK-ON-BODY #%ld: facing write skipped for %lld updates (%llu ms), move jump type %d at the "
+                "start | engine-call faults so far %lld%s",
+                g_lobLines, g_lobRunUpd, static_cast<unsigned long long>(GetTickCount64() - g_lobRunStart), g_lobRunType,
+                g_lobFaults, g_lobLines == kLobMaxLines ? "  (line cap reached - further episodes are not logged)" : "");
+        }
+    }
+}
+
 void Before(uintptr_t a1, float h, float dt)
 {
     const bool on = ComfortBodyFollowsHead;
@@ -21388,11 +21842,15 @@ void Before(uintptr_t a1, float h, float dt)
         g_pausedVtRva = vt ? vt - snap::g_gd : 0;
     }
     g_addend = st.addend;
-    // Torso from controllers: only on an update that folded cleanly (LookController owns the look, switch on). Otherwise the body
-    // turn published is the head fold, as before, and the walk stick gets no gap.
+    // The body faces the look (the hand twist is removed, trace 20261119_1400): only on an update that folded cleanly (LookController
+    // owns the look, switch on). Otherwise the body turn published is the head fold, as before.
     float bodyTurn = g_s.folded;
-    if (on && owned && foldOk) {
-        bodyTurn = TorsoApply(a1, h, g_s.folded, dt);
+    // Wall-kick spin fix (trace 20261119_2215): not while the engine clamps the look onto the body - see LookOnBody.
+    int lobJump = -1;
+    const bool lookOnBody = on && owned && foldOk && LookOnBody(a1, lobJump);
+    LookOnBodyNote(lookOnBody, lobJump);
+    if (on && owned && foldOk && !lookOnBody) {
+        bodyTurn = FacingWithNeck(a1, h, g_s.folded, dt);
     } else {
         PublishTorso(0.0f, false);
         bodyTurn = ActualBodyTurn(a1, g_s.folded);   // the root may still sit off the look while the engine chases it back
@@ -21425,10 +21883,8 @@ void Before(uintptr_t a1, float h, float dt)
             "single-update fold %.2f deg, largest resume fold %.2f deg | camera addend while folding max %.2f deg (must "
             "read 0.00) | head yaw %+.2f, folded %+.2f | body-facing delta %+.1f deg | self-check %s | reported head position "
             "turned by %+.1f deg | elbow axis vs root max %.1f deg, at rest %.1f deg (-1 = no sample) | check re-latched for the "
-            "stick %ld, held for the root %ld (this player) | torso: %s gap mean %+.1f min %+.1f max %+.1f deg over %lld updates, "
-            "clamped at %.0f %lld, held (hands close / missing) %lld, no head or grip pose %lld, facing write faults %lld | "
-            "causes: limit pulled the body %.1f deg total, hands used none %lld / "
-            "left %lld / right %lld / both %lld, right stick turning on %lld updates (unread %lld)",
+            "stick %ld, held for the root %ld (this player) | neck hold (hand twist removed) %lld updates, gap min %+.1f max %+.1f "
+            "deg, at the %.0f deg range %lld, re-centring (walking) %lld, reset (jump / new player) %lld, facing write faults %lld",
             on ? 1 : 0, g_folded, g_paused, static_cast<unsigned long long>(g_pausedVtRva), g_off, g_selFaults,
             g_faults, g_maxStep, g_maxResume, g_maxAddend, h, g_s.folded, static_cast<float>(g_bfDeltaCdeg) / 100.0f,
             g_bfVerdict < 0 ? "WAITING (no root yaw yet)"
@@ -21436,20 +21892,14 @@ void Before(uintptr_t a1, float h, float dt)
             HeadFollowFoldedForSolve(nullptr),   // what ovr_GetTrackingState turns the position by (decouple active here)
             bfAx < 0 ? -1.0f : static_cast<float>(bfAx) / 100.0f,
             bfAxRest < 0 ? -1.0f : static_cast<float>(bfAxRest) / 100.0f, static_cast<long>(g_bfRelatchStick),
-            static_cast<long>(g_bfHeldByRoot),
-            g_tN ? "" : "NO TORSO READING - the body followed the head as before;",
-            g_tN ? static_cast<float>(g_tSum / static_cast<double>(g_tN)) : 0.0f, g_tMin, g_tMax, g_tN,
-            headfollow::kTorsoMaxGapDeg, g_tClamped, g_tHeld, g_tNoPose, g_tFaults,
-            static_cast<float>(g_tPulled), g_tHands[0], g_tHands[1], g_tHands[2], g_tHands[3], g_tStick, g_tStickUnread);
+            static_cast<long>(g_bfHeldByRoot), g_tN, g_nhMin, g_nhMax, headfollow::kNeckRangeDeg, g_nhClamped, g_nhWalking,
+            g_nhResets, g_tFaults);
         g_winStart = now;
         g_folded = g_paused = g_off = g_selFaults = g_faults = 0;
         g_maxStep = g_maxResume = g_maxAddend = 0.0f;
-        g_tSum = 0.0;
-        g_tN = g_tClamped = g_tHeld = g_tFaults = g_tNoPose = 0;
-        g_tMin = g_tMax = 0.0f;
-        g_tPulled = 0.0;
-        g_tHands[0] = g_tHands[1] = g_tHands[2] = g_tHands[3] = 0;
-        g_tStick = g_tStickUnread = 0;
+        g_tN = g_tFaults = 0;
+        g_nhClamped = g_nhWalking = g_nhResets = 0;
+        g_nhMin = g_nhMax = 0.0f;
     }
 }
 
@@ -30944,6 +31394,46 @@ void GhResetItem(VbWin& w, uintptr_t item, const char* cls)
     strncpy_s(w.ghCls, sizeof(w.ghCls), cls, _TRUNCATE);
 }
 
+// [REACTGRIP] (d) - while a hit / knockdown / dodge event runs (g_rgxActive, set by reldev::RgxStep), the weapon vs the DRAWN right
+// hand on EVERY torn-checked sample, moving or not. GunHandNote's own window keeps its still-only filter; this does not touch it.
+// The same arithmetic as GunHandNote: where rel puts the Holder on the drawn hand vs what we WROTE (0) and the item's drawn slot in
+// buffer 0 / 1 (INV-178), and the drawn hand vs the solve's wrist. Peaks into single-word atomics, read at the event's end.
+// COST: only inside an event - up to two guarded 48-byte reads and a few 3x3 products per rendered frame.
+void ReactGripGunSample(const float* wh, const GhPub& p)
+{
+    float Hb[9], Hn[9], hl[3];
+    Mtx34To3x3(wh, Hb);
+    if (!Mat3NormalizeCols(Hb, Hn, hl)) { return; }
+    const float hp[3] = { wh[3], wh[7], wh[11] };
+    const float ex[3] = { hp[0] + Hn[0] * p.relT[0] + Hn[1] * p.relT[1] + Hn[2] * p.relT[2],
+                          hp[1] + Hn[3] * p.relT[0] + Hn[4] * p.relT[1] + Hn[5] * p.relT[2],
+                          hp[2] + Hn[6] * p.relT[0] + Hn[7] * p.relT[1] + Hn[8] * p.relT[2] };
+    float exB[9];
+    Mat3Mul(Hn, p.relR, exB);
+    float src[3][12];
+    bool  have[3] = { true, false, false };
+    for (int k = 0; k < 12; ++k) { src[0][k] = p.W[k]; }
+    if (static_cast<uintptr_t>(g_ghAltItem) == p.item) {
+        for (int b = 0; b < 2; ++b) {
+            const uintptr_t a = static_cast<uintptr_t>(g_ghAltAddr[b]);
+            if (a && DcReadMtx(a, 0, src[1 + b])) { have[1 + b] = true; }
+        }
+    }
+    for (int s = 0; s < 3; ++s) {
+        if (!have[s]) { continue; }
+        const float mm = VecLen(src[s][3] - ex[0], src[s][7] - ex[1], src[s][11] - ex[2]) * 1000.0f;
+        RgxAtomicMax(&g_rgxGunMm[s], static_cast<LONG>(mm * 10.0f));
+        if (s == 0) {
+            float Ob[9], On[9], ol[3];
+            Mtx34To3x3(src[0], Ob);
+            if (Mat3NormalizeCols(Ob, On, ol)) { RgxAtomicMax(&g_rgxGunDeg, static_cast<LONG>(Mat3AngleBetween(exB, On) * 100.0f)); }
+        }
+    }
+    const float emm = VecLen(hp[0] - p.wrist[0], hp[1] - p.wrist[1], hp[2] - p.wrist[2]) * 1000.0f;
+    RgxAtomicMax(&g_rgxHandWrMm, static_cast<LONG>(emm * 10.0f));
+    InterlockedIncrement(&g_rgxGunN);
+}
+
 // Render thread, from ViewBodySample after the torn guard. wh = the DRAWN world matrix of element 53 (handR) from
 // altMatrices RAW; Cn = the view basis (columns right/up/back, normalised); still = camera speed < 0.5 m/s.
 // COST when on: a 150-byte seqlock copy, up to two guarded 48-byte reads, ~6 small 3x3 products, 4 acos.
@@ -30959,6 +31449,8 @@ void GunHandNote(const float* wh, const float* Cn, bool still)
     if (g_ghSeq != s1) { ++w.ghBusy; return; }
     if (GetTickCount64() - p.ms > 200) { ++w.ghStale; return; }   // nothing placed for 200 ms: the hand is empty now
     if (!p.usedRel) { ++w.ghNoRel; return; }
+    // [REACTGRIP] (d): inside a hit / dodge event, every sample (moving or not). Outside one: one volatile load.
+    if (g_rgxActive) { ReactGripGunSample(wh, p); }
     if (!still) { ++w.ghMoving; return; }
     float Hb[9], Hn[9], hl[3];
     Mtx34To3x3(wh, Hb);
@@ -32354,6 +32846,9 @@ void BodyWritersInstall()
         AnimSuppressLookPath ? 1 : 0);
 }
 
+// camhook.cpp (dlvr scope): the ENGINE camera's world position, stored on the camera copy - the hand-twist view hold's self-check.
+extern volatile float g_viewPos[3];
+
 // ===== [EYEPOINT] - THE VIEW AT THE FACE's EYES (docs/SPEC-EYE-FORWARD-2026-10-02.md) =====
 // gamedll +C75380 (PlayerVis slot 371, lp2_gamedll_out.txt): GetElementWorldPos(eye bone) -> IControlObject::PointWorldToLocal
 // (owner+24) -> vis+4112..4120, the base GetCameraPos turns back into the world (+BA72F0, INV-327). A pass-through detour: the
@@ -32423,7 +32918,7 @@ float           g_epRefMaxMm = 0.0f, g_epRefMaxSinceMm = 0.0f;
 bool            g_epWasCrouched = false;
 volatile LONG   g_epSaidClimbOff = 0;
 
-bool EpAddLocal(__int64 a1, const float d[3], float loc[3], uintptr_t* ownerOut)
+bool EpAddLocal(__int64 a1, const float d[3], float loc[3], uintptr_t* ownerOut, const float cl[3])
 {
     __try {
         void* iface = reinterpret_cast<void*>(a1 + 64);
@@ -32435,11 +32930,309 @@ bool EpAddLocal(__int64 a1, const float d[3], float loc[3], uintptr_t* ownerOut)
         g_epV2L(reinterpret_cast<const void*>(owner + 24), loc, d);
         if (!(loc[0] == loc[0] && loc[1] == loc[1] && loc[2] == loc[2])) { return false; }   // NaN
         float* p = reinterpret_cast<float*>(a1 + 4112);
-        p[0] += loc[0];
-        p[1] += loc[1];
-        p[2] += loc[2];
+        // + cl: the hand-twist view hold's body-local correction (0 0 0 unless it applied this call)
+        p[0] += loc[0] + cl[0];
+        p[1] += loc[1] + cl[1];
+        p[2] += loc[2] + cl[2];
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// ===== HAND-TWIST VIEW HOLD - docs/superpowers/specs/2026-11-19-hand-twist-view-hold-design.md, trace 20261119_1040, INV-748 =====
+// Torso from controllers turns the BODY by the hand twist G; the camera base is body-local (INV-747), so every lever below the head
+// term turned with it and the view moved with the hands. Here, for the player, the base gets c (headfollow::HandTwistViewCorrection)
+// so those levers sit where a body WITHOUT the twist puts them; the head term is the fold's (S-61) and is not touched.
+// P (C06C60's look-pitch turn of HSPINE1, INV-310) is latched around C06C60 by BaSpinePitch and used only when HSPINE1's basis NOW
+// equals the latched result bit for bit - C75380 runs twice per update, once before C06C60 (+C5FE5D) and once after (C1F9B0:29).
+// Every refusal leaves c = 0 (today's base) and is counted; the first of each kind is named.
+float           g_htvBBefore[12] = {}, g_htvBAfter[12] = {};   // HSPINE1 world 3x4 around the last player C06C60 call
+uintptr_t       g_htvPVis = 0;
+bool            g_htvPHave = false;
+volatile LONG64 g_htvPLatched = 0, g_htvPReadFail = 0;
+enum HtvWhy { kHtvOk = 0, kHtvNoGap, kHtvStale, kHtvObj, kHtvBones, kHtvHead, kHtvUpright, kHtvNaN, kHtvBig, kHtvFault, kHtvN };
+const char* const kHtvWhyText[kHtvN] = { "applied", "no twist this update (torso not folding)", "twist older than 100 ms",
+    "another player object", "HSPINE1 / eye bone unreadable", "head position unreadable or the helper inactive",
+    "the body is not upright within 1 deg", "NaN", "|c| over 0.25 m (refused)", "fault (an engine call threw)" };
+long long       g_htvCount[kHtvN] = {};
+bool            g_htvSaid[kHtvN] = {};
+long long       g_htvPUsed = 0, g_htvPIdent = 0;
+// window (game thread)
+ULONGLONG       g_htvWinMs = 0;
+float           g_htvGMin = 0.0f, g_htvGMax = 0.0f, g_htvCMaxMm = 0.0f, g_htvSpringMax = 0.0f;
+double          g_htvCSumMm = 0.0, g_htvASumMm = 0.0, g_htvVSumMm = 0.0, g_htvPSumDeg = 0.0;
+long long       g_htvApplied = 0;
+bool            g_htvSaidFirst = false;
+// self-check (game thread): the ENGINE's camera position (camhook g_viewPos, one update old) against the change in c
+float           g_htvVpPrev[3] = {}, g_htvCWCur[3] = {}, g_htvCWPrevB[3] = {}, g_htvGCur = 0.0f, g_htvGPrevB = 0.0f;
+bool            g_htvVpHave = false;
+double          g_htvSelfDot = 0.0, g_htvSelfUU = 0.0, g_htvSelfU = 0.0, g_htvSelfDG = 0.0;
+long long       g_htvSelfN = 0;
+
+// The head C08100 placed HSPINE1 with (h0_2 :117-126): qword_181C11A70 -> vfunc +6872 -> helper; slot 5 (+40) active; slot 4 (+32)
+// the vec3. Body-local as C08100 uses it. 0 = ok, 1 = inactive / absent, 2 = fault.
+// Resolved once, outside HtvReadHead (a function-local static cannot share a function with __try, C2712 - lookpitch::GameRva).
+uintptr_t HtvGameRva() { static const uintptr_t v = ::dlvr::buildrva::Rva(::dlvr::buildrva::kGamedll, 0x1C11A70); return v; }
+uintptr_t HtvGd() { static const uintptr_t v = reinterpret_cast<uintptr_t>(GetModuleHandleA("gamedll_x64_rwdi.dll")); return v; }
+
+bool HtvReadFacing(uintptr_t obj, float& out)
+{
+    __try {
+        out = *reinterpret_cast<const float*>(obj + 4588);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+int HtvReadHead(float h[3])
+{
+    const uintptr_t gameRva = HtvGameRva();
+    const uintptr_t gd = HtvGd();
+    if (!gd) { return 1; }
+    typedef uintptr_t (__fastcall* ObjFn)(uintptr_t);
+    typedef unsigned char (__fastcall* BoolFn)(uintptr_t);
+    typedef float* (__fastcall* VecFn)(uintptr_t, void*);
+    __try {
+        const uintptr_t game = *reinterpret_cast<const uintptr_t*>(gd + gameRva);
+        if (!game) { return 1; }
+        const uintptr_t* gvt = *reinterpret_cast<uintptr_t* const*>(game);
+        const uintptr_t helper = reinterpret_cast<ObjFn>(gvt[6872 / 8])(game);
+        if (!helper) { return 1; }
+        const uintptr_t* hvt = *reinterpret_cast<uintptr_t* const*>(helper);
+        if (!reinterpret_cast<BoolFn>(hvt[40 / 8])(helper)) { return 1; }
+        alignas(16) unsigned char buf[32] = {};
+        const float* r = reinterpret_cast<VecFn>(hvt[32 / 8])(helper, buf);
+        if (!r) { return 2; }
+        h[0] = r[0]; h[1] = r[1]; h[2] = r[2];
+        return (std::isfinite(h[0]) && std::isfinite(h[1]) && std::isfinite(h[2])) ? 0 : 2;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 2;
+    }
+}
+
+bool HtvV2L(uintptr_t owner, const float w[3], float l[3])
+{
+    __try {
+        g_epV2L(reinterpret_cast<const void*>(owner + 24), l, w);
+        return l[0] == l[0] && l[1] == l[1] && l[2] == l[2];
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool HtvOwner(__int64 a1, uintptr_t& owner)
+{
+    __try {
+        void* iface = reinterpret_cast<void*>(a1 + 64);
+        void** vt   = *reinterpret_cast<void***>(iface);
+        typedef uintptr_t (__fastcall* GetOwnerFn)(void*);
+        owner = reinterpret_cast<GetOwnerFn>(vt[1])(iface);   // the same vfunc +8 +C75380 calls
+        return owner != 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool HtvReadBase(__int64 a1, float b[3])
+{
+    __try {
+        const float* p = reinterpret_cast<const float*>(a1 + 4112);
+        b[0] = p[0]; b[1] = p[1]; b[2] = p[2];
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// BaSpinePitch (C06C60's pass-through) for the player: HSPINE1's world 3x4 before (pre) and after the original.
+void HtvPitchLatch(__int64 a1, bool pre)
+{
+    const uintptr_t model = reinterpret_cast<uintptr_t>(BoneProbeCapturedModel());
+    float m[12];
+    if (!model || !ReadAccessorMtx(g_getWorld, model, E6(7), m)) {   // [ELEMMAP] hspine1
+        InterlockedIncrement64(&g_htvPReadFail);
+        g_htvPHave = false;
+        return;
+    }
+    if (pre) {
+        memcpy(g_htvBBefore, m, sizeof(m));
+        g_htvPHave = false;
+    } else {
+        memcpy(g_htvBAfter, m, sizeof(m));
+        g_htvPVis = static_cast<uintptr_t>(a1);
+        g_htvPHave = true;
+        InterlockedIncrement64(&g_htvPLatched);
+    }
+}
+
+void HtvRefuse(HtvWhy w)
+{
+    ++g_htvCount[w];
+    if (w != kHtvOk && w != kHtvNoGap && !g_htvSaid[w]) {
+        g_htvSaid[w] = true;
+        // [PROBE: HANDVIEW] gate=comfort_body_follows_head  site=HEADSET  log-only=no
+        LOG("boneblend: [HANDVIEW] REFUSED FIRST (logged once per reason) - %s: the camera base gets NO hand-twist correction on "
+            "this call (today's view). Counted on the 5 s line.", kHtvWhyText[w]);
+    }
+}
+
+// Computes the body-local correction cl and its world form cw for this C75380 call. False = refused (cl = cw = 0, counted).
+// d1 = the cam_eye_forward offset this call (world). COST: listed in the trace (two matrix reads, five V2L, one helper read).
+bool HtvCompute(__int64 a1, const float d1[3], float cl[3], float cw[3])
+{
+    cl[0] = cl[1] = cl[2] = cw[0] = cw[1] = cw[2] = 0.0f;
+    const ULONGLONG now = GetTickCount64();
+    if (!camyaw::follow::g_htvValid) { HtvRefuse(kHtvNoGap); return false; }
+    if (now - camyaw::follow::g_htvMs > 100) { HtvRefuse(kHtvStale); return false; }
+    const float G = camyaw::follow::g_htvGapDeg;
+    if (G == 0.0f) { HtvRefuse(kHtvNoGap); return false; }
+    uintptr_t owner = 0;
+    if (!HtvOwner(a1, owner)) { HtvRefuse(kHtvFault); return false; }
+    if (owner != camyaw::follow::g_htvObj) { HtvRefuse(kHtvObj); return false; }
+    const uintptr_t model = reinterpret_cast<uintptr_t>(BoneProbeCapturedModel());
+    float mE[12], mS[12];
+    if (!model || !ReadAccessorMtx(g_getWorld, model, E6(8), mE) ||     // [ELEMMAP] eyecamera
+        !ReadAccessorMtx(g_getWorld, model, E6(7), mS)) {               // [ELEMMAP] hspine1
+        HtvRefuse(kHtvBones); return false;
+    }
+    float h[3];
+    if (HtvReadHead(h) != 0) { HtvRefuse(kHtvHead); return false; }
+    // M = Rb^T: its columns are the world axes in body-local coordinates.
+    const float ex[3] = { 1.0f, 0.0f, 0.0f }, ey[3] = { 0.0f, 1.0f, 0.0f }, ez[3] = { 0.0f, 0.0f, 1.0f };
+    float cx[3], cy[3], cz[3];
+    if (!HtvV2L(owner, ex, cx) || !HtvV2L(owner, ey, cy) || !HtvV2L(owner, ez, cz)) { HtvRefuse(kHtvFault); return false; }
+    if (cy[1] < headfollow::kWalkUprightCos) { HtvRefuse(kHtvUpright); return false; }
+    const float M[9] = { cx[0], cy[0], cz[0], cx[1], cy[1], cz[1], cx[2], cy[2], cz[2] };
+    float base[3];
+    if (!HtvReadBase(a1, base)) { HtvRefuse(kHtvFault); return false; }
+    // a = HSPINE1 body-local - h = base - V2L(eye - HSPINE1) - h ; v = V2L(eye - HSPINE1 + d1)
+    const float eMinusS[3] = { mE[3] - mS[3], mE[7] - mS[7], mE[11] - mS[11] };
+    const float vW[3] = { eMinusS[0] + d1[0], eMinusS[1] + d1[1], eMinusS[2] + d1[2] };
+    float eSL[3], v[3];
+    if (!HtvV2L(owner, eMinusS, eSL) || !HtvV2L(owner, vW, v)) { HtvRefuse(kHtvFault); return false; }
+    const float a[3] = { base[0] - eSL[0] - h[0], base[1] - eSL[1] - h[1], base[2] - eSL[2] - h[2] };
+    // P: only when HSPINE1's basis now IS the latched post-C06C60 basis (bit for bit); else C06C60 has not pitched it -> I.
+    float Pl[9];
+    const float* P = nullptr;
+    const bool pMatch = g_htvPHave && g_htvPVis == static_cast<uintptr_t>(a1) &&
+                        memcmp(&mS[0], &g_htvBAfter[0], 3 * sizeof(float)) == 0 &&
+                        memcmp(&mS[4], &g_htvBAfter[4], 3 * sizeof(float)) == 0 &&
+                        memcmp(&mS[8], &g_htvBAfter[8], 3 * sizeof(float)) == 0;
+    float pDeg = 0.0f;
+    if (pMatch) {
+        float rb[9], ra[9], nb[9], na[9], lens[3];
+        Mtx34To3x3(g_htvBBefore, rb);
+        Mtx34To3x3(g_htvBAfter, ra);
+        if (Mat3NormalizeCols(rb, nb, lens) && Mat3NormalizeCols(ra, na, lens)) {
+            float Pw[9];   // Pw = na * nb^T
+            for (int r = 0; r < 3; ++r) {
+                for (int c = 0; c < 3; ++c) {
+                    Pw[3 * r + c] = na[3 * r + 0] * nb[3 * c + 0] + na[3 * r + 1] * nb[3 * c + 1] + na[3 * r + 2] * nb[3 * c + 2];
+                }
+            }
+            float t[9];   // Pl = M Pw M^T
+            for (int r = 0; r < 3; ++r) {
+                for (int c = 0; c < 3; ++c) {
+                    t[3 * r + c] = M[3 * r + 0] * Pw[0 * 3 + c] + M[3 * r + 1] * Pw[1 * 3 + c] + M[3 * r + 2] * Pw[2 * 3 + c];
+                }
+            }
+            for (int r = 0; r < 3; ++r) {
+                for (int c = 0; c < 3; ++c) {
+                    Pl[3 * r + c] = t[3 * r + 0] * M[3 * c + 0] + t[3 * r + 1] * M[3 * c + 1] + t[3 * r + 2] * M[3 * c + 2];
+                }
+            }
+            P = Pl;
+            const float tr = Pw[0] + Pw[4] + Pw[8];
+            const float ca = (tr - 1.0f) * 0.5f;
+            pDeg = acosf(ca > 1.0f ? 1.0f : (ca < -1.0f ? -1.0f : ca)) * 57.2957795f;
+            ++g_htvPUsed;
+        }
+    } else {
+        ++g_htvPIdent;
+    }
+    float c[3];
+    headfollow::HandTwistViewCorrection(G, a, v, P, c);
+    if (!(c[0] == c[0] && c[1] == c[1] && c[2] == c[2])) { HtvRefuse(kHtvNaN); return false; }
+    const float cm = sqrtf(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]);
+    if (cm > 0.25f) { HtvRefuse(kHtvBig); return false; }
+    cl[0] = c[0]; cl[1] = c[1]; cl[2] = c[2];
+    // world form: cw_i = dot(column i of M, c) = dot(V2L(e_i), c)
+    cw[0] = cx[0] * c[0] + cx[1] * c[1] + cx[2] * c[2];
+    cw[1] = cy[0] * c[0] + cy[1] * c[1] + cy[2] * c[2];
+    cw[2] = cz[0] * c[0] + cz[1] * c[1] + cz[2] * c[2];
+    HtvRefuse(kHtvOk);
+    // window
+    const float aMm = 1000.0f * sqrtf(a[0] * a[0] + a[2] * a[2]);
+    const float vMm = 1000.0f * sqrtf(v[0] * v[0] + v[2] * v[2]);
+    if (g_htvApplied == 0 || G < g_htvGMin) { g_htvGMin = G; }
+    if (g_htvApplied == 0 || G > g_htvGMax) { g_htvGMax = G; }
+    if (1000.0f * cm > g_htvCMaxMm) { g_htvCMaxMm = 1000.0f * cm; }
+    g_htvCSumMm += 1000.0f * cm;
+    g_htvASumMm += aMm;
+    g_htvVSumMm += vMm;
+    g_htvPSumDeg += pDeg;
+    ++g_htvApplied;
+    float spring = -1.0f, facingNow = 0.0f;
+    if (HtvReadFacing(camyaw::follow::g_htvObj, facingNow)) {
+        spring = fabsf(headfollow::Wrap180(facingNow - camyaw::follow::g_htvAfter));
+    }
+    if (spring > g_htvSpringMax) { g_htvSpringMax = spring; }
+    if (!g_htvSaidFirst) {
+        g_htvSaidFirst = true;
+        // [PROBE: HANDVIEW] gate=comfort_body_follows_head  site=HEADSET  log-only=no
+        LOG("boneblend: [HANDVIEW] FIRST (logged unconditionally) - twist G %+.2f deg | lever a (HSPINE1 - head, body x/z) %.1f mm, "
+            "v (eye - HSPINE1 + d1, x/z) %.1f mm | C06C60 pitch %s %.1f deg | head (body-local) %+.3f %+.3f %+.3f | correction c "
+            "(body-local) %+.1f %+.1f %+.1f mm, to the hand anchor (world) %+.1f %+.1f %+.1f mm | root facing - written %.2f deg | "
+            "player vis %p", G, aMm, vMm, P ? "USED" : "not on this basis (identity)", pDeg, h[0], h[1], h[2], 1000.0f * c[0],
+            1000.0f * c[1], 1000.0f * c[2], 1000.0f * cw[0], 1000.0f * cw[1], 1000.0f * cw[2], spring, reinterpret_cast<void*>(a1));
+    }
+    return true;
+}
+
+// Game thread, once per EyePointApply call (before this call's c): the self-check pairing and the 5 s line.
+void HtvTick()
+{
+    // A new engine camera position = a new frame: pair its move with the change of the LAST call's c since the previous one.
+    const float vp[3] = { g_viewPos[0], g_viewPos[1], g_viewPos[2] };
+    if (std::isfinite(vp[0]) && std::isfinite(vp[2]) && (vp[0] != g_htvVpPrev[0] || vp[2] != g_htvVpPrev[2])) {
+        if (g_htvVpHave) {
+            const float m[2] = { vp[0] - g_htvVpPrev[0], vp[2] - g_htvVpPrev[2] };
+            const float u[2] = { g_htvCWCur[0] - g_htvCWPrevB[0], g_htvCWCur[2] - g_htvCWPrevB[2] };
+            const float uu = u[0] * u[0] + u[1] * u[1];
+            const float mm = m[0] * m[0] + m[1] * m[1];
+            if (uu > 0.0005f * 0.0005f && mm < 0.05f * 0.05f) {   // c moved > 0.5 mm; camera step < 5 cm (no teleport / walk burst)
+                g_htvSelfDot += m[0] * u[0] + m[1] * u[1];
+                g_htvSelfUU  += uu;
+                g_htvSelfU   += sqrtf(uu);
+                g_htvSelfDG  += fabsf(headfollow::Wrap180(g_htvGCur - g_htvGPrevB));
+                ++g_htvSelfN;
+            }
+        }
+        g_htvVpHave = true;
+        g_htvVpPrev[0] = vp[0]; g_htvVpPrev[1] = vp[1]; g_htvVpPrev[2] = vp[2];
+        g_htvCWPrevB[0] = g_htvCWCur[0]; g_htvCWPrevB[1] = g_htvCWCur[1]; g_htvCWPrevB[2] = g_htvCWCur[2];
+        g_htvGPrevB = g_htvGCur;
+    }
+    const ULONGLONG now = GetTickCount64();
+    if (g_htvWinMs == 0) { g_htvWinMs = now; return; }
+    if (now - g_htvWinMs < 5000) { return; }
+    g_htvWinMs = now;
+    long long calls = 0;
+    for (int i = 0; i < kHtvN; ++i) { calls += g_htvCount[i]; }
+    const double n = g_htvApplied ? static_cast<double>(g_htvApplied) : 1.0;
+    // ratio: the engine camera's move projected on the change of c, over |change of c|^2. With the hold working the camera does NOT
+    // follow the lever: ~0. A camera that still swung with the hands would read ~ -1 (the camera move = minus the change of c).
+    // [PROBE: HANDVIEW] gate=comfort_body_follows_head  site=HEADSET  log-only=no
+    LOG("boneblend: [HANDVIEW] 5 s | calls %lld, applied %lld | refused: no twist %lld, stale %lld, other object %lld, bones %lld, "
+        "head %lld, not upright %lld, NaN %lld, too big %lld, fault %lld | twist G %+.1f..%+.1f deg | |c| mean %.1f max %.1f mm | "
+        "lever a %.1f mm, v %.1f mm (means) | C06C60 pitch used %lld (mean %.1f deg), identity %lld, latched %lld, latch read fails "
+        "%lld | root facing - written max %.2f deg | SELF-CHECK (engine camera, one update old): %lld pairs, camera-on-lever ratio "
+        "%+.2f (0 = held, -1 = swinging), lever swing %.2f mm/deg, residual %.2f mm/deg",
+        calls, g_htvApplied, g_htvCount[kHtvNoGap], g_htvCount[kHtvStale], g_htvCount[kHtvObj], g_htvCount[kHtvBones],
+        g_htvCount[kHtvHead], g_htvCount[kHtvUpright], g_htvCount[kHtvNaN], g_htvCount[kHtvBig], g_htvCount[kHtvFault],
+        g_htvApplied ? g_htvGMin : 0.0f, g_htvApplied ? g_htvGMax : 0.0f, g_htvCSumMm / n, g_htvCMaxMm, g_htvASumMm / n,
+        g_htvVSumMm / n, g_htvPUsed, g_htvPUsed ? g_htvPSumDeg / static_cast<double>(g_htvPUsed) : 0.0, g_htvPIdent,
+        static_cast<long long>(g_htvPLatched), static_cast<long long>(g_htvPReadFail), g_htvSpringMax, g_htvSelfN,
+        g_htvSelfUU > 0.0 ? g_htvSelfDot / g_htvSelfUU : 0.0, g_htvSelfDG > 0.0 ? 1000.0 * g_htvSelfU / g_htvSelfDG : 0.0,
+        (g_htvSelfDG > 0.0 && g_htvSelfUU > 0.0) ? 1000.0 * fabs(g_htvSelfDot / g_htvSelfUU) * g_htvSelfU / g_htvSelfDG : 0.0);
+    for (int i = 0; i < kHtvN; ++i) { g_htvCount[i] = 0; }
+    g_htvApplied = 0; g_htvPUsed = 0; g_htvPIdent = 0;
+    g_htvCSumMm = g_htvASumMm = g_htvVSumMm = g_htvPSumDeg = 0.0;
+    g_htvCMaxMm = 0.0f; g_htvSpringMax = 0.0f;
+    g_htvSelfDot = g_htvSelfUU = g_htvSelfU = g_htvSelfDG = 0.0;
+    g_htvSelfN = 0;
 }
 
 // physical_crouch_enable only: publishes the applied duck factor for physcrouch's decision. The view is NOT changed - the eye lift
@@ -32471,7 +33264,8 @@ void EyePointApply(__int64 a1)
             st ? "is moved (camera base only; hands follow everything but the arc)" : "is the game's own eye bone",
             g_epCalls, g_epApplied);
     }
-    if (st == 0 && !PhysicalCrouchEnable) { InterlockedIncrement64(&g_epOff); return; }
+    // || ComfortBodyFollowsHead: the hand-twist view hold runs here too (spec 2026-11-19 §8b-2) - with every cam_eye_ off d1 = d2 = 0.
+    if (st == 0 && !PhysicalCrouchEnable && !ComfortBodyFollowsHead) { InterlockedIncrement64(&g_epOff); return; }
     const uintptr_t player = static_cast<uintptr_t>(g_bwVis);
     if (!player) { InterlockedIncrement64(&g_epNoLatch); return; }
     if (static_cast<uintptr_t>(a1) != player) { InterlockedIncrement64(&g_epNotPlayer); return; }
@@ -32659,11 +33453,21 @@ void EyePointApply(__int64 a1)
     const float d[3] = { d1[0] + d2[0], d1[1] + d2[1], d1[2] + d2[2] };
     float loc[3] = {};
     uintptr_t owner = 0;
+    // [LOADBEARING: hand-twist view hold] with comfort_body_follows_head=1 the view does not swing with the hands only because of
+    //      this body-local correction (INV-748; spec 2026-11-19-hand-twist-view-hold-design). Refused = 0 = today's base, counted.
+    float htvL[3] = {}, htvW[3] = {};
+    if (ComfortBodyFollowsHead) {
+        HtvTick();
+        HtvCompute(a1, d1, htvL, htvW);
+        g_htvCWCur[0] = htvW[0]; g_htvCWCur[1] = htvW[1]; g_htvCWCur[2] = htvW[2];
+        g_htvGCur = camyaw::follow::g_htvValid ? camyaw::follow::g_htvGapDeg : 0.0f;
+    }
     // [LOADBEARING: cam_eye_forward] the camera base is moved here (and by cam_eye_arc's term)
-    if (!EpAddLocal(a1, d, loc, &owner)) { InterlockedIncrement64(&g_epFault); return; }
+    if (!EpAddLocal(a1, d, loc, &owner, htvL)) { InterlockedIncrement64(&g_epFault); return; }
     InterlockedIncrement64(&g_epApplied);
     AcquireSRWLockExclusive(&g_epLock);
-    g_epD1[0] = d1[0]; g_epD1[1] = d1[1] + anchorExtraY; g_epD1[2] = d1[2];   // what the HAND ANCHOR gets
+    // what the HAND ANCHOR gets: + the hand-twist correction (world), so the hands stay on the controllers (§4, R5)
+    g_epD1[0] = d1[0] + htvW[0]; g_epD1[1] = d1[1] + anchorExtraY + htvW[1]; g_epD1[2] = d1[2] + htvW[2];
     g_epD1Ms = GetTickCount64();
     g_epDW[0] = d[0]; g_epDW[1] = d[1]; g_epDW[2] = d[2];   // what the VIEW got - dlgview.cpp adds it to a dialogue's point
     g_epDWMs = g_epD1Ms;
@@ -32702,7 +33506,10 @@ void EyePointNoteBodyYaw(float cby, float sby)
 // off, the detour is not armed, or the camera has not applied one in the last 250 ms - counted per side.
 bool EyePointForwardOffset(int side, float out[3])
 {
-    if (!g_epArmed || !(CamEyeForward > 0.0f || CamEyeUpMm > 0.0f || (CamEyeArc && CamEyeArcDrop < 1.0f))) { return false; }
+    // || ComfortBodyFollowsHead: the hand-twist correction rides g_epD1 too (spec 2026-11-19 §8b-2), cam_eye_ switches or not
+    if (!g_epArmed || !(CamEyeForward > 0.0f || CamEyeUpMm > 0.0f || (CamEyeArc && CamEyeArcDrop < 1.0f) || ComfortBodyFollowsHead)) {
+        return false;
+    }
     AcquireSRWLockShared(&g_epLock);
     const ULONGLONG ms = g_epD1Ms;
     out[0] = g_epD1[0]; out[1] = g_epD1[1]; out[2] = g_epD1[2];
@@ -32731,12 +33538,14 @@ bool EyePointViewOffsetWorld(float out[3], uintptr_t* owner)
 void EyePointInstall()
 {
     if (g_epInstallDone) { return; }
-    if (!(CamEyeForward > 0.0f) && !CamEyeArc && !(CamEyeUpMm > 0.0f) && !PhysicalCrouchEnable) {
+    // || comfort_body_follows_head: the hand-twist view hold needs this detour (spec 2026-11-19 §8b-2)
+    if (!(CamEyeForward > 0.0f) && !CamEyeArc && !(CamEyeUpMm > 0.0f) && !PhysicalCrouchEnable && !ComfortBodyFollowsHead) {
         InterlockedExchange(&g_epInstallDone, 1);
         // [PROBE: EYEPOINT] gate=cam_eye_forward|cam_eye_arc  site=FLAT  log-only=yes
         LOG("boneblend: [EYEPOINT] NOT ARMED - cam_eye_forward=0, cam_eye_arc=0 and cam_eye_up_mm=0 at launch, so the gamedll "
             "+C75380 detour is NOT installed: the view is the game's own eye bone and none of the cam_eye_ settings can be turned "
-            "on live this launch. That is a SETTING, not a result.");
+            "on live this launch (comfort_body_follows_head=0 and physical_crouch_enable=0 too, so the hand-twist view hold is not "
+            "armed either). That is a SETTING, not a result.");
         return;
     }
     HMODULE gd = GetModuleHandleA("gamedll_x64_rwdi.dll");
@@ -36873,7 +37682,12 @@ void __fastcall BaSpinePitch(__int64 a1)
     }
     if (AnimSkipSpinePitch && g_baThis == 0) { InterlockedIncrement64(&g_baSpNoLatch); }
     else { InterlockedIncrement64(&g_baSpPass); }
+    // HAND-TWIST VIEW HOLD (spec 2026-11-19 §8b-1/3): for the player (EyePointApply's own latch, g_bwVis) HSPINE1's world basis
+    // around the original, so EyePointApply can undo the twist about C06C60's look-pitch axis. COST: two matrix reads, player only.
+    const bool htvLatch = ComfortBodyFollowsHead && g_bwVis != 0 && a1 == static_cast<__int64>(g_bwVis);
+    if (htvLatch) { HtvPitchLatch(a1, true); }
     g_baTrueSpinePitch(a1);
+    if (htvLatch) { HtvPitchLatch(a1, false); }
 }
 
 // ---- The pump eye hold, AFTER BFF080 (D-298 follow-up; rig_throwable_body_hold, no new key). D-298: with a firearm, BFF080 (slot 342)
@@ -37202,9 +38016,51 @@ void BonesAnimStamp(int ev)
     BaNoteEv(ev == 0 ? 0 : 1);
 }
 
+// C06C60's pass-through on its OWN install + commit (spec 2026-11-19 §8b-1, trace 20261119_1040): it serves anim_skip_spine_pitch
+// (skip the original for the player) AND the hand-twist view hold (latch HSPINE1 around it). Outside the bones-anim all-or-nothing
+// block, so a prologue mismatch here never takes the Tier B detours (BFF080 / sampler / additive) down with it. One-shot.
+volatile LONG g_spInstallDone = 0;
+void SpinePitchInstall()
+{
+    if (g_spInstallDone) { return; }
+    if (!AnimSkipSpinePitch && !ComfortBodyFollowsHead) {
+        InterlockedExchange(&g_spInstallDone, 1);
+        // [PROBE: HANDVIEW] gate=comfort_body_follows_head  site=FLAT  log-only=yes
+        LOG("boneblend: [HANDVIEW] C06C60 NOT INSTALLED - anim_skip_spine_pitch=0 and comfort_body_follows_head=0 at launch: no "
+            "spine-pitch skip, no hand-twist view hold this launch. That is a SETTING, not a result.");
+        return;
+    }
+    HMODULE gd = GetModuleHandleA("gamedll_x64_rwdi.dll");
+    if (!gd) { return; }   // the bones-anim WAITING line already names this; retried on the next poll
+    InterlockedExchange(&g_spInstallDone, 1);
+    // hm5 (ghidra-project/ida/hm5_gamedll_out.txt, bytes read back from the deployed gamedll 97046bba...): C06C60 mov
+    // [rsp+8],rbx / mov [rsp+10h],rdi / push rbp / lea rbp,[rsp-20h] = 16 bytes, whole instructions, none RIP-relative.
+    static const unsigned char kSpP[] = { 0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x7C,0x24,0x10,0x55,0x48,0x8D,0x6C,0x24,0xE0 };
+    PreparedDetour prep[1] = {};
+    BaSpinePitchFn tru = nullptr;
+    bool committed = false;
+    int  attempts  = 0;
+    if (InstallDetour(reinterpret_cast<uintptr_t>(gd) + 0xC06C60, kSpP, sizeof(kSpP), reinterpret_cast<void*>(&BaSpinePitch),
+                      reinterpret_cast<void**>(&tru), "C06C60 spine pitch", &prep[0])) {
+        g_baTrueSpinePitch = tru;   // before the commit: the hook calls it the moment it is live
+        for (; attempts < 20 && !committed; ++attempts) {
+            committed = CommitDetours(prep, 1);
+            if (!committed) { Sleep(2); }
+        }
+    }
+    // [PROBE: HANDVIEW] gate=comfort_body_follows_head  site=FLAT  log-only=yes
+    LOG("boneblend: [HANDVIEW] C06C60 %s - detour %s after %d attempt(s) | anim_skip_spine_pitch=%d (skip for the player), "
+        "comfort_body_follows_head=%d (latch HSPINE1 around it for the hand-twist view hold)%s",
+        committed ? "ARMED" : "*** NOT ARMED ***", committed ? "committed" : (prep[0].ready ? "commit FAILED" : "REFUSED (prologue)"),
+        attempts, AnimSkipSpinePitch ? 1 : 0, ComfortBodyFollowsHead ? 1 : 0,
+        committed ? "" : " - the view hold then uses no pitch (refusing nothing; error only when looking down with a twist)");
+    if (!committed) { g_baTrueSpinePitch = nullptr; }
+}
+
 // Poll thread (ovr2xr.cpp, beside BodyWritersInstall). One-shot once gamedll is mapped.
 void BonesAnimInstall()
 {
+    SpinePitchInstall();   // its own one-shot - before the bones-anim gate below, which does not list comfort_body_follows_head
     if (g_baInstallDone) { return; }
     // diag_view_pos needs only the latch (the [VIEWPOS] STAB column reads the head stabiliser through the player's
     // PlayerFppVis): with every anim_* setting and diag_bones_anim off, BaHook latches `this` and calls the original.
@@ -37241,9 +38097,7 @@ void BonesAnimInstall()
     // RIP-relative (the first RIP-relative instruction is the GetTimeDelta call at +32).
     static const unsigned char kBaH[] = { 0x40,0x55,0x56,0x41,0x57,0x48,0x8D,0x6C,0x24,0xC0,0x48,0x81,0xEC,0x40,0x01,0x00,
                                           0x00 };
-    // hm5 (ghidra-project/ida/hm5_gamedll_out.txt, bytes read back from the deployed gamedll 97046bba...): C06C60 mov
-    // [rsp+8],rbx / mov [rsp+10h],rdi / push rbp / lea rbp,[rsp-20h] = 16 bytes, whole instructions, none RIP-relative.
-    static const unsigned char kBaP[] = { 0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x7C,0x24,0x10,0x55,0x48,0x8D,0x6C,0x24,0xE0 };
+    // (C06C60's prologue bytes moved to SpinePitchInstall with its detour.)
     const uintptr_t base = reinterpret_cast<uintptr_t>(gd);
     PreparedDetour prep[5] = {};
     int  n = 0;
@@ -37253,7 +38107,6 @@ void BonesAnimInstall()
     BaSampleFn     truS = nullptr;
     BaAddFn        truA = nullptr;
     BaHandCorrFn   truH = nullptr;
-    BaSpinePitchFn truP = nullptr;
     if (InstallDetour(base + 0xBFF080, kBa, sizeof(kBa), reinterpret_cast<void*>(&BaHook),
                       reinterpret_cast<void**>(&tru), "BFF080 bones-anim", &prep[n])) { ++n; } else { okAll = false; }
     if (wantSkip) {
@@ -37266,17 +38119,13 @@ void BonesAnimInstall()
         if (InstallDetour(base + 0xC81190, kBaH, sizeof(kBaH), reinterpret_cast<void*>(&BaHandCorr),
                           reinterpret_cast<void**>(&truH), "C81190 hand correction", &prep[n])) { ++n; } else { okAll = false; }
     }
-    if (AnimSkipSpinePitch) {
-        if (InstallDetour(base + 0xC06C60, kBaP, sizeof(kBaP), reinterpret_cast<void*>(&BaSpinePitch),
-                          reinterpret_cast<void**>(&truP), "C06C60 spine pitch", &prep[n])) { ++n; } else { okAll = false; }
-    }
+    // C06C60 (anim_skip_spine_pitch) moved to SpinePitchInstall - its own commit (spec 2026-11-19 §8b-1).
     // ALL OR NOTHING: a sampler skip without the additive skip (or vice versa) would be a half-fix that reads like one.
     if (okAll) {
         g_baTrue = tru;          // before the commit: the hooks call them the moment they are live
         g_baTrueSample = truS;
         g_baTrueAdd    = truA;
         g_baTrueHandCorr = truH;
-        g_baTrueSpinePitch = truP;
         for (; attempts < 20 && !committed; ++attempts) {
             committed = CommitDetours(prep, n);
             if (!committed) { Sleep(2); }
@@ -37289,14 +38138,13 @@ void BonesAnimInstall()
         "| diag_view_pos=%d (latch only, for the view-position probe's STAB column) | anim_skip_spine_pitch=%d (C06C60 not "
         "called for the player).",
         committed ? "ARMED" : "*** NOT ARMED ***", n, wantSkip ? " + BFFC50 + C1F4C0" : "",
-        AnimSkipHandCorrection ? " + C81190" : "", AnimSkipSpinePitch ? " + C06C60" : "",
+        AnimSkipHandCorrection ? " + C81190" : "", "",   // C06C60: its own line now (SpinePitchInstall)
         committed ? "OK" : (okAll ? "FAILED" : "NOT ATTEMPTED - a prologue mismatched (game updated OR another mod patched "
                                                "it), NOTHING written"),
         attempts, g_playerMatrices ? "set" : "NULL for now", DiagBonesAnim ? 1 : 0, AnimRestoreOwnedBones ? 1 : 0,
         AnimSkipOwnedBones ? 1 : 0, AnimDecoupleArms ? 1 : 0, DiagViewPos ? 1 : 0, AnimSkipSpinePitch ? 1 : 0);
     if (!committed) {
         g_baTrue = nullptr; g_baTrueSample = nullptr; g_baTrueAdd = nullptr; g_baTrueHandCorr = nullptr;
-        g_baTrueSpinePitch = nullptr;
     }
 }
 

@@ -174,6 +174,7 @@ constexpr RvaPair kEglGamedll[] = {
     { 0x0D27AE0, 0x0D26F80 },   // GrabController tap handler, called (breakout kTapRva)
     { 0x0D3F9D0, 0x0D3EE70 },   // lockpick look interface slot 0 Look_GetWantedDev, compare + called (lockpitch kWantedRva)
     { 0x0D41610, 0x0D40AB0 },   // LookController enable detour (lookenable::kRva)
+    { 0x0D57B10, 0x0D56FB0 },   // MoveController::IsBodyVectorRefToLook, byte-checked + called (follow::LookOnBody, wall-kick spin fix)
     { 0x0D74AF0, 0x0D73F90 },   // rope per-update dispatcher detour, diag (grappleaim kDispatchRva) - inline jump table
     { 0x0D75DF0, 0x0D75290 },   // icon gate 2, diag (grappleaim, called)
     { 0x0D760AB, 0x0D7554B },   // GetOnScreenPointF return; its call site is -6 (grappleaim kRetRva, compare + E8/FF15 check)

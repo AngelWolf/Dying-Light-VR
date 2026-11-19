@@ -4459,7 +4459,7 @@ const Setting kSettings[] = {
            "the fitted camera-yaw mapping and its residual, and how far the rendered yaw trails the pose we declare "
            "while turning (what the compositor would correct). HEADSET-ONLY. Log-only - nothing is declared. "
            "DEFAULT OFF."),
-#if !defined(DLVR_BETA_LEAN)   // BETA lean: compiled out (docs/BETA_CENSUS.md)
+#if !defined(DLVR_BETA_LEAN) || defined(DLVR_YAW_PROBE)   // BETA lean: compiled out; back in the yaw probe variant (trace 20261119_2145)
     S_BOOL("diag_cam_yaw", DiagCamYaw,
            "Diagnostics: [CAMYAW] design D's head yaw in the engine camera", "Camera hook",
            ">>> SPEC-HEAD-YAW-DECOUPLE-D. With head_yaw_decouple active, a detour on the player's "
@@ -6007,6 +6007,8 @@ const Setting kSettings[] = {
            "bone table once. It is for replaying arm fixes on real poses without the headset. Changes nothing "
            "you see. The file is started fresh each launch, so copy it before relaunching. Headset only. Off "
            "by default."),
+#endif
+#if !defined(DLVR_BETA_LEAN) || defined(DLVR_SWING_PROBE)   // the swing probe variant (trace 20261119_1730) registers it too
     S_BOOL("diag_swing_shadow", DiagSwingShadow,
            "Diagnostics: melee swing shadow test (the weapon you see vs the line the game tests)", "Camera hook",
            "Log-only. On every VR melee swing (melee_swing_mode 2) it also tests the weapon as it is drawn - "
@@ -13063,14 +13065,16 @@ extern "C" __declspec(dllexport) void dlvr_FilterScePad(void* pData)
     //      manual reload owns (reloadSuppressL1 - at the mag / handle or mid-reload, decided at its edge by ReloadPadPoll) is also
     //      "owned" for LootPoll and PushGrabPoll, so one press never starts a reload AND a loot search / an enemy grab. Before rifles
     //      the two-handed hold absorbed a mag-zone press; it no longer does (Task 5). COST: one bool or per poll per call.
-    bool lootSuppressL1 = false, lootSuppressR1 = false;
-    dlvr::LootPoll(g_vrGrip, holsterOwnsL || twoHandSuppressL1 || reloadSuppressL1, holsterOwnsR, lootSuppressL1, lootSuppressR1);
-    // Hand-open lids (spec 2026-11-18-hand-open-lids-design, trace 20261118_1711): AFTER loot by hand (a press it owns is not a lid
-    // grab). A grip held on a lid / an item, or squeezed next to one, is the grab, not L1 (the kick) / R1. lid_by_hand=0 -> both
-    // false at one bool test.
+    // Hand-open lids (spec 2026-11-18-hand-open-lids-design, trace 20261118_1711): a grip held on a lid / an item, or squeezed next
+    // to one, is the grab, not L1 (the kick) / R1. lid_by_hand=0 -> both false at one bool test. BEFORE loot by hand (trace
+    // 20261119_1240, Jay: "This is what I was concerned about having it tied to that system"): RUN LH6 lost 12 / 12 lid presses to
+    // loot's limb-reading wait (its withheld grip read as "owned"). The lid decides first; a press it claims is "owned elsewhere"
+    // for loot (no wait, NO-ARM), so loot can never delay or refuse a lid press. Holsters / two-hand / reload still own first.
     bool lidSuppressL1 = false, lidSuppressR1 = false;
-    dlvr::LidHandPoll(g_vrGrip, holsterOwnsL || twoHandSuppressL1 || reloadSuppressL1 || lootSuppressL1, holsterOwnsR || lootSuppressR1,
-                      lidSuppressL1, lidSuppressR1);
+    dlvr::LidHandPoll(g_vrGrip, holsterOwnsL || twoHandSuppressL1 || reloadSuppressL1, holsterOwnsR, lidSuppressL1, lidSuppressR1);
+    bool lootSuppressL1 = false, lootSuppressR1 = false;
+    dlvr::LootPoll(g_vrGrip, holsterOwnsL || twoHandSuppressL1 || reloadSuppressL1 || lidSuppressL1, holsterOwnsR || lidSuppressR1,
+                   lootSuppressL1, lootSuppressR1);
     // Physical breakout (plan 2026-10-24-physical-breakout Task 3): the shove detector only - it withholds and injects nothing;
     // the game call happens on the game thread (HookTail -> BreakoutTick). breakout_physical=0 -> one bool test.
     dlvr::BreakoutPoll();

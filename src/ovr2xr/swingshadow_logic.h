@@ -199,5 +199,115 @@ inline bool Agree(Los ray1, int gameHits)
     return !((ray1 == Los::Blocked || ray1 == Los::BlockedWorld) && gameHits > 0);
 }
 
+// ===== [SWINGAI] v2 geometry (trace docs/traces/20261119_1730_swing_probe.md): the melee search's per-bone test replicated - each
+// quad's two triangles against the bone element's local AABB (gamedll sub_180C48E30 +C49597..: the points into the element frame by
+// the inverse of GetElementWorldMatrix, then two triangle-box tests). Pure; tests/swingai_geom_test.cpp.
+
+// Exact triangle-AABB overlap (separating axis theorem, Akenine-Moller 2001): box centre c, half extents h, triangle a b d.
+inline bool TriAabb(const float c[3], const float h[3], const float a[3], const float b[3], const float d[3])
+{
+    const float v[3][3] = { { a[0] - c[0], a[1] - c[1], a[2] - c[2] },
+                            { b[0] - c[0], b[1] - c[1], b[2] - c[2] },
+                            { d[0] - c[0], d[1] - c[1], d[2] - c[2] } };
+    // 1) the box's three face normals
+    for (int k = 0; k < 3; ++k) {
+        const float mn = std::fmin(v[0][k], std::fmin(v[1][k], v[2][k]));
+        const float mx = std::fmax(v[0][k], std::fmax(v[1][k], v[2][k]));
+        if (mn > h[k] || mx < -h[k]) { return false; }
+    }
+    const float e[3][3] = { { v[1][0] - v[0][0], v[1][1] - v[0][1], v[1][2] - v[0][2] },
+                            { v[2][0] - v[1][0], v[2][1] - v[1][1], v[2][2] - v[1][2] },
+                            { v[0][0] - v[2][0], v[0][1] - v[2][1], v[0][2] - v[2][2] } };
+    // 2) the triangle's normal
+    const float n[3] = { e[0][1] * e[1][2] - e[0][2] * e[1][1], e[0][2] * e[1][0] - e[0][0] * e[1][2],
+                         e[0][0] * e[1][1] - e[0][1] * e[1][0] };
+    const float dn = n[0] * v[0][0] + n[1] * v[0][1] + n[2] * v[0][2];
+    const float rn = h[0] * std::fabs(n[0]) + h[1] * std::fabs(n[1]) + h[2] * std::fabs(n[2]);
+    if (std::fabs(dn) > rn) { return false; }
+    // 3) the nine cross products of box axis x triangle edge
+    for (int i = 0; i < 3; ++i) {
+        for (int k = 0; k < 3; ++k) {
+            float ax[3] = { 0.0f, 0.0f, 0.0f };   // unit axis k cross edge i
+            const int k1 = (k + 1) % 3, k2 = (k + 2) % 3;
+            ax[k1] = -e[i][k2];
+            ax[k2] = e[i][k1];
+            float pmin = 1e30f, pmax = -1e30f;
+            for (int j = 0; j < 3; ++j) {
+                const float p = ax[0] * v[j][0] + ax[1] * v[j][1] + ax[2] * v[j][2];
+                pmin = std::fmin(pmin, p);
+                pmax = std::fmax(pmax, p);
+            }
+            const float r = h[0] * std::fabs(ax[0]) + h[1] * std::fabs(ax[1]) + h[2] * std::fabs(ax[2]);
+            if (pmin > r || pmax < -r) { return false; }
+        }
+    }
+    return true;
+}
+
+// Squared distance from a point to an AABB given by min / max (0 inside).
+inline float AabbPointDist2(const float mn[3], const float mx[3], const float p[3])
+{
+    float s = 0.0f;
+    for (int k = 0; k < 3; ++k) {
+        const float d = p[k] < mn[k] ? mn[k] - p[k] : (p[k] > mx[k] ? p[k] - mx[k] : 0.0f);
+        s += d * d;
+    }
+    return s;
+}
+
+// A sampled (upper-bound) distance from a triangle to an AABB: 0 when TriAabb overlaps, else the least point-box distance over the
+// three corners, the three edge midpoints, the edge quarter points and the centroid (13 points). Metres; an over-estimate of the
+// true gap by at most ~a quarter of the longest edge.
+inline float TriAabbDist(const float mn[3], const float mx[3], const float a[3], const float b[3], const float d[3])
+{
+    const float c[3] = { 0.5f * (mn[0] + mx[0]), 0.5f * (mn[1] + mx[1]), 0.5f * (mn[2] + mx[2]) };
+    const float h[3] = { 0.5f * (mx[0] - mn[0]), 0.5f * (mx[1] - mn[1]), 0.5f * (mx[2] - mn[2]) };
+    if (TriAabb(c, h, a, b, d)) { return 0.0f; }
+    const float* P[3] = { a, b, d };
+    float best = AabbPointDist2(mn, mx, a);
+    for (int i = 0; i < 3; ++i) {
+        const float* p = P[i];
+        const float* q = P[(i + 1) % 3];
+        for (int s = 0; s <= 4; ++s) {
+            const float t = 0.25f * static_cast<float>(s);
+            const float x[3] = { p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t, p[2] + (q[2] - p[2]) * t };
+            best = std::fmin(best, AabbPointDist2(mn, mx, x));
+        }
+    }
+    const float g[3] = { (a[0] + b[0] + d[0]) / 3.0f, (a[1] + b[1] + d[1]) / 3.0f, (a[2] + b[2] + d[2]) / 3.0f };
+    best = std::fmin(best, AabbPointDist2(mn, mx, g));
+    return std::sqrt(best);
+}
+
+// The engine's mtx34 (12 floats, rows r0..r2 = [R | t], world = R * local + t - x[3], x[7], x[11] are the translation as read by
+// GetWorldXform elsewhere in this file): its inverse. False when singular / non-finite.
+inline bool Inverse34(const float m[12], float out[12])
+{
+    const float a = m[0], b = m[1], c = m[2], d = m[4], e = m[5], f = m[6], g = m[8], h = m[9], i = m[10];
+    const float A = e * i - f * h, B = -(d * i - f * g), C = d * h - e * g;
+    const float det = a * A + b * B + c * C;
+    if (!(std::fabs(det) > 1e-12f) || !std::isfinite(det)) { return false; }
+    const float id = 1.0f / det;
+    const float r[9] = { A * id, -(b * i - c * h) * id, (b * f - c * e) * id,
+                         B * id, (a * i - c * g) * id, -(a * f - c * d) * id,
+                         C * id, -(a * h - b * g) * id, (a * e - b * d) * id };
+    const float t[3] = { m[3], m[7], m[11] };
+    for (int row = 0; row < 3; ++row) {
+        out[4 * row + 0] = r[3 * row + 0];
+        out[4 * row + 1] = r[3 * row + 1];
+        out[4 * row + 2] = r[3 * row + 2];
+        out[4 * row + 3] = -(r[3 * row + 0] * t[0] + r[3 * row + 1] * t[1] + r[3 * row + 2] * t[2]);
+    }
+    for (int k = 0; k < 12; ++k) { if (!std::isfinite(out[k])) { return false; } }
+    return true;
+}
+
+inline void Xform34(const float m[12], const float p[3], float out[3])
+{
+    out[0] = m[0] * p[0] + m[1] * p[1] + m[2] * p[2] + m[3];
+    out[1] = m[4] * p[0] + m[5] * p[1] + m[6] * p[2] + m[7];
+    out[2] = m[8] * p[0] + m[9] * p[1] + m[10] * p[2] + m[11];
+}
+
 }  // namespace swingshadow
 }  // namespace dlvr

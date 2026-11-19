@@ -30,8 +30,8 @@ extern bool  DiagMeleeSwingProbe;  // diag_melee_swing_probe - per-frame detail 
 #endif
 extern bool  AnimSuppressMeleeIdle; // anim_suppress_melee_idle - keep the melee ready state on "Stand" (INV-319). DEFAULT ON.
 // diag_swing_shadow - the swing shadow probe (blade vs hit line), log only. DEFAULT OFF. DEV only:
-#if defined(DLVR_BETA_LEAN)   // compiled out of BETA (docs/BETA_CENSUS.md): constant false, the gated code is dropped
-inline constexpr bool DiagSwingShadow = false;
+#if defined(DLVR_BETA_LEAN) && !defined(DLVR_SWING_PROBE)   // compiled out of BETA (docs/BETA_CENSUS.md) - back in the probe
+inline constexpr bool DiagSwingShadow = false;                // variant (DLVR_SWING_PROBE, trace 20261119_1730)
 #else
 extern bool  DiagSwingShadow;
 #endif

@@ -27,8 +27,11 @@ namespace vsclass {
 // no TANGENT, rows at v3..v5).
 // kRigidD / kRigidE / kSkinnedC (2026-10-28, the buggy, run B4 + OUR pack read): the buggy's three large draws - forms A / C / the
 // body's skinning with a COLOR input added (a68f15c7 / 4f2f75b7 / e40d02f6, pack +93A1D3 / +78931F / +A9F527).
+// kRigidC1 (2026-11-19, INV-751, trace 20261119_1840): form C with TEXCOORD1 at v3, rows TEXCOORD4..6 at v4..v6 - the ONLY GBuffer
+// form of a weapon material we did not move (36 shaders in OUR pack a00bdd80, 95 weapon meshes; e.g. the machete's bloody blade
+// dc9f5576 +66DC4F, the pickaxe 4a006809 +86176F).
 enum Class : unsigned char { kUnclassified = 0, kNone = 1, kRigidA = 2, kRigidB = 3, kSkinned = 4, kSkinned1 = 5, kRigidC = 6,
-                             kRigidD = 7, kRigidE = 8, kSkinnedC = 9, kSkinnedM = 10 };
+                             kRigidD = 7, kRigidE = 8, kSkinnedC = 9, kSkinnedM = 10, kRigidC1 = 11 };
 // why a shader is kNone (the first test that failed for the closest form)
 enum Reason : unsigned char { kOk = 0, kNotDxbc = 1, kSignature = 2, kBuffers = 3, kMath = 4, kDisasmFailed = 5 };
 
@@ -50,6 +53,9 @@ constexpr In kOurD[] = { { "POSITION", 0, 0 }, { "COLOR", 0, 1 }, { "NORMAL", 0,
 constexpr In kOurE[] = { { "POSITION", 0, 0 }, { "COLOR", 0, 1 }, { "NORMAL", 0, 2 }, { "TEXCOORD", 0, 3 }, { "TEXCOORD", 4, 4 },
                          { "TEXCOORD", 5, 5 }, { "TEXCOORD", 6, 6 }, { "TEXCOORD", 7, 7 } };
 constexpr In kOurSC[] = { { "POSITION", 0, 0 }, { "BLENDWEIGHT", 0, 1 }, { "COLOR", 0, 2 }, { "BLENDINDICES", 0, 3 } };
+// kRwHlsl RInC1, copied register for register from the 36 C1 shaders' ISGN (OUR pack; fxc /dumpbin of +66DC4F and 35 more)
+constexpr In kOurC1[] = { { "POSITION", 0, 0 }, { "NORMAL", 0, 1 }, { "TEXCOORD", 0, 2 }, { "TEXCOORD", 1, 3 },
+                          { "TEXCOORD", 4, 4 }, { "TEXCOORD", 5, 5 }, { "TEXCOORD", 6, 6 }, { "TEXCOORD", 7, 7 } };
 
 struct Sig { int n; struct E { char name[24]; unsigned idx, reg; } e[32]; };
 
@@ -218,6 +224,10 @@ inline Class FromText(const Sig& s, const char* t, Reason* why)
         if (cb2 < 7) { r = kBuffers; }
         else if (HasDp4Row(t, 4) && HasDp4Row(t, 5) && HasDp4Row(t, 6)) { *why = kOk; return kRigidE; }
         else { r = kMath; }
+    } else if (Supplies(s, kOurC1)) {                                  // INV-751: form C + TEXCOORD1 at v3, rows at v4..v6
+        if (cb2 < 7) { r = kBuffers; }
+        else if (HasDp4Row(t, 4) && HasDp4Row(t, 5) && HasDp4Row(t, 6)) { *why = kOk; return kRigidC1; }
+        else { r = kMath; }
     }
     if (sigS) {
         const int mb = MorphBase(t);
@@ -246,7 +256,7 @@ inline Class Classify(const void* code, size_t n, Reason* why, int* disasm)
     if (!ParseIsgn(code, n, &s)) { *why = kNotDxbc; return kNone; }
     if (!Supplies(s, kOurA) && !Supplies(s, kOurB) && !Supplies(s, kOurS) && !Supplies(s, kOurC) &&
         !(Supplies(s, kOurS1) && !HasSemantic(s, "BLENDWEIGHT")) && !Supplies(s, kOurD) && !Supplies(s, kOurE) &&
-        !Supplies(s, kOurSC)) { *why = kSignature; return kNone; }
+        !Supplies(s, kOurSC) && !Supplies(s, kOurC1)) { *why = kSignature; return kNone; }
     ID3DBlob* text = nullptr;
     *disasm = 1;
     if (FAILED(D3DDisassemble(code, n, 0, nullptr, &text)) || !text) { *why = kDisasmFailed; return kNone; }
@@ -293,7 +303,7 @@ inline const char* Name(unsigned char c)
     case kRigidA: return "rigid A"; case kRigidB: return "rigid B"; case kSkinned: return "skinned";
     case kSkinned1: return "single-bone skinned"; case kRigidC: return "rigid C";
     case kRigidD: return "rigid D"; case kRigidE: return "rigid E"; case kSkinnedC: return "skinned (COLOR, BLENDINDICES v3)";
-    case kSkinnedM: return "skinned, morph targets";
+    case kSkinnedM: return "skinned, morph targets"; case kRigidC1: return "rigid C1";
     case kNone: return "none"; default: return "unclassified (created before the hook)";
     }
 }
