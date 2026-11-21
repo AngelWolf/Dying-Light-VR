@@ -2225,6 +2225,10 @@ const Setting kSettings[] = {
             "How fast the muzzle must snap upward to flick the open double-barrel shut. Lower = easier."),
     // diag_duck_probe: OUTSIDE every DLVR_BETA_LEAN block on purpose (2026-10-25: a diag inside a lean block is compiled out of
     // BETA and the file's 1 is never read).
+    // holster_rings (plan 2026-11-20-holster-pivot-posture-rings Task 5, Jay: "B, with a switch defaulting on"): OUTSIDE every
+    // DLVR_BETA_LEAN block - it must exist in BETA (the [DEP] marker is at its declaration in holster.cpp).
+    S_BOOL("holster_rings", dlvr::HolsterRings, "Show holsters", "VR Comfort",
+           "A faint ring shows each chest and hip holster as your hand comes near it, so you can see where to grab. Off: no rings."),
     S_BOOL("diag_hip_capture", dlvr::DiagHipCapture,
            "Diagnostics: [HIPCAP] standing recording for the hip holsters (log-only)", "Aim",
            "Log-only. One line per frame to dlvr_hipcap.log: your head, both controllers' grip poses with grip and trigger, the "
@@ -6887,6 +6891,12 @@ void SyncFollowers()
         AfwAltEye = false;
         AfwRebuild = false;
     }
+    // [AFWNET] (trace docs/traces/20261121_1057_afw_tonemap_net.md): while the safety net holds them off (the bootstrap has not seen
+    // the tonemap draw - no rebuild possible), a settings write / menu tab draw must not turn them back on. camhook gives them back.
+    if (dlvr::AfwNetHeld()) {
+        AfwAltEye = false;
+        AfwRebuild = false;
+    }
 }
 
 float SettingAsFloat(const Setting& st)
@@ -10362,6 +10372,8 @@ ovr_SubmitFrame(ovrSession session, long long frameIndex,
     XrCompositionLayerQuad overlayQuad{ XR_TYPE_COMPOSITION_LAYER_QUAD };
     XrCompositionLayerQuad grappleQuad{ XR_TYPE_COMPOSITION_LAYER_QUAD };   // grapple_reticle_3d
     XrCompositionLayerQuad sphereQuad{ XR_TYPE_COMPOSITION_LAYER_QUAD };    // the holster sphere (place-by-hand Task 4)
+    XrCompositionLayerQuad ringQuad[3] = { { XR_TYPE_COMPOSITION_LAYER_QUAD }, { XR_TYPE_COMPOSITION_LAYER_QUAD },
+                                           { XR_TYPE_COMPOSITION_LAYER_QUAD } };   // the holster rings (plan 2026-11-20 Task 5)
     XrCompositionLayerQuad titleQuad{ XR_TYPE_COMPOSITION_LAYER_QUAD };     // the mod menu's title above its panel (BETA)
     XrCompositionLayerQuad calibQuad{ XR_TYPE_COMPOSITION_LAYER_QUAD };     // the calibration screen (build A)
     XrCompositionLayerQuad calibFloor{ XR_TYPE_COMPOSITION_LAYER_QUAD };    // its floor under the void (build B)
@@ -11168,6 +11180,23 @@ ovr_SubmitFrame(ovrSession session, long long frameIndex,
                 kLayerCap);
         }
     }
+    // HOLSTER RINGS (plan 2026-11-20-holster-pivot-posture-rings Task 5; trace 20261120_1300_holster_rings): right after the sphere,
+    // before the panel / title (they stand down while the panel is open anyway), same budget rule (kLayerCap - 1 keeps the panel's
+    // unconditional slot), none while the loading quads are up. COST off / no hand near a holster: one bool test / a few distances.
+    if (loadQuads == 0 && ::dlvr::HolsterRings) {
+        const int room = static_cast<int>(kLayerCap - 1) - static_cast<int>(submitted);
+        if (room > 0) {
+            const int nr = OverlayRenderHolsterRings(s->appSpace, ringQuad, room < 3 ? room : 3);
+            for (int rq = 0; rq < nr; ++rq) { layers[submitted++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&ringQuad[rq]); }
+        } else {
+            static bool saidRingCap = false;
+            if (!saidRingCap) {
+                saidRingCap = true;
+                // [PROBE: HOLSTERRING] gate=holster_rings  site=HEADSET  log-only=no
+                LOG("overlay: [HOLSTERRING] NOT submitted - the layer list is full (%u of %d layers); logged once", submitted, kLayerCap);
+            }
+        }
+    }
     // MENU TITLE (Jay 2026-11-11: above the panel, top left, outside it): its own quad beside the panel's, same budget rule as the
     // sphere (kLayerCap - 1 keeps the panel's slot). No ImGui frame (own draw list), so before OverlayRender is safe. Worst case
     // with it: one more than the sphere's 7 of 12. COST menu closed: two bool tests inside the call.
@@ -11191,8 +11220,20 @@ ovr_SubmitFrame(ovrSession session, long long frameIndex,
             OverlayRenderToMirror(s->mirrors[0]->tex);
         }
     }
-    if (submitted < 5 && OverlayRenderGrapple(s->appSpace, &grappleQuad)) {
-        layers[submitted++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&grappleQuad);
+    // The 3D grapple icon (trace 20261121_2225, Jay: the reticle "keeps disappearing", "definitely ... with the gun out"): the same cap
+    // as the other extra quads (kLayerCap - 1 keeps the calibration panel's slot). It was a hard `< 5` - the game image + the HUD
+    // panel (2) + the gun reticle + any holster ring (since 11-20) filled it and dropped the icon without a word.
+    if (submitted < static_cast<uint32_t>(kLayerCap - 1)) {
+        if (OverlayRenderGrapple(s->appSpace, &grappleQuad)) {
+            layers[submitted++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&grappleQuad);
+        }
+    } else if (::dlvr::Grapple3dReticle) {
+        static bool saidGrappleCap = false;
+        if (!saidGrappleCap) {
+            saidGrappleCap = true;
+            // [PROBE: GRAPPLE3D] gate=grapple_reticle_3d  site=HEADSET  log-only=yes
+            LOG("overlay: [GRAPPLE3D] icon NOT submitted - the layer list is full (%u of %d layers); logged once", submitted, kLayerCap);
+        }
     }
     // WRIST HUD STAGE 2 (wristquad.h, marker dlvr\wrist_hud.txt): the five HUD pieces on quads in the grip spaces, AFTER the `< 5`
     // gates above (they cannot be starved) and before the calibration layers; kLayerCap - 1 keeps the calibration panel's slot, as
@@ -11670,6 +11711,7 @@ XrVector3f NeckPivotReportedPos(const XrPosef& rawHead)
     NeckPivotCompute(rawHead, p, nullptr);
     return p;
 }
+const char* XrSystemNameNow() { return g_xrSystemName; }   // headpose.h (plan 2026-11-20-holster-pivot-posture-rings Task 4)
 XrVector3f NeckOffsetM()
 {
     return XrVector3f{ HeadNeckPivotXmm * 0.001f, HeadNeckPivotYmm * 0.001f, HeadNeckPivotZmm * 0.001f };
@@ -13206,6 +13248,12 @@ extern "C" __declspec(dllexport) void dlvr_FilterScePad(void* pData)
     //      2026-11-04-crossbow-bolt-wheel, Jay: R2 "Hold off"; holster.cpp HolsterBoltWheelHoldsR2). Same place as the two above - AFTER
     //      every R2 rule, BEFORE the mod-menu block. COST: one volatile read.
     if (dlvr::HolsterBoltWheelHoldsR2()) {
+        p[0x09] = 0;
+    }
+    // Carry (trace 20261121_1450, Jay WH1: "guns were still able to shoot and they shouldn't be able to" -> "Right hand only"): while
+    // lidhand's RIGHT hand (side 0) carries an item - a lid container item or a world item, take to release - the game reads R2 = 0.
+    // Same place as the three above. lid_by_hand=0 -> LidHandCarrying false. COST: one bool test + one volatile load.
+    if (dlvr::LidHandCarrying(0)) {
         p[0x09] = 0;
     }
     if (dlvr::BodyGrabHandActive(0) && !dlvr::ThrowableHoldsL2()) {

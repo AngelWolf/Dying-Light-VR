@@ -237,6 +237,34 @@ inline Vec3 VirtualHead(const Vec3& anchor, float yaw, const Latch& L)
     return { anchor.x + o.x, anchor.y + o.y, anchor.z + o.z };
 }
 
+// ===== DIRECTION-FREE ZONES (2026-11-20, spec docs/superpowers/specs/2026-11-20-holster-direction-free-design.md) =====
+// A body zone is a RING round the anchor's vertical axis: only the hand's height and its distance from the axis matter, never a facing
+// (a long look and a real turn give the same headset / controller inputs - D-368, D-381, CPVR). The yaw below turns the zone's body-frame
+// offset (latch.eyeFromAnchor + centre, +X right +Z behind) to the hand's bearing round the axis, so LocalOffsetYaw(VirtualHead(anchor,
+// yaw, latch), yaw, palm) measures the hand against the ring. A hand or a zone within kAlignMinM of the axis has no bearing: fallbackYaw.
+constexpr float kAlignMinM      = 0.03f;
+constexpr float kShoulderFrontR = 60.0f * 0.0174532925f;   // the right shoulder ignores a hand within this of the head's yaw (the face)
+
+inline float AlignYawToHand(const Vec3& anchor, const Vec3& offsetBody, const Vec3& palm, float fallbackYaw)
+{
+    const float hx = palm.x - anchor.x, hz = palm.z - anchor.z;
+    if (hx * hx + hz * hz < kAlignMinM * kAlignMinM) { return fallbackYaw; }
+    if (offsetBody.x * offsetBody.x + offsetBody.z * offsetBody.z < kAlignMinM * kAlignMinM) { return fallbackYaw; }
+    // HeadYaw's convention: forward (-Z) = 0, left (-X) +; ToWorldYaw(l, y) turns a bearing by +y.
+    const float handBearing = std::atan2(-hx, -hz);
+    const float zoneBearing = std::atan2(-offsetBody.x, -offsetBody.z);
+    return WrapPi(handBearing - zoneBearing);
+}
+
+// The hand's bearing round the neck's vertical axis lies within halfAngleR of the head's yaw (the space in front of the face). A hand
+// within kAlignMinM of the axis has no bearing: false.
+inline bool InFrontOfFace(const Vec3& neck, float headYaw, const Vec3& palm, float halfAngleR)
+{
+    const float hx = palm.x - neck.x, hz = palm.z - neck.z;
+    if (hx * hx + hz * hz < kAlignMinM * kAlignMinM) { return false; }
+    return std::fabs(WrapPi(std::atan2(-hx, -hz) - headYaw)) <= halfAngleR;
+}
+
 // ===== THE FACING V2 + THE HIP POINT (2026-11-16; trace docs/traces/20261116_1450_hip_anchor_facing_v2.md) =====
 // Jay: "We want them to stay exactly where they are, regardless of lean, crouch, player position" / "bulletproof". Built from RUN HC1
 // (standing, backups/20261116_hipcap_run_hc1) and checked on 38 seated archive sessions + 48 gun sessions, offline (scratchpad hc1/:
@@ -266,6 +294,8 @@ constexpr double kBandHoldS     = 0.5;                     // ... and must stay 
 constexpr float  kFollowTauS    = 0.4f;                    // the follow's time constant
 constexpr float  kFollowDoneR   = 5.0f * 0.0174532925f;    // the follow ends this close to the head
 constexpr float  kPitchFreezeR  = 35.0f * 0.0174532925f;   // a head pitched below -this holds the facing (looking at the body)
+constexpr float  kLookDownLimitR = 70.0f * 0.0174532925f;  // ... only while within this of the facing (VRExpansion's lower tolerance;
+                                                           // RUN HP2, Jay 2026-11-20 "Do the fix")
 constexpr float  kConfirmShare  = 0.5f;                    // each hand turned round the neck by >= this x the head's turn
 constexpr float  kConfirmRigidM = 0.05f;                   // ... keeping its horizontal radius and height within this
 constexpr float  kConfirmAgreeR = 15.0f * 0.0174532925f;   // ... the two hands' turns within this of each other
@@ -347,7 +377,11 @@ inline FacingWhy FacingStepV2(Facing& f, const Vec3& neck, const Vec3& l, const 
                       RestPose(neck, headYaw, l, r);
     if (!rest) { f.restSince = -1.0; } else if (f.restSince < 0.0) { f.restSince = nowS; }
 
-    const bool freeze = otherFreeze || headPitch < -kPitchFreezeR || (zoneFreeze && !(confirmed || longHeld));
+    // The look-down hold (a glance at the belt does not turn the holsters) holds only within kLookDownLimitR of the facing and never
+    // stops a follow already under way (RUN HP2 2026-11-20: a turn then a look down left the facing 100-173 deg behind; trace
+    // 20261120_1325_lookdown_limit). Past it no neck turns that far: the held-turn / hands rules below decide, as with the head up.
+    const bool lookDownHold = headPitch < -kPitchFreezeR && off <= kLookDownLimitR && !f.following;
+    const bool freeze = otherFreeze || lookDownHold || (zoneFreeze && !(confirmed || longHeld));
     FacingWhy why = FacingWhy::Frozen;
     if (!freeze) {
         const float dt = dtS > 0.0f ? dtS : 0.0f;
@@ -386,8 +420,33 @@ struct Posture {
     double aboveSince = -1.0, belowSince = -1.0;
 };
 
-// One step; returns true when the posture changed this step.
-inline bool PostureStep(Posture& p, bool floorOk, float eyeAboveFloorM, double nowS)
+// THE POSTURE LINES (plan 2026-11-20-holster-pivot-posture-rings Task 2, spec §5.2): the two lines from the PLAYER's own eye height
+// above the floor, measured by the calibration in the posture they chose (armfit.cpp eye_floor_m / eye_floor_posture). Measured
+// against the same floor the game uses later, so a mis-set floor and a short player both land on the right side. The ratios are
+// Jay's lines over his measured heights (standing 1.67 m, seated 1.14 m - RUNS BC2 / BC1), so his lines stay 1.38 / 1.33.
+// source: 0 = the fixed fallback, 1 = calibrated standing, 2 = calibrated seated.
+struct PostureLines {
+    float standEyeM;
+    float seatEyeM;
+    int   source;
+};
+constexpr PostureLines kFallbackLines{ kStandEyeM, kSeatEyeM, 0 };
+constexpr float kLineStandOfStanding = 0.826f, kLineSeatOfStanding = 0.796f;   // x the standing eye height
+constexpr float kLineStandOfSeated = 1.21f, kLineSeatOfSeated = 1.167f;        // x the seated eye height
+
+inline PostureLines PostureLinesFrom(bool have, float eyeFloorM, bool calibratedStanding)
+{
+    if (!have || !std::isfinite(eyeFloorM)) { return kFallbackLines; }
+    if (calibratedStanding) {
+        if (eyeFloorM < 1.00f || eyeFloorM > 2.10f) { return kFallbackLines; }
+        return { kLineStandOfStanding * eyeFloorM, kLineSeatOfStanding * eyeFloorM, 1 };
+    }
+    if (eyeFloorM < 0.60f || eyeFloorM > 1.50f) { return kFallbackLines; }
+    return { kLineStandOfSeated * eyeFloorM, kLineSeatOfSeated * eyeFloorM, 2 };
+}
+
+// One step; returns true when the posture changed this step. `lines` defaults to today's fixed 1.38 / 1.33 (ledger ruling T2-R1).
+inline bool PostureStep(Posture& p, bool floorOk, float eyeAboveFloorM, double nowS, const PostureLines& lines = kFallbackLines)
 {
     const bool was = p.standing;
     if (!floorOk) {
@@ -395,13 +454,13 @@ inline bool PostureStep(Posture& p, bool floorOk, float eyeAboveFloorM, double n
         p.aboveSince = p.belowSince = -1.0;
         return was;
     }
-    if (eyeAboveFloorM > kStandEyeM) {
+    if (eyeAboveFloorM > lines.standEyeM) {
         if (p.aboveSince < 0.0) { p.aboveSince = nowS; }
         if (nowS - p.aboveSince >= kPostureHoldS) { p.standing = true; }
     } else {
         p.aboveSince = -1.0;
     }
-    if (eyeAboveFloorM < kSeatEyeM) {
+    if (eyeAboveFloorM < lines.seatEyeM) {
         if (p.belowSince < 0.0) { p.belowSince = nowS; }
         if (nowS - p.belowSince >= kPostureHoldS) { p.standing = false; }
     } else {

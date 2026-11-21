@@ -5,9 +5,15 @@
 #include "holster.h"
 
 #include "armfit.h"   // ArmFitRestHand - holster_hip_from_calib's resting hand
+#include "calibscreen.h"   // CalibPosture - [BODYCAP]'s p section (read only, trace 20261120_1044)
 #include "controllers.h"
 #include "headpose.h"
 #include "holster_logic.h"
+#include "pivotfit_logic.h"   // the learned pivot (plan 2026-11-20-holster-pivot-posture-rings Task 4)
+#include "ring_logic.h"       // the visible rings (Task 5)
+#include "uipin.h"            // GameMenuOpen / GamePausedForMenu - no ring in a menu (Task 5)
+#include "camhook.h"          // CamHookLocalInVehicle / CamHookCutsceneActive - no ring in a vehicle / cutscene (Task 5)
+#include "settings.h"         // DlvrFilePath - dlvr\holster_pivot.txt
 #include "holster_place_logic.h"   // placing a holster by hand (plan 2026-10-30-holster-place-by-hand)
 #include "wheel_logic.h"   // the selection wheels (plan 2026-10-27-vr-selection-wheels)
 #include "boltwheel.h"         // BoltWheelSetWant / BoltWheelLive - the crossbow bolt wheel's hooks (plan 2026-11-04-crossbow-bolt-wheel)
@@ -296,6 +302,12 @@ struct BodyFrame {
     long              postureLines = 0, postureWinLines = 0, heldFollows = 0;
     ULONGLONG         postureWinStart = 0;
     float             eyeMin = 1e9f, eyeMax = -1e9f;
+    // Plan 2026-11-20 Task 4: the posture lines from the player's calibration (holster_logic.h PostureLinesFrom), refreshed when the
+    // calibration's sequence changes; -3 = never read.
+    holster::PostureLines lines = holster::kFallbackLines;
+    long              linesSeq = -3;
+    // Direction-free zones (2026-11-20, trace 20261120_1400): each body zone's placed centre this cycle (its frame is aligned to the hand).
+    holster::Vec3     centre[kZoneCount] = {};
 };
 BodyFrame g_bf;
 volatile LONG g_bfResetAsked = 0;
@@ -310,6 +322,7 @@ struct BodySnap {
     bool           latched[kZoneCount] = {};
     holster::Vec3  eyeFromAnchor[kZoneCount] = {};
     holster::Vec3  anchorFromNeck[kZoneCount] = {};   // anchor - neck (appSpace): 0 for the shoulder / chest, the hip point for the hips
+    holster::Vec3  centre[kZoneCount] = {};           // direction-free (2026-11-20): the centres the zones are aligned with
 };
 SRWLOCK g_snapLock = SRWLOCK_INIT;
 BodySnap g_snap;
@@ -343,17 +356,182 @@ void SnapPublish(const BodyFrame& b, double now, bool valid)
         g_snap.anchorFromNeck[z] = valid ? holster::Vec3{ b.anchor[z].x - b.neckNow.x, b.anchor[z].y - b.neckNow.y,
                                                           b.anchor[z].z - b.neckNow.z }
                                          : holster::Vec3{ 0.0f, 0.0f, 0.0f };
+        g_snap.centre[z] = b.centre[z];
     }
     ReleaseSRWLockExclusive(&g_snapLock);
 }
 
 // The zone's offset from the frame as it stood (body-locked when anchored and latched, else head-relative) - no counting.
-holster::Vec3 ZoneLocalNoCount(const BodyFrame& b, int zone, const holster::Vec3& eye, float headYaw, const holster::Vec3& palm)
+// Direction-free (2026-11-20, trace 20261120_1400): the body frame is turned round the anchor's axis to the hand's bearing
+// (holster::AlignYawToHand with latch + centre), so the zone is a ring - height and distance from the axis only. frontExclude (the
+// right shoulder): a hand in front of the face (InFrontOfFace, +-60 deg of the head's yaw) is put 100 m away - never in the zone.
+holster::Vec3 ZoneLocalNoCount(const BodyFrame& b, int zone, const holster::Vec3& eye, float headYaw, const holster::Vec3& palm,
+                               const holster::Vec3& centre, bool frontExclude)
 {
     if (b.anchorOk[zone] && b.latch[zone].have) {
-        return holster::LocalOffsetYaw(holster::VirtualHead(b.anchor[zone], b.facing.yaw, b.latch[zone]), b.facing.yaw, palm);
+        const holster::Vec3& L = b.latch[zone].eyeFromAnchor;
+        const float y = holster::AlignYawToHand(b.anchor[zone], { L.x + centre.x, L.y + centre.y, L.z + centre.z }, palm, b.facing.yaw);
+        holster::Vec3 local = holster::LocalOffsetYaw(holster::VirtualHead(b.anchor[zone], y, b.latch[zone]), y, palm);
+        if (frontExclude && holster::InFrontOfFace(b.neckNow, headYaw, palm, holster::kShoulderFrontR)) { local.z += 100.0f; }
+        return local;
     }
     return holster::LocalOffsetYaw(eye, headYaw, palm);
+}
+
+// ===== THE LEARNED PIVOT (plan 2026-11-20-holster-pivot-posture-rings Task 4, spec §5.1; trace 20261120_1240_holster_pivot_fit) =====
+// pivotfit_logic.h fed from BodyFrameUpdate (this thread only); the value in use is published through a seqlock so HolsterZoneLocal /
+// PlaceFrameOf on other threads read the same n. Until a commit or this headset's file line: NeckOffsetM() (the shipped n).
+pivotfit::State g_pf;
+bool            g_pfInit = false, g_pfFileTried = false;
+double          g_pfLastSampleS = -1.0;
+ULONGLONG       g_pfWinStart = 0;
+long            g_pfRefusedLines = 0;
+volatile LONG   g_pivSeq = 0;
+volatile LONG   g_pivHave = 0;
+float           g_pivN[3] = { 0.0f, 0.0f, 0.0f };
+
+void PivotPublish(const float n[3])
+{
+    InterlockedIncrement(&g_pivSeq);   // odd = writing
+    g_pivN[0] = n[0]; g_pivN[1] = n[1]; g_pivN[2] = n[2];
+    InterlockedIncrement(&g_pivSeq);
+    InterlockedExchange(&g_pivHave, 1);
+}
+
+// dlvr\holster_pivot.txt: keep every other headset's line, replace this one's. COST: a commit only (>= 60 s apart).
+void PivotFileSave(const char* headset)
+{
+    char path[MAX_PATH] = {};
+    if (!DlvrFilePath("holster_pivot.txt", path, sizeof(path))) {
+        // [PROBE: PIVOTFIT] gate=holster_enable  site=HEADSET  log-only=no
+        LOG("holster: [PIVOTFIT] FILE NOT WRITTEN - the dlvr path could not be resolved (the learned pivot holds for this launch only)");
+        return;
+    }
+    char keep[16][256] = {};
+    int nk = 0;
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "r") == 0 && f) {
+        char line[256];
+        float n[3]; int c[2];
+        while (fgets(line, sizeof(line), f) && nk < 16) {
+            if (line[0] == '#' || pivotfit::Parse(line, headset, n, c)) { continue; }
+            if (strncmp(line, "headset=", 8) == 0) { strcpy_s(keep[nk++], sizeof(keep[0]), line); }
+        }
+        fclose(f);
+    }
+    char mine[256];
+    if (pivotfit::Serialize(g_pf, headset, mine, static_cast<int>(sizeof(mine))) < 0) { return; }
+    if (fopen_s(&f, path, "w") != 0 || !f) {
+        // [PROBE: PIVOTFIT] gate=holster_enable  site=HEADSET  log-only=no
+        LOG("holster: [PIVOTFIT] FILE WRITE FAILED - %s (the learned pivot holds for this launch only)", path);
+        return;
+    }
+    fprintf(f, "# DyingLightVR - the holsters' neck pivot learned in play, one line per headset (n = pivot -> eye, head frame, m).\n");
+    for (int i = 0; i < nk; ++i) { fputs(keep[i], f); }
+    fprintf(f, "%s\n", mine);
+    fclose(f);
+    // [PROBE: PIVOTFIT] gate=holster_enable  site=HEADSET  log-only=no
+    LOG("holster: [PIVOTFIT] FILE WRITTEN %s - %s (+%d other headset line(s) kept)", path, mine, nk);
+}
+
+// Once per launch, after the headset name is known: this headset's line, if any, becomes the n in use (the fit keeps learning).
+void PivotFileLoad(const char* headset)
+{
+    char path[MAX_PATH] = {};
+    float n[3] = {}; int c[2] = {};
+    bool found = false;
+    FILE* f = nullptr;
+    if (DlvrFilePath("holster_pivot.txt", path, sizeof(path)) && fopen_s(&f, path, "r") == 0 && f) {
+        char line[256];
+        while (!found && fgets(line, sizeof(line), f)) { found = pivotfit::Parse(line, headset, n, c); }
+        fclose(f);
+    }
+    bool inBox = found;
+    for (int k = 0; k < 3 && inBox; ++k) { inBox = n[k] >= pivotfit::kBoxMin[k] && n[k] <= pivotfit::kBoxMax[k]; }
+    if (inBox) {
+        for (int k = 0; k < 3; ++k) { g_pf.n[k] = n[k]; }
+        PivotPublish(n);
+    }
+    // [PROBE: PIVOTFIT] gate=holster_enable  site=HEADSET  log-only=no
+    LOG("holster: [PIVOTFIT] FILE %s for \"%s\" - %s (%.1f, %.1f, %.1f) mm%s", found ? "READ" : "NO LINE", headset,
+        inBox ? "the holsters start from" : (found ? "*** OUT OF THE BOX, IGNORED *** -" : "the holsters start from the shipped"),
+        (inBox ? n[0] : g_pf.n[0]) * 1000.0f, (inBox ? n[1] : g_pf.n[1]) * 1000.0f, (inBox ? n[2] : g_pf.n[2]) * 1000.0f,
+        found ? "" : (path[0] ? "" : " | the dlvr path could not be resolved"));
+}
+
+// Called by BodyFrameUpdate with the head pose it uses. Returns true on a COMMIT this cycle with the old and new n (the caller shifts
+// the latches and the hip point). COST: most cycles one compare (30 Hz decimation); a sample = one Guard enter (GetAppBase) + a
+// 64-byte copy; every 0.5 s a 6x6 solve over ~90 samples and, past 40 windows, three medians of <= 4096 floats.
+bool PivotTick(double now, const XrPosef& head, float n0[3], float n1[3])
+{
+    if (!g_pfInit) {
+        g_pfInit = true;
+        const XrVector3f s = NeckOffsetM();
+        const float sh[3] = { s.x, s.y, s.z };
+        pivotfit::Reset(g_pf, sh);
+        PivotPublish(sh);
+        // [PROBE: PIVOTFIT] gate=holster_enable  site=HEADSET  log-only=no
+        LOG("holster: [PIVOTFIT] FIRST (logged unconditionally) | start n (%.1f, %.1f, %.1f) mm = the shipped head_neck_pivot_* | windows "
+            "%.1f s every %.1f s, rigid < %.0f mm, sweep >= %.0f deg | n.x / n.z after %d yaw windows, n.y after %d pitch windows | "
+            "box x %.0f..%.0f y %.0f..%.0f z %.0f..%.0f mm | the view keeps head_neck_pivot_*", sh[0] * 1000.0f, sh[1] * 1000.0f,
+            sh[2] * 1000.0f, pivotfit::kWindowS, pivotfit::kStepS, pivotfit::kRmsM * 1000.0f, pivotfit::kSweepRad * 57.2957795f,
+            pivotfit::kYawNeed, pivotfit::kPitchNeed, pivotfit::kBoxMin[0] * 1000.0f, pivotfit::kBoxMax[0] * 1000.0f,
+            pivotfit::kBoxMin[1] * 1000.0f, pivotfit::kBoxMax[1] * 1000.0f, pivotfit::kBoxMin[2] * 1000.0f, pivotfit::kBoxMax[2] * 1000.0f);
+    }
+    if (!g_pfFileTried) {
+        const char* nm = XrSystemNameNow();
+        if (nm && nm[0]) {
+            g_pfFileTried = true;
+            PivotFileLoad(nm);
+        }
+    }
+    const ULONGLONG ms = GetTickCount64();
+    if (g_pfWinStart == 0) { g_pfWinStart = ms; }
+    if (ms - g_pfWinStart >= 60000) {
+        g_pfWinStart = ms;   // stamped before the LOG (INV-9)
+        float med[3];
+        pivotfit::Medians(g_pf, med);
+        // [PROBE: PIVOTFIT] gate=holster_enable  site=HEADSET  log-only=no
+        LOG_PERIODIC("holster: [PIVOTFIT] 60 s | windows tried %d rigid %d | accepted yaw %d / %d pitch %d / %d | medians (%.1f, %.1f, %.1f) "
+                     "mm | in use (%.1f, %.1f, %.1f) mm | commits %d refused %d | last window rms %.1f mm yaw %.0f pitch %.0f deg",
+                     g_pf.tried, g_pf.rigid, g_pf.acceptedYaw, pivotfit::kYawNeed, g_pf.acceptedPitch, pivotfit::kPitchNeed,
+                     med[0] * 1000.0f, med[1] * 1000.0f, med[2] * 1000.0f, g_pf.n[0] * 1000.0f, g_pf.n[1] * 1000.0f,
+                     g_pf.n[2] * 1000.0f, g_pf.commits, g_pf.refused, g_pf.last.rmsM * 1000.0f,
+                     g_pf.last.yawSweepRad * 57.2957795f, g_pf.last.pitchSweepRad * 57.2957795f);
+    }
+    if (g_pfLastSampleS >= 0.0 && now - g_pfLastSampleS < 1.0 / 30.0) { return false; }
+    float base[3] = {};
+    float baseYawDeg = 0.0f;
+    if (!GetAppBase(base, &baseYawDeg)) { return false; }
+    g_pfLastSampleS = now;
+    const float x = head.orientation.x, y = head.orientation.y, z = head.orientation.z, w = head.orientation.w;
+    const float Rq[9] = { 1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w),
+                          2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w),
+                          2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y) };
+    const float by = baseYawDeg * 0.0174532925f, c = std::cos(by), s = std::sin(by);
+    const float Y[9] = { c, 0.0f, s, 0.0f, 1.0f, 0.0f, -s, 0.0f, c };
+    const float eye[3] = { head.position.x, head.position.y, head.position.z };
+    pivotfit::Sample smp{};
+    smp.t = now;
+    for (int r = 0; r < 3; ++r) {
+        smp.eye[r] = Y[3 * r] * eye[0] + Y[3 * r + 1] * eye[1] + Y[3 * r + 2] * eye[2] + base[r];
+        for (int k = 0; k < 3; ++k) { smp.R[3 * r + k] = Y[3 * r] * Rq[k] + Y[3 * r + 1] * Rq[3 + k] + Y[3 * r + 2] * Rq[6 + k]; }
+    }
+    const float before[3] = { g_pf.n[0], g_pf.n[1], g_pf.n[2] };
+    const pivotfit::Event ev = pivotfit::Step(g_pf, smp);
+    if (ev == pivotfit::Event::RefusedOutOfBox && (g_pfRefusedLines < 5 || g_pf.refused % 120 == 0)) {
+        ++g_pfRefusedLines;
+        // [PROBE: PIVOTFIT] gate=holster_enable  site=HEADSET  log-only=no
+        LOG("holster: [PIVOTFIT] REFUSED #%d - the medians (%.1f, %.1f, %.1f) mm are outside the plausibility box; the holsters keep "
+            "(%.1f, %.1f, %.1f) mm", g_pf.refused, g_pf.refusedMedian[0] * 1000.0f, g_pf.refusedMedian[1] * 1000.0f,
+            g_pf.refusedMedian[2] * 1000.0f, g_pf.n[0] * 1000.0f, g_pf.n[1] * 1000.0f, g_pf.n[2] * 1000.0f);
+    }
+    if (ev != pivotfit::Event::Committed) { return false; }
+    for (int k = 0; k < 3; ++k) { n0[k] = before[k]; n1[k] = g_pf.n[k]; }
+    PivotPublish(n1);
+    const char* nm = XrSystemNameNow();
+    if (nm && nm[0]) { PivotFileSave(nm); }
+    return true;
 }
 
 // Hysteresis like the Machines: enter inside r, leave past r * kExitScale. Review I3/M2: every zone, enabled or not, every cycle.
@@ -414,10 +592,53 @@ void BodyFrameUpdate()
         return;
     }
     const holster::Vec3 eye{ head.position.x, head.position.y, head.position.z };
-    const XrVector3f nv = NeckOffsetM();
-    const holster::Vec3 n{ nv.x, nv.y, nv.z };
+    // Plan 2026-11-20-holster-pivot-posture-rings Task 4: the learned pivot - one sample at 30 Hz, then the n the holsters use this
+    // cycle (NeckOffsetM() until a commit / this headset's file line).
+    float pn0[3] = {}, pn1[3] = {};
+    const bool pivotCommitted = PivotTick(now, head, pn0, pn1);
+    float pv[3];
+    HolsterPivotM(pv);
+    const holster::Vec3 n{ pv[0], pv[1], pv[2] };
     const holster::Vec3 neck = holster::NeckPoint(eye, head.orientation.x, head.orientation.y, head.orientation.z,
                                                   head.orientation.w, n);
+    // A COMMIT: the neck point just moved by -R(q)(n1 - n0). Every latch takes LatchShift (the virtual head does not move -
+    // pivotfit_logic_test LatchShiftKeepsVirtualHead) and the hip point P / ref take the same move in the reference frame (the hips
+    // do not glide). Placed centres are untouched (spec §5.1).
+    if (pivotCommitted) {
+        const float qx = head.orientation.x, qy = head.orientation.y, qz = head.orientation.z, qw = head.orientation.w;
+        const float Rq[9] = { 1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw),
+                              2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw),
+                              2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy) };
+        float d[3];
+        pivotfit::LatchShift(b.facing.yaw, Rq, pn0, pn1, d);
+        int shifted = 0;
+        for (int z = 0; z < kZoneCount; ++z) {
+            if (!b.latch[z].have) { continue; }
+            b.latch[z].eyeFromAnchor.x += d[0];
+            b.latch[z].eyeFromAnchor.y += d[1];
+            b.latch[z].eyeFromAnchor.z += d[2];
+            ++shifted;
+        }
+        const float dn[3] = { pn1[0] - pn0[0], pn1[1] - pn0[1], pn1[2] - pn0[2] };
+        const holster::Vec3 mv{ -(Rq[0] * dn[0] + Rq[1] * dn[1] + Rq[2] * dn[2]), -(Rq[3] * dn[0] + Rq[4] * dn[1] + Rq[5] * dn[2]),
+                                -(Rq[6] * dn[0] + Rq[7] * dn[1] + Rq[8] * dn[2]) };
+        float base[3] = {};
+        float baseYawDeg = 0.0f;
+        bool hipShifted = false;
+        if (b.hip.have && GetAppBase(base, &baseYawDeg)) {
+            const holster::Vec3 mw = holster::ToWorldYaw(mv, baseYawDeg * 0.0174532925f);
+            b.hip.px += mw.x;
+            b.hip.pz += mw.z;
+            b.hip.ref += mw.y;
+            hipShifted = true;
+        }
+        // [PROBE: PIVOTFIT] gate=holster_enable  site=HEADSET  log-only=no
+        LOG("holster: [PIVOTFIT] COMMIT #%d - n (%.1f, %.1f, %.1f) -> (%.1f, %.1f, %.1f) mm | accepted yaw %d pitch %d | %d latch(es) shifted "
+            "by (%.1f, %.1f, %.1f) mm, hip point %s | the neck point moved %.1f mm", g_pf.commits, pn0[0] * 1000.0f, pn0[1] * 1000.0f,
+            pn0[2] * 1000.0f, pn1[0] * 1000.0f, pn1[1] * 1000.0f, pn1[2] * 1000.0f, g_pf.acceptedYaw, g_pf.acceptedPitch, shifted,
+            d[0] * 1000.0f, d[1] * 1000.0f, d[2] * 1000.0f, hipShifted ? "shifted with it" : "not set yet",
+            std::sqrt(mv.x * mv.x + mv.y * mv.y + mv.z * mv.z) * 1000.0f);
+    }
     const float headYaw = holster::HeadYaw(head.orientation.x, head.orientation.y, head.orientation.z, head.orientation.w);
 
     // Anchors first (they do not depend on the facing). Every body zone hangs off the real neck point (Jay 2026-10-20, run 1 of the
@@ -441,14 +662,21 @@ void BodyFrameUpdate()
         float rc[3], lc[3];
         HolsterHipCentre(0, rc);
         HolsterHipCentre(1, lc);
-        b.in[kZoneShoulder] = rOk && ZoneInStep(b.in[kZoneShoulder], ZoneLocalNoCount(b, kZoneShoulder, eye, headYaw, r), sc,
-                                                HolsterRadius);
-        b.in[kZoneRHip] = rOk && ZoneInStep(b.in[kZoneRHip], ZoneLocalNoCount(b, kZoneRHip, eye, headYaw, r), rc,
-                                            HolsterRHipRadius);
-        b.in[kZoneLHip] = lOk && ZoneInStep(b.in[kZoneLHip], ZoneLocalNoCount(b, kZoneLHip, eye, headYaw, l), lc,
-                                            HolsterHipRadius);
         const float cc[3] = { HolsterLChestCenterX, HolsterLChestCenterY, HolsterLChestCenterZ };
-        b.in[kZoneLChest] = lOk && ZoneInStep(b.in[kZoneLChest], ZoneLocalNoCount(b, kZoneLChest, eye, headYaw, l), cc,
+        // Direction-free (2026-11-20): the centres every frame this cycle is aligned with (published in the snapshot too).
+        b.centre[kZoneShoulder] = { sc[0], sc[1], sc[2] };
+        b.centre[kZoneRHip] = { rc[0], rc[1], rc[2] };
+        b.centre[kZoneLHip] = { lc[0], lc[1], lc[2] };
+        b.centre[kZoneLChest] = { cc[0], cc[1], cc[2] };
+        b.in[kZoneShoulder] = rOk && ZoneInStep(b.in[kZoneShoulder],
+                                                ZoneLocalNoCount(b, kZoneShoulder, eye, headYaw, r, b.centre[kZoneShoulder], true), sc,
+                                                HolsterRadius);
+        b.in[kZoneRHip] = rOk && ZoneInStep(b.in[kZoneRHip], ZoneLocalNoCount(b, kZoneRHip, eye, headYaw, r, b.centre[kZoneRHip], false),
+                                            rc, HolsterRHipRadius);
+        b.in[kZoneLHip] = lOk && ZoneInStep(b.in[kZoneLHip], ZoneLocalNoCount(b, kZoneLHip, eye, headYaw, l, b.centre[kZoneLHip], false),
+                                            lc, HolsterHipRadius);
+        b.in[kZoneLChest] = lOk && ZoneInStep(b.in[kZoneLChest],
+                                              ZoneLocalNoCount(b, kZoneLChest, eye, headYaw, l, b.centre[kZoneLChest], false), cc,
                                               HolsterLChestRadius);
     }
 
@@ -468,7 +696,22 @@ void BodyFrameUpdate()
     // COST: one Guard enter (GetEyeAboveFloor), a few compares.
     float eyeFloor = 0.0f;
     const bool floorOk = GetEyeAboveFloor(&eyeFloor);
-    const bool postureChanged = holster::PostureStep(b.posture, floorOk, eyeFloor, now);
+    // Plan 2026-11-20 Task 4 (spec §5.2): the lines from the player's own calibration (armfit eye_floor_m), refreshed whenever the
+    // calibration changes (its sequence, read above by ArmFitRestHand); none / implausible = the fixed 1.38 / 1.33 m.
+    if (seq != b.linesSeq) {
+        b.linesSeq = seq;
+        float ef = 0.0f;
+        bool efStanding = true;
+        const bool efHave = ArmFitEyeFloor(&ef, &efStanding);
+        b.lines = holster::PostureLinesFrom(efHave, ef, efStanding);
+        // [PROBE: HOLSTERBODY] gate=holster_enable,holster_rhip_enable,holster_hip_enable  site=HEADSET  log-only=no
+        LOG("holster: [HOLSTERBODY] POSTURE LINES - STANDING above %.3f m, SEATED below %.3f m | source: %s | the calibration's eye "
+            "height %s%.3f m (%s)", b.lines.standEyeM, b.lines.seatEyeM,
+            b.lines.source == 1 ? "calibrated standing" : (b.lines.source == 2 ? "calibrated seated" :
+            (efHave ? "FALLBACK - that eye height is implausible" : "FALLBACK - no eye height in the calibration (recalibrate)")),
+            efHave ? "" : "none, ", efHave ? ef : 0.0f, efHave ? (efStanding ? "standing" : "seated") : "-");
+    }
+    const bool postureChanged = holster::PostureStep(b.posture, floorOk, eyeFloor, now, b.lines);
     if (floorOk) {
         if (eyeFloor < b.eyeMin) { b.eyeMin = eyeFloor; }
         if (eyeFloor > b.eyeMax) { b.eyeMax = eyeFloor; }
@@ -478,7 +721,7 @@ void BodyFrameUpdate()
         // [PROBE: HOLSTERBODY] gate=holster_enable,holster_rhip_enable,holster_hip_enable  site=HEADSET  log-only=no
         LOG("holster: [HOLSTERBODY] POSTURE FIRST (logged unconditionally) | eye %.3f m above the floor | STANDING after %.1f s above "
             "%.2f m, SEATED after %.1f s below %.2f m | standing: a head held %.1f s past the band is followed as a body turn",
-            eyeFloor, holster::kPostureHoldS, holster::kStandEyeM, holster::kPostureHoldS, holster::kSeatEyeM, holster::kStandHoldS);
+            eyeFloor, holster::kPostureHoldS, b.lines.standEyeM, holster::kPostureHoldS, b.lines.seatEyeM, holster::kStandHoldS);
     } else if (!b.saidNoFloor && !floorOk) {
         b.saidNoFloor = true;
         // [PROBE: HOLSTERBODY] gate=holster_enable,holster_rhip_enable,holster_hip_enable  site=HEADSET  log-only=no
@@ -624,7 +867,7 @@ void BodyFrameUpdate()
             "head yaw %+.1f deg: held inside %.0f deg of the head, follows a head held past it for %.1f s only when both hands turn "
             "with it, held while the head is pitched below -%.0f deg (squared up to the hand line over %.1f s only for hands at rest "
             "%.2f m below the neck) | the hips hang off the hip point | the temple stays head-relative",
-            nv.x * 1000.0f, nv.y * 1000.0f, nv.z * 1000.0f, pelPub ? "published" : "NOT published yet", headYaw * 57.2957795f,
+            n.x * 1000.0f, n.y * 1000.0f, n.z * 1000.0f, pelPub ? "published" : "NOT published yet", headYaw * 57.2957795f,
             holster::kBandR * 57.2957795f, holster::kBandHoldS, holster::kPitchFreezeR * 57.2957795f, holster::kRestTauS,
             holster::kRestDropM);
     }
@@ -661,14 +904,16 @@ void BodyFrameUpdate()
 }
 
 // The zone's offset for its Machine: body-locked when its anchor and latch are ready, else `today` (head-relative) untouched.
-void BodyLocal(int zone, const XrPosef& grip, holster::Vec3& local)
+// Direction-free (2026-11-20, trace 20261120_1400): aligned to the hand round the anchor's axis (ZoneLocalNoCount); the right
+// shoulder excludes the space in front of the face. headYaw = the poll's own head yaw.
+void BodyLocal(int zone, const XrPosef& grip, float headYaw, holster::Vec3& local)
 {
     BodyFrame& b = g_bf;
     if (!b.anchorOk[zone]) { ++b.offNoAnchor[zone]; return; }
     if (!b.latch[zone].have) { ++b.offNoLatch[zone]; return; }
     ++b.onBody[zone];
-    const holster::Vec3 v = holster::VirtualHead(b.anchor[zone], b.facing.yaw, b.latch[zone]);
-    local = holster::LocalOffsetYaw(v, b.facing.yaw, { grip.position.x, grip.position.y, grip.position.z });
+    local = ZoneLocalNoCount(b, zone, { 0.0f, 0.0f, 0.0f }, headYaw, { grip.position.x, grip.position.y, grip.position.z },
+                             b.centre[zone], zone == kZoneShoulder);
 }
 
 // [HOLSTERPLACE] CHECK (Task 3 review I1): the independent test of a placement - the POLL's own hand-to-centre distance for a
@@ -1267,7 +1512,7 @@ bool HolsterWheelStick(float& x, float& y)
     return true;
 }
 
-bool HolsterZoneLocal(int zone, int caller, const float headPos[3], const float headQ[4], const float grip[3], float out[3])
+bool HolsterZoneLocal(int zone, int caller, const float headPos[3], const float headQ[4], const float grip[3], float out[3], bool mirrorX)
 {
     zone = zone < 0 ? 0 : (zone >= kZoneCount ? kZoneCount - 1 : zone);
     caller = caller < 0 ? 0 : (caller > 2 ? 2 : caller);
@@ -1282,8 +1527,9 @@ bool HolsterZoneLocal(int zone, int caller, const float headPos[3], const float 
     // the neck point, from the caller's own head pose.
     const bool body = s.atS >= 0.0 && NowS() - s.atS <= 0.25 && s.latched[zone];
     if (body) {
-        const XrVector3f nv = NeckOffsetM();
-        const holster::Vec3 neck = holster::NeckPoint(eye, headQ[0], headQ[1], headQ[2], headQ[3], { nv.x, nv.y, nv.z });
+        float nv[3];
+        HolsterPivotM(nv);   // the learned pivot (plan 2026-11-20 Task 4), NeckOffsetM() until one is committed
+        const holster::Vec3 neck = holster::NeckPoint(eye, headQ[0], headQ[1], headQ[2], headQ[3], { nv[0], nv[1], nv[2] });
         // 2026-11-16: the zone's anchor = the caller's neck + the published anchor - neck (0 for the shoulder; the hip point for the
         // hips - the throwables' right-hip ready zone).
         const holster::Vec3 an{ neck.x + s.anchorFromNeck[zone].x, neck.y + s.anchorFromNeck[zone].y,
@@ -1291,7 +1537,18 @@ bool HolsterZoneLocal(int zone, int caller, const float headPos[3], const float 
         holster::Latch L;
         L.have = true;
         L.eyeFromAnchor = s.eyeFromAnchor[zone];
-        local = holster::LocalOffsetYaw(holster::VirtualHead(an, s.yaw, L), s.yaw, palm);
+        // Direction-free (2026-11-20, trace 20261120_1400): aligned to this hand round the anchor's axis with the published centre;
+        // the right shoulder ignores a hand in front of the face (the swing refusal and the bow quiver stay free there).
+        // mirrorX (final review I1, trace 20261120_1510): aligned to the mirrored centre, the one the caller measures against; the
+        // front-of-face test is symmetric round the neck and applies to the mirrored shoulder too.
+        const holster::Vec3 c{ mirrorX ? -s.centre[zone].x : s.centre[zone].x, s.centre[zone].y, s.centre[zone].z };
+        const float y = holster::AlignYawToHand(an, { L.eyeFromAnchor.x + c.x, L.eyeFromAnchor.y + c.y, L.eyeFromAnchor.z + c.z }, palm,
+                                                s.yaw);
+        local = holster::LocalOffsetYaw(holster::VirtualHead(an, y, L), y, palm);
+        if (zone == kZoneShoulder &&
+            holster::InFrontOfFace(neck, holster::HeadYaw(headQ[0], headQ[1], headQ[2], headQ[3]), palm, holster::kShoulderFrontR)) {
+            local.z += 100.0f;
+        }
     }
     InterlockedIncrement(&g_consumer[caller][body ? 0 : 1]);
     out[0] = local.x;
@@ -1378,8 +1635,9 @@ bool HolsterPoll(bool vrGripOn, bool& outDpadRight, bool& outDpadLeft, bool& out
     holster::Input inH = in;
     if (in.poseOk) {
         // the shoulder's lines below print the offset its Machine used; a zone that is off is not counted (review M3)
-        if (shoulderOn) { BodyLocal(kZoneShoulder, grip, in.local); }
-        if (rhipOn) { BodyLocal(kZoneRHip, grip, inH.local); }
+        const float hyR = holster::HeadYaw(head.orientation.x, head.orientation.y, head.orientation.z, head.orientation.w);
+        if (shoulderOn) { BodyLocal(kZoneShoulder, grip, hyR, in.local); }
+        if (rhipOn) { BodyLocal(kZoneRHip, grip, hyR, inH.local); }
         // [HOLSTERPLACE] CHECK after a placement (review I1). Idle COST: two volatile reads.
         if (shoulderOn) { PlaceCheckPoll(kZoneShoulder, in.local, params.centre); }
         if (rhipOn) { PlaceCheckPoll(kZoneRHip, inH.local, rhip.centre); }
@@ -1959,9 +2217,10 @@ bool HolsterLeftPoll(bool vrGripOn, bool& outDpadDown, bool& outDpadUp, bool& ou
     // flashlight only").
     BodyFrameUpdate();
     holster::Input inHip = in;
-    if (in.poseOk && hipOn) { BodyLocal(kZoneLHip, grip, inHip.local); }
+    const float hyL = in.poseOk ? holster::HeadYaw(hp.orientation.x, hp.orientation.y, hp.orientation.z, hp.orientation.w) : 0.0f;
+    if (in.poseOk && hipOn) { BodyLocal(kZoneLHip, grip, hyL, inHip.local); }
     holster::Input inChest = in;
-    if (in.poseOk && chestOn) { BodyLocal(kZoneLChest, grip, inChest.local); }
+    if (in.poseOk && chestOn) { BodyLocal(kZoneLChest, grip, hyL, inChest.local); }
     // [HOLSTERPLACE] CHECK after a placement (review I1). Idle COST: three volatile reads. Zones are PLACEMENT indices here.
     if (in.poseOk && hipOn) { PlaceCheckPoll(holster::place::kLHip, inHip.local, hip.centre); }
     if (in.poseOk && headOn) { PlaceCheckPoll(holster::place::kHead, in.local, head.centre); }
@@ -1979,8 +2238,10 @@ bool HolsterLeftPoll(bool vrGripOn, bool& outDpadDown, bool& outDpadUp, bool& ou
     if (takeLive) {
         if (in.poseOk) {
             const float hy = holster::HeadYaw(hp.orientation.x, hp.orientation.y, hp.orientation.z, hp.orientation.w);
+            // Direction-free (2026-11-20): aligned to the MIRRORED centre (the left shoulder) - the left hand's own ring; no
+            // front-of-face exclusion (the take is the left hand; the right shoulder's exclusion is the right hand's).
             takeLocal = ZoneLocalNoCount(g_bf, kZoneShoulder, { hp.position.x, hp.position.y, hp.position.z }, hy,
-                                         { grip.position.x, grip.position.y, grip.position.z });
+                                         { grip.position.x, grip.position.y, grip.position.z }, takeZone.centre, false);
             const float dx = takeLocal.x - takeZone.centre.x, dy = takeLocal.y - takeZone.centre.y,
                         dz = takeLocal.z - takeZone.centre.z;
             takeDist = std::sqrt(dx * dx + dy * dy + dz * dz);
@@ -2307,15 +2568,27 @@ PlaceFrame PlaceFrameOf(int zone, const XrPosef& head)
     f.ageMs = age < 0.0 ? -1.0 : age * 1000.0;
     if (s.latched[bz] && !(age >= 0.0 && age <= 0.25)) { f.stale = true; }
     if (s.atS >= 0.0 && NowS() - s.atS <= 0.25 && s.latched[bz]) {
-        const XrVector3f nv = NeckOffsetM();
-        const holster::Vec3 neck = holster::NeckPoint(eye, qx, qy, qz, qw, { nv.x, nv.y, nv.z });
+        float nv[3];
+        HolsterPivotM(nv);   // the learned pivot (plan 2026-11-20 Task 4) - the same one the polls use
+        const holster::Vec3 neck = holster::NeckPoint(eye, qx, qy, qz, qw, { nv[0], nv[1], nv[2] });
         // 2026-11-16: anchor = the neck + the published anchor - neck (the hip point for the hips; 0 otherwise).
         const holster::Vec3 an{ neck.x + s.anchorFromNeck[bz].x, neck.y + s.anchorFromNeck[bz].y, neck.z + s.anchorFromNeck[bz].z };
         holster::Latch L;
         L.have = true;
         L.eyeFromAnchor = s.eyeFromAnchor[bz];
-        f.origin = holster::VirtualHead(an, s.yaw, L);
-        f.yaw = s.yaw;
+        // Direction-free (2026-11-20, trace 20261120_1400): aligned to the zone's OWN hand (the right for the shoulder / right hip, the
+        // left for the left hip / chest) - the sphere, the rings and a placement sit on that hand's side, where the grab measures.
+        // No grip pose = the snapshot's yaw (the old frame).
+        float y = s.yaw;
+        XrPosef gp{};
+        const Hand hand = (bz == kZoneShoulder || bz == kZoneRHip) ? kRightHand : kLeftHand;
+        if (GetControllerGripPose(hand, gp)) {
+            const holster::Vec3& c = s.centre[bz];
+            y = holster::AlignYawToHand(an, { L.eyeFromAnchor.x + c.x, L.eyeFromAnchor.y + c.y, L.eyeFromAnchor.z + c.z },
+                                        { gp.position.x, gp.position.y, gp.position.z }, s.yaw);
+        }
+        f.origin = holster::VirtualHead(an, y, L);
+        f.yaw = y;
         f.body = true;
     }
     return f;
@@ -2689,6 +2962,21 @@ volatile LONG64 g_hcInvalid = 0;         // locates without both valid bits
 volatile LONG   g_hcSaidFirst = 0, g_hcSaidWait = 0, g_hcSaidCap = 0;
 volatile LONG64 g_hcNextSummaryMs = 0;
 constexpr LONG  kHcMaxLines = 150000;    // ~28 min at 90 Hz (INV-9)
+// BODYCAP (trace 20261120_1044_bodycap_probe): lines written with / without a body sample, and the two FIRST lines.
+volatile LONG64 g_bcWith = 0, g_bcWithout = 0;
+volatile LONG   g_bcSaidWith = 0, g_bcSaidWithout = 0;
+
+// Appends to buf at *len; a truncation stops further appends (the line is still written, flagged by a trailing "|TRUNC").
+void BcAppend(char* buf, size_t cap, size_t* len, bool* trunc, const char* fmt, ...)
+{
+    if (*trunc) { return; }
+    va_list ap;
+    va_start(ap, fmt);
+    const int n = _vsnprintf_s(buf + *len, cap - *len, _TRUNCATE, fmt, ap);
+    va_end(ap);
+    if (n < 0) { *trunc = true; return; }
+    *len += static_cast<size_t>(n);
+}
 }  // namespace
 
 void HolsterHipCapture(long long t, bool headValid, const float hp[3], const float hq[4], const float base[3], float baseYawDeg)
@@ -2703,8 +2991,9 @@ void HolsterHipCapture(long long t, bool headValid, const float hp[3], const flo
         const LONG written = g_hcLines < kHcMaxLines ? g_hcLines : kHcMaxLines;
         // [PROBE: HIPCAP] gate=diag_hip_capture  site=HEADSET  log-only=yes
         LOG("holster: [HIPCAP] 60 s | lines written to dlvr_hipcap.log %ld (cap %ld) | repeated display times skipped %lld | "
-            "locates with the head not tracked %lld", static_cast<long>(written), static_cast<long>(kHcMaxLines),
-            static_cast<long long>(g_hcRepeat), static_cast<long long>(g_hcInvalid));
+            "locates with the head not tracked %lld | [BODYCAP] lines with the body %lld, without (no publish yet / torn) %lld",
+            static_cast<long>(written), static_cast<long>(kHcMaxLines), static_cast<long long>(g_hcRepeat),
+            static_cast<long long>(g_hcInvalid), static_cast<long long>(g_bcWith), static_cast<long long>(g_bcWithout));
     }
     if (!headValid) {
         InterlockedIncrement64(&g_hcInvalid);
@@ -2746,13 +3035,67 @@ void HolsterHipCapture(long long t, bool headValid, const float hp[3], const flo
     const holster::Vec3& eS = s.eyeFromAnchor[kZoneShoulder];
     const holster::Vec3& eR = s.eyeFromAnchor[kZoneRHip];
     const holster::Vec3& eL = s.eyeFromAnchor[kZoneLHip];
+    // [BODYCAP] (trace 20261120_1044_bodycap_probe): appended AFTER the original fields, which are unchanged (older readers parse a
+    // prefix). k = body read ok, age ms (QPC, -1 none), publishes, model | m = anchor xyz, headRep xyz, cby, sby, folded deg |
+    // n = neck have, neck yaw, last head yaw (OpenXR deg, no flip), fields ok, look +4468, facing +4588 | W0..W5 = have + world 3x4
+    // (bip01 pelvis hspine spine1 spine3 hspine1) | V0..V3 = have + local 3x4 (pelvis hspine spine spine1) | p = floor ok, eye above
+    // the floor m, calib_posture | a = anchorFromNeck x y z for shoulder, right hip, left hip, left chest; left chest latched +
+    // eyeFromAnchor. COST: one ~600-byte seqlock copy, ~1.5 KB of formatting into the stack buffer below.
+    BodyCapSample bc;
+    const bool bcOk = BodyCapRead(&bc);
+    InterlockedIncrement64(bcOk ? &g_bcWith : &g_bcWithout);
+    char ext[3072];
+    ext[0] = '\0';
+    size_t el = 0;
+    bool trunc = false;
+    const double bcAge = bcOk ? (NowS() - bc.atS) * 1000.0 : -1.0;
+    BcAppend(ext, sizeof(ext), &el, &trunc, "|k %d %.1f %lld %llx|m %.4f %.4f %.4f %.4f %.4f %.4f %.6f %.6f %.3f|n %d %.3f %.3f %d %.4f %.4f",
+             bcOk ? 1 : 0, bcAge, bc.solves, bc.model, bc.anchor[0], bc.anchor[1], bc.anchor[2], bc.headRep[0], bc.headRep[1],
+             bc.headRep[2], bc.cby, bc.sby, bc.folded, bc.neckHave, bc.neckYaw, bc.neckLastH, bc.fieldsOk, bc.look, bc.facing);
+    for (int i = 0; i < kBodyCapW; ++i) {
+        const float* m = bc.w[i];
+        BcAppend(ext, sizeof(ext), &el, &trunc, "|W%d %d %.5f %.5f %.5f %.4f %.5f %.5f %.5f %.4f %.5f %.5f %.5f %.4f", i, bc.haveW[i],
+                 m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11]);
+    }
+    for (int i = 0; i < kBodyCapL; ++i) {
+        const float* m = bc.l[i];
+        BcAppend(ext, sizeof(ext), &el, &trunc, "|V%d %d %.5f %.5f %.5f %.4f %.5f %.5f %.5f %.4f %.5f %.5f %.5f %.4f", i, bc.haveL[i],
+                 m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11]);
+    }
+    float bcFloor = -1.0f;
+    const bool bcFloorOk = GetEyeAboveFloor(&bcFloor);
+    BcAppend(ext, sizeof(ext), &el, &trunc, "|p %d %.4f %d|a", bcFloorOk ? 1 : 0, bcFloorOk ? bcFloor : -1.0f, CalibPosture);
+    for (int z = 0; z < kZoneCount; ++z) {
+        BcAppend(ext, sizeof(ext), &el, &trunc, " %.4f %.4f %.4f", s.anchorFromNeck[z].x, s.anchorFromNeck[z].y, s.anchorFromNeck[z].z);
+    }
+    const holster::Vec3& eC = s.eyeFromAnchor[kZoneLChest];
+    BcAppend(ext, sizeof(ext), &el, &trunc, " %d %.4f %.4f %.4f", s.latched[kZoneLChest] ? 1 : 0, eC.x, eC.y, eC.z);
+    if (trunc && el + 7 < sizeof(ext)) {
+        static const char kTr[7] = { '|', 'T', 'R', 'U', 'N', 'C', '\0' };
+        for (int i = 0; i < 7; ++i) { ext[el + i] = kTr[i]; }
+    }
+    if (bcOk && InterlockedExchange(&g_bcSaidWith, 1) == 0) {
+        // [PROBE: BODYCAP] gate=diag_hip_capture  site=HEADSET  log-only=yes
+        LOG("holster: [BODYCAP] FIRST SAMPLE WITH THE BODY (logged unconditionally) | age %.1f ms, publishes %lld, model %llx | world have "
+            "bip01 %d pelvis %d hspine %d spine1 %d spine3 %d hspine1 %d | local have pelvis %d hspine %d spine %d spine1 %d | hspine "
+            "world (%.3f, %.3f, %.3f) | neck have %d yaw %.1f head %.1f | look / facing ok %d (%.1f / %.1f) | floor %d %.3f m | calib_posture %d"
+            " | line %zu chars%s", bcAge, bc.solves, bc.model, bc.haveW[0], bc.haveW[1], bc.haveW[2], bc.haveW[3], bc.haveW[4],
+            bc.haveW[5], bc.haveL[0], bc.haveL[1], bc.haveL[2], bc.haveL[3], bc.w[2][3], bc.w[2][7], bc.w[2][11], bc.neckHave,
+            bc.neckYaw, bc.neckLastH, bc.fieldsOk, bc.look, bc.facing, bcFloorOk ? 1 : 0, bcFloor, CalibPosture, el,
+            trunc ? " | *** TRUNCATED ***" : "");
+    } else if (!bcOk && InterlockedExchange(&g_bcSaidWithout, 1) == 0) {
+        // [PROBE: BODYCAP] gate=diag_hip_capture  site=HEADSET  log-only=yes
+        LOG("holster: [BODYCAP] A LINE WITHOUT THE BODY (logged once) - BodyCapRead returned false: the right-arm solve has not "
+            "published yet (rig not solving: loading / menu / no player) or 8 torn reads; that line's k section reads 0 and its "
+            "bone fields are zeros");
+    }
     // Fields: display time ns | b = appSpace base x y z, yaw deg | h = head x y z, qx qy qz qw (appSpace) | L / R = grip valid,
     // x y z, qx qy qz qw, squeeze, trigger | s = snapshot age ms, facing yaw rad | z = latched + eyeFromAnchor: shoulder, right hip,
-    // left hip.
+    // left hip. Then the [BODYCAP] sections above (%s).
     LogTo("dlvr_hipcap.log",
           "%lld|b %.4f %.4f %.4f %.3f|h %.4f %.4f %.4f %.5f %.5f %.5f %.5f|"
           "L %d %.4f %.4f %.4f %.5f %.5f %.5f %.5f %.3f %.3f|R %d %.4f %.4f %.4f %.5f %.5f %.5f %.5f %.3f %.3f|"
-          "s %.1f %.5f|z %d %.4f %.4f %.4f %d %.4f %.4f %.4f %d %.4f %.4f %.4f",
+          "s %.1f %.5f|z %d %.4f %.4f %.4f %d %.4f %.4f %.4f %d %.4f %.4f %.4f%s",
           t, base[0], base[1], base[2], baseYawDeg, hp[0], hp[1], hp[2], hq[0], hq[1], hq[2], hq[3],
           gOk[0] ? 1 : 0, g[0].position.x, g[0].position.y, g[0].position.z, g[0].orientation.x, g[0].orientation.y,
           g[0].orientation.z, g[0].orientation.w, sq[0], tr[0],
@@ -2760,7 +3103,7 @@ void HolsterHipCapture(long long t, bool headValid, const float hp[3], const flo
           g[1].orientation.z, g[1].orientation.w, sq[1], tr[1],
           ageMs, s.yaw,
           s.latched[kZoneShoulder] ? 1 : 0, eS.x, eS.y, eS.z, s.latched[kZoneRHip] ? 1 : 0, eR.x, eR.y, eR.z,
-          s.latched[kZoneLHip] ? 1 : 0, eL.x, eL.y, eL.z);
+          s.latched[kZoneLHip] ? 1 : 0, eL.x, eL.y, eL.z, ext);
     if (InterlockedExchange(&g_hcSaidFirst, 1) == 0) {
         // [PROBE: HIPCAP] gate=diag_hip_capture  site=HEADSET  log-only=yes
         LOG("holster: [HIPCAP] FIRST SAMPLE (logged unconditionally) -> dlvr_hipcap.log beside this log, one line per located frame "
@@ -2769,6 +3112,73 @@ void HolsterHipCapture(long long t, bool headValid, const float hp[3], const flo
             hp[2], gOk[0] ? 1 : 0, gOk[1] ? 1 : 0, ageMs, s.yaw * 57.2957795f, s.latched[kZoneShoulder] ? 1 : 0,
             s.latched[kZoneRHip] ? 1 : 0, s.latched[kZoneLHip] ? 1 : 0);
     }
+}
+
+// ===== THE VISIBLE RINGS (plan 2026-11-20-holster-pivot-posture-rings Task 5; trace 20261120_1300_holster_rings) =====
+// [DEP: holster_rings] required-for=the visible holster rings (HolsterRings) - overlay.cpp OverlayRenderHolsterRings draws, this file
+//      picks them. tree=a FEATURE switch, not the grab: off = no ring, the holsters work as before. HEADSET (quad layers + grips).
+//      DEFAULT ON (Jay 2026-11-20: "B, with a switch defaulting on").
+bool HolsterRings = true;
+
+bool HolsterRingsAllowed()
+{
+    return !uipin::GameMenuOpen() && !uipin::GamePausedForMenu() && !CalibScreenActive() && !CamHookLocalInVehicle() &&
+           !CamHookCutsceneActive();
+}
+
+int HolsterRingTargets(float centre[][3], float radius[], float alpha[], int maxOut)
+{
+    if (maxOut <= 0) { return 0; }
+    if (maxOut > holster::ring::kMaxRings) { maxOut = holster::ring::kMaxRings; }
+    XrPosef g[2] = {};
+    const bool gOk[2] = { GetControllerGripPose(kRightHand, g[0]), GetControllerGripPose(kLeftHand, g[1]) };
+    float d[holster::place::kZones] = {};
+    bool on[holster::place::kZones] = {};
+    bool in[holster::place::kZones] = {};
+    float w[holster::place::kZones][3] = {};
+    float r[holster::place::kZones] = {};
+    for (int z = 0; z < holster::place::kZones; ++z) {
+        // No shoulder ring (Jay 2026-11-20: "we don't need the shoulder holsters to be visible. Just the chest & hips are fine"; trace
+        // 20261120_1535). Rings only - the placement sphere still shows the shoulder while it is placed; the grab is unchanged.
+        if (z == holster::place::kShoulder) { continue; }
+        float local[3];
+        bool enabled = false;
+        if (!HolsterZoneParams(z, local, &r[z], &enabled) || !enabled || !(r[z] > 0.0f) || !HolsterZoneWorld(z, w[z])) { continue; }
+        const int h = (z == holster::place::kShoulder || z == holster::place::kRHip) ? 0 : 1;   // the hand that uses this holster
+        if (!gOk[h]) { continue; }
+        const float dx = g[h].position.x - w[z][0], dy = g[h].position.y - w[z][1], dz = g[h].position.z - w[z][2];
+        d[z] = std::sqrt(dx * dx + dy * dy + dz * dz) - r[z];
+        in[z] = d[z] <= 0.0f;
+        on[z] = true;
+    }
+    int idx[holster::ring::kMaxRings] = {};
+    const int n = holster::ring::Pick(d, on, holster::place::kZones, idx, maxOut);
+    for (int i = 0; i < n; ++i) {
+        const int z = idx[i];
+        for (int k = 0; k < 3; ++k) { centre[i][k] = w[z][k]; }
+        radius[i] = r[z];
+        alpha[i] = holster::ring::Alpha(d[z], in[z]);
+    }
+    return n;
+}
+
+// holster.h (plan 2026-11-20-holster-pivot-posture-rings Task 4): the n the holsters use; NeckOffsetM() until PivotTick publishes.
+void HolsterPivotM(float out[3])
+{
+    if (g_pivHave) {
+        for (int attempt = 0; attempt < 8; ++attempt) {
+            const LONG s0 = g_pivSeq;
+            if (s0 & 1) { continue; }
+            MemoryBarrier();
+            const float a = g_pivN[0], b = g_pivN[1], c = g_pivN[2];
+            MemoryBarrier();
+            if (g_pivSeq != s0) { continue; }
+            out[0] = a; out[1] = b; out[2] = c;
+            return;
+        }
+    }
+    const XrVector3f s = NeckOffsetM();
+    out[0] = s.x; out[1] = s.y; out[2] = s.z;
 }
 
 }  // namespace dlvr

@@ -107,5 +107,9 @@ bool ArmFitHaveCalibration();
 // the calibration's change counter, so a caller re-logs when a new calibration lands. Loads the file on the first call.
 // COST: one shared lock and three float copies (the first call per launch also reads the file).
 int ArmFitRestHand(int side, float out[3], long* seq);
+// Plan 2026-11-20-holster-pivot-posture-rings Task 3: the eye's height above the STAGE floor measured by the last calibration (median
+// over its accepted step samples) and the posture it was taken in (true = calibrated standing). False = none (no calibration, a file
+// written before 2026-11-20, or no floor while calibrating). Loads the file on the first call. COST: one shared lock, two copies.
+bool ArmFitEyeFloor(float* metres, bool* calibratedStanding);
 
 }  // namespace dlvr

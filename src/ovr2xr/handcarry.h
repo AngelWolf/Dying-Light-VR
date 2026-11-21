@@ -17,6 +17,12 @@ struct HandCarry {
     float appliedRel[12] = {};           // the relation the current local was built with (any slider change -> SetLocal)
     bool  active = false;
     long  takes = 0, giveBacks = 0, forgets = 0, retakes = 0;
+    // A WORLD carry (HandCarryTakeWorld - plan 2026-11-20-world-items-by-hand, trace 20261120_2210): the object hangs off no element,
+    // so its home is its WORLD matrix as found; gsoId = its IGSObject id for the "still the live object" check (INV-663).
+    bool  world = false;
+    float homeWorld[12] = {};
+    int   gsoId = -1;
+    bool  idOk = false;
 };
 
 // The four engine exports, resolved once by name. False = refused (logged once, naming the missing export). COST: one bool test
@@ -47,5 +53,19 @@ bool HandCarryGiveBack(HandCarry& c, const char* why);
 void HandCarryForget(HandCarry& c, const char* why);
 // The object's world translation (its IModelObject element 0) through the rig's world accessor - the self-check's drawn nock.
 bool HandCarryObjectOrigin(const HandCarry& c, float out[3]);
+
+// ---- the WORLD carry (plan 2026-11-20-world-items-by-hand Task 4; trace 20261120_2210; INV-758). Its five engine exports are resolved
+// in HandCarryReady but are NOT in its refusal list: a missing one makes only these three return false (named once), the element carry
+// (bow, crossbow, chest items) is untouched. Game thread only. ----
+// obj must hang off NO mesh element (GetParentMeshElement < 0). Latch its world matrix (homeWorld) and IGSObject id, attach it to
+// onModel / onElem and set its local = `drawn`. False = refused / faulted, nothing changed (the reason is logged, first per reason).
+// COST: 6 export calls, once per take.
+bool HandCarryTakeWorld(HandCarry& c, void* obj, void* onModel, int onElem, const float drawn[12]);
+// Detach to the world keeping its world matrix (DetachFromParent(true) - a DroppedItem's own OnDetached restarts its physics), then,
+// when `world` is given, SetWorldXform(world). c.active = false. False = a fault (the carry is forgotten). COST: 1-2 export calls, once.
+bool HandCarryReleaseWorld(HandCarry& c, const float* world, const char* why);
+// True = the carried world object is no longer the live object the engine knows by its id (FindObjectByID on the player's IGSObject),
+// or it left onElem: forget it, call nothing on it. COST: 2 export calls - per tick while carried (replaces HandCarryStillOn's one).
+bool HandCarryObjectGone(const HandCarry& c, void* player);
 
 }  // namespace dlvr

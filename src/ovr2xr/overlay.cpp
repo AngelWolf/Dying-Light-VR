@@ -22,6 +22,7 @@
 #include "grappleaim.h"   // FireReticle3d / GetGunDot - the gun reticle's point
 #include "headpose.h"     // GetHeadPose - the fire_reticle_3d probe's cross-check; the holster sphere's facing
 #include "holster.h"      // HolsterZoneWorld / HolsterZoneParams / HolsterPlacing - the holster sphere (place-by-hand Task 4)
+#include "ring_logic.h"   // the holster rings' look (plan 2026-11-20-holster-pivot-posture-rings Task 5)
 #include "rtticam.h"
 #include "camhook.h"
 #include "watchwrite.h"
@@ -147,6 +148,13 @@ struct Overlay {
     std::vector<ID3D11RenderTargetView*> rtvs8;
     bool sphereTried = false;
     ImDrawList* sphereList = nullptr;
+    // The visible holster rings (plan 2026-11-20-holster-pivot-posture-rings Task 5, OverlayRenderHolsterRings): up to 3, each its own
+    // swapchain (kPanelW x kPanelH, the centred square used, as the sphere's), created on first use; drawn through an ImGui frame
+    // (never while the panel is open - the rings stand down then).
+    XrSwapchain swapchainRing[3] = { XR_NULL_HANDLE, XR_NULL_HANDLE, XR_NULL_HANDLE };
+    std::vector<XrSwapchainImageD3D11KHR> imagesRing[3];
+    std::vector<ID3D11RenderTargetView*> rtvsRing[3];
+    bool ringTried[3] = { false, false, false };
     // The menu TITLE's quad (OverlayRenderTitle, Jay 2026-11-11: above the panel, top left, outside it) - created on first use,
     // kPanelW x kPanelH like the sphere's, only the title's top-left rectangle shown. Own ImDrawList, no ImGui frame (as the sphere).
     XrSwapchain swapchain9 = XR_NULL_HANDLE;
@@ -4546,6 +4554,72 @@ bool OverlayRenderHolsterSphere(XrSpace appSpace, XrCompositionLayerQuad* out)
 }
 
 namespace {
+// A holster ring, option B (plan 2026-11-20 Task 5; renders backups/20261120_holster_ring_renders): a faint disc + an outline, the
+// sphere's colour, both scaled by the ring's alpha (*user = float 0..1). Drawn into the centred square (h x h) of the canvas.
+void DrawHolsterRing(void* drawList, float w, float h, const void* user)
+{
+    const float a = user ? *static_cast<const float*>(user) : 1.0f;
+    ImDrawList* dl = static_cast<ImDrawList*>(drawList);
+    const ImVec2 c(w * 0.5f, h * 0.5f);
+    const float line = std::max(2.0f, holster::ring::kLineFrac * h * 0.5f);
+    const float r = h * 0.5f - line * 0.5f - 1.0f;
+    const auto A = [a](float k) { return static_cast<int>(std::min(255.0f, std::max(0.0f, k * a * 255.0f + 0.5f))); };
+    dl->AddCircleFilled(c, r, IM_COL32(235, 240, 255, A(holster::ring::kFill)), 0);
+    dl->AddCircle(c, r, IM_COL32(235, 240, 255, A(holster::ring::kOutline)), 0, line);
+}
+}  // namespace
+
+// The visible holster rings (plan 2026-11-20-holster-pivot-posture-rings Task 5; trace 20261120_1300_holster_rings): up to maxOut quads
+// in appSpace at holster.cpp HolsterRingTargets' centres (the grab's own frame), 2 x radius wide, facing the head like the sphere.
+// None while holster_rings is off, the panel is open or a placement sphere shows, or HolsterRingsAllowed() says no. COST with no hand
+// near a holster: a few distance tests in HolsterRingTargets; per visible ring one ImGui frame + one quad (the grapple quad's path).
+int OverlayRenderHolsterRings(XrSpace appSpace, XrCompositionLayerQuad* out, int maxOut)
+{
+    if (!HolsterRings || maxOut <= 0 || !out || appSpace == XR_NULL_HANDLE) { return 0; }
+    if (!g.initialised || g.visible || g_holsterShowZone >= 0) { return 0; }
+    if (!HolsterRingsAllowed()) { return 0; }
+    float centre[3][3], radius[3], alpha[3];
+    const int n = HolsterRingTargets(centre, radius, alpha, maxOut < 3 ? maxOut : 3);
+    if (n <= 0) { return 0; }
+    XrPosef head{};
+    if (!GetHeadPose(head)) { return 0; }
+    static float s_alpha[3];   // the draw callback's user data must outlive the call; render thread only
+    int k = 0;
+    for (int i = 0; i < n; ++i) {
+        XrPosef pose{};
+        pose.position = { centre[i][0], centre[i][1], centre[i][2] };
+        float d[3] = { head.position.x - centre[i][0], head.position.y - centre[i][1], head.position.z - centre[i][2] };
+        const float len = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+        if (!std::isfinite(len)) { continue; }
+        if (len < 1e-3f) {
+            pose.orientation = head.orientation;
+        } else {
+            for (int q = 0; q < 3; ++q) { d[q] /= len; }   // the sphere's billboard: +Z of the quad toward the head, no roll
+            const float dy = d[1] < -1.0f ? -1.0f : (d[1] > 1.0f ? 1.0f : d[1]);
+            const float yaw = atan2f(d[0], d[2]);
+            const float pitch = -asinf(dy);
+            const float sy = sinf(yaw * 0.5f), cy = cosf(yaw * 0.5f), sp = sinf(pitch * 0.5f), cp = cosf(pitch * 0.5f);
+            pose.orientation = { cy * sp, sy * cp, -sy * sp, cy * cp };
+        }
+        s_alpha[i] = alpha[i];
+        if (RenderCalibQuadInto(g.swapchainRing[i], g.imagesRing[i], g.rtvsRing[i], g.ringTried[i], "holster ring", appSpace, pose,
+                                2.0f * radius[i], true, DrawHolsterRing, &s_alpha[i], &out[k], nullptr,
+                                "that holster ring is not shown; the holsters still work")) {
+            ++k;
+        }
+    }
+    static bool s_saidFirst = false;
+    if (k > 0 && !s_saidFirst) {
+        s_saidFirst = true;
+        // [PROBE: HOLSTERRING] gate=holster_rings  site=HEADSET  log-only=no
+        LOG("overlay: [HOLSTERRING] FIRST (logged unconditionally) - %d ring(s) drawn, the nearest at (%.3f, %.3f, %.3f) r %.3f alpha %.2f | "
+            "option B: fill %.0f %%, outline %.0f %%, fade over %.2f m", k, centre[0][0], centre[0][1], centre[0][2], radius[0], alpha[0],
+            holster::ring::kFill * 100.0f, holster::ring::kOutline * 100.0f, holster::ring::kFadeM);
+    }
+    return k;
+}
+
+namespace {
 // title.png at the canvas's top-left, at its own size (clamped to the canvas).
 void DrawMenuTitle(void* drawList, float w, float h, const void* user)
 {
@@ -4985,6 +5059,16 @@ void OverlayShutdown()
     if (g.swapchain8 != XR_NULL_HANDLE && xrDestroySwapchain_) {
         xrDestroySwapchain_(g.swapchain8);
         g.swapchain8 = XR_NULL_HANDLE;
+    }
+    for (int i = 0; i < 3; ++i) {   // the holster rings (plan 2026-11-20 Task 5), same as rtvs8 / swapchain8
+        for (auto* r : g.rtvsRing[i]) {
+            if (r) { r->Release(); }
+        }
+        g.rtvsRing[i].clear();
+        if (g.swapchainRing[i] != XR_NULL_HANDLE && xrDestroySwapchain_) {
+            xrDestroySwapchain_(g.swapchainRing[i]);
+            g.swapchainRing[i] = XR_NULL_HANDLE;
+        }
     }
     for (auto* r : g.rtvs9) {   // the menu title's quad (OverlayRenderTitle), same as rtvs8
         if (r) {

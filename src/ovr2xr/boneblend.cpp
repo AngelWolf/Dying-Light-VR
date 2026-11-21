@@ -2247,6 +2247,7 @@ void ThrowableFingersApply(void* mats); // throwable_hand_enable: the right hand
 void ReloadFingersApply(void* mats);   // manual_reload: the LEFT hand's fingers holding a mag / racking (2026-11-01)
 void BuggyFingersApply(void* mats);    // buggy_hand_steer: the game's own wheel grip / key pinch fingers while pinned (2026-11-10)
 void FingerTrackApply(void* mats);     // finger_track: an EMPTY hand's fingers follow the controller's touches (2026-11-11)
+void LidFingersApply(void* mats);      // lid_by_hand: a hand carrying a lid item holds it in Jay's approved grip (trace 20261120_2057)
 void GunHandJointsPublish(void* mats); // hand_collision: the LEFT hand's joints for the solid hand (gunshape.cpp, 2026-11-02)
 void RightThumbCaptureProbe();
 void SubtreeGripWatch();
@@ -8299,6 +8300,10 @@ void ApplyDrivenBones(void* mats)
     // it holds that hand (two-hand grip, reload, bow draw / nock, buggy pin - they write fingers but not hand1, so a blend under them
     // would have swung hand1 with the grip). Off: one bool test; on, per side: two volatile loads + the owners' state reads.
     FingerTrackApply(mats);
+    // [LOADBEARING: lid_by_hand] VERY LAST (trace 20261120_2057): a hand carrying a lid item with a pose row - its 17 pins (hand1 + 16
+    // fingers) in Jay's approved grip for that mesh, over every writer above on THAT hand (its weapon is hidden while carrying). Not
+    // carrying: one bool test + two volatile loads.
+    LidFingersApply(mats);
 }
 
 void __fastcall HookWriter(__int64 ctx)
@@ -11597,6 +11602,13 @@ bool SolveArmIk(const ArmSide& side)
             const float trk[3] = { headRep.x + o.x, headRep.y + o.y, headRep.z + o.z };
             HolsterPelvisPublish(trk, static_cast<unsigned long long>(model));
         }
+    }
+    // [PROBE: BODYCAP] gate=diag_hip_capture  site=HEADSET  log-only=yes - the holster-bone redesign's recording (holster.h
+    // BodyCapPublish, trace 20261120_1044_bodycap_probe): the drawn torso chain at the pelvis read's point, with its map. Read-only.
+    // COST: off = one bool load; on = 10 accessor reads + one seqlock publish per right-arm solve.
+    if (DiagHipCapture && !side.isLeft && model) {
+        const float bcHead[3] = { headRep.x, headRep.y, headRep.z };
+        BodyCapPublish(static_cast<unsigned long long>(model), anchor, bcHead, cby, sby);
     }
     // [LOADBEARING: manual reload pump] pump plan Task 4 fix round 1 (review C1) + final fix wave (final review I1, ruling R17): EACH
     // controller's grip point in TRACKING space, handed to the pump's rack stroke HERE - before the two-hand pin below moves T onto the gun
@@ -19817,7 +19829,7 @@ bool      g_egWas = false;
 int       g_egPhase = -1;
 ULONGLONG g_egEndMs = 0;
 volatile LONG64 g_hookCalls = 0, g_hookFiltered = 0, g_hookHidden[2] = {}, g_hookByClimb[2] = {}, g_hookByTail[2] = {},
-                g_hookBySwap[2] = {}, g_hookByGrab[2] = {};
+                g_hookBySwap[2] = {}, g_hookByGrab[2] = {}, g_hookByLid[2] = {};
 const char* g_lastWhy[2] = {};       // set by the hook for the last filtered call per hand (nullptr = not forced)
 float     g_lastW[2] = { -1.0f, -1.0f };
 struct Hand {
@@ -19992,6 +20004,10 @@ const char* WantHide(uintptr_t vis, unsigned int hand, ULONGLONG now)
     // body_grab (plan 2026-10-23-body-grab Task 4): this hand holds a body. bodygrab's hand index is 0 = LEFT, here 0 = RIGHT.
     // COST: one volatile load.
     if (BodyGrabHandActive(hand == 0 ? 1 : 0)) { return "body grab"; }
+    // A lid container's item in this hand (trace 20261120_1830, Jay: "If an item has been picked up by a hand with a weapon in it, the
+    // weapon should be hidden"): take -> release (stow / give-back / forget). lidhand's side is 0 = RIGHT too. COST: one bool test +
+    // one volatile load.
+    if (LidHandCarrying(static_cast<int>(hand))) { return "lid item"; }
     if (!it || !wOk) { return nullptr; }
     // (c) HEAL latch: starts when the hand's SELECTED item is a medkit (selected before the weapon is put away), ends once the
     //     weapon is fully back (w at 1 with a non-medkit selected). Ordinary weapon swaps never latch, so are never hidden.
@@ -20053,6 +20069,7 @@ bool __fastcall HookInvVis(void* vis, unsigned int hand)
     if (strcmp(why, "heal swap") == 0)       { InterlockedIncrement64(&g_hookBySwap[hand]); }
     else if (strcmp(why, "climb tail") == 0) { InterlockedIncrement64(&g_hookByTail[hand]); }
     else if (strcmp(why, "body grab") == 0)  { InterlockedIncrement64(&g_hookByGrab[hand]); }
+    else if (strcmp(why, "lid item") == 0)   { InterlockedIncrement64(&g_hookByLid[hand]); }
     else                                     { InterlockedIncrement64(&g_hookByClimb[hand]); }
     return false;
 }
@@ -20193,7 +20210,7 @@ void Tick(void* entV)
         }
     }
     if (now - g_winStart >= 1000) {
-        LONG64 hid[2], byC[2], byT[2], byS[2], byG[2];
+        LONG64 hid[2], byC[2], byT[2], byS[2], byG[2], byL[2];
         for (int h = 0; h < 2; ++h) {
             hid[h] = g_hookHidden[h] - g_wHookHidden0[h];
             g_wHookHidden0[h] = g_hookHidden[h];
@@ -20201,13 +20218,16 @@ void Tick(void* entV)
             byT[h] = g_hookByTail[h];
             byS[h] = g_hookBySwap[h];
             byG[h] = g_hookByGrab[h];
+            byL[h] = g_hookByLid[h];
         }
         if (g_wEg || hid[0] || hid[1] || g_wVisOff[0] || g_wVisOff[1] || g_wFault) {
             // [PROBE: ITEMHIDE] gate=item_hide_by_state  site=HEADSET  log-only=no
             LOG("boneblend: [ITEMHIDE] 1 s | updates %ld | climb active %ld | answered 'hidden' this window R %lld L %lld (run "
-                "totals by key: climb R %lld L %lld, tail R %lld L %lld, swap R %lld L %lld, body grab R %lld L %lld) | predicate "
-                "calls %lld, from UpdateInventoryVis %lld | rendered while off the hand R %ld L %ld%s | faults %ld", g_wUpd, g_wEg,
-                hid[0], hid[1], byC[0], byC[1], byT[0], byT[1], byS[0], byS[1], byG[0], byG[1], g_hookCalls, g_hookFiltered,
+                "totals by key: climb R %lld L %lld, tail R %lld L %lld, swap R %lld L %lld, body grab R %lld L %lld, lid item R "
+                "%lld L %lld) | predicate calls %lld, from UpdateInventoryVis %lld | rendered while off the hand R %ld L %ld%s | "
+                "faults %ld", g_wUpd, g_wEg,
+                hid[0], hid[1], byC[0], byC[1], byT[0], byT[1], byS[0], byS[1], byG[0], byG[1], byL[0], byL[1], g_hookCalls,
+                g_hookFiltered,
                 g_wVisOff[0], g_wVisOff[1], DiagRelDev ? "" : " (NOT MEASURED, diag_rel_dev=0)", g_wFault);
         }
         g_winStart = now;
@@ -22804,6 +22824,93 @@ bool HolsterPelvisTracking(float out[3], unsigned long long* modelOut, unsigned 
         if (modelOut) { *modelOut = m; }
         if (ageMsOut) { *ageMsOut = GetTickCount64() - at; }
         return true;
+    }
+    return false;
+}
+
+// BODYCAP (holster.h, trace 20261120_1044_bodycap_probe). Seqlock: the right-arm solve writes, HolsterHipCapture (LocateViews) reads;
+// a torn read retries. Log-only - nothing here is read by the rig or the game.
+namespace {
+volatile LONG g_bcSeq = 0;
+BodyCapSample g_bc;
+long long     g_bcSolves = 0;
+
+// The local player's look (+4468) / facing (+4588); an object gone since the player update is caught here. No C++ objects in scope.
+bool BodyCapFields(uintptr_t a1, float* look, float* facing)
+{
+    if (!a1) { return false; }
+    __try {
+        *look = *reinterpret_cast<const float*>(a1 + 4468);
+        *facing = *reinterpret_cast<const float*>(a1 + 4588);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+}  // namespace
+
+void BodyCapPublish(unsigned long long modelU, const float anchor[3], const float headRep[3], float cby, float sby)
+{
+    const uintptr_t model = static_cast<uintptr_t>(modelU);
+    static const char* const kWName[kBodyCapW] = { "bip01", "pelvis", "hspine", "spine1", "spine3", "hspine1" };
+    static const char* const kLName[kBodyCapL] = { "pelvis", "hspine", "spine", "spine1" };
+    static uintptr_t s_model = 0;
+    static int       s_w[kBodyCapW] = { -1, -1, -1, -1, -1, -1 };
+    static int       s_l[kBodyCapL] = { -1, -1, -1, -1 };
+    static long      s_modelLines = 0;
+    if (model != s_model) {
+        s_model = model;
+        for (int i = 0; i < kBodyCapW; ++i) {
+            bool ok = false;
+            const int id = g_elemId ? SafeElemId(reinterpret_cast<void*>(model), kWName[i], &ok) : -1;
+            s_w[i] = (ok && id >= 0) ? id : -1;
+        }
+        for (int i = 0; i < kBodyCapL; ++i) {
+            bool ok = false;
+            const int id = g_elemId ? SafeElemId(reinterpret_cast<void*>(model), kLName[i], &ok) : -1;
+            s_l[i] = (ok && id >= 0) ? id : -1;
+        }
+        if (s_modelLines < 20) {
+            ++s_modelLines;
+            // [PROBE: BODYCAP] gate=diag_hip_capture  site=HEADSET  log-only=yes
+            LOG("boneblend: [BODYCAP] MODEL %p - element ids by name (-1 = NOT FOUND: that bone's have flag stays 0 on every line): world bip01 %d "
+                "pelvis %d hspine %d spine1 %d spine3 %d hspine1 %d | local pelvis %d hspine %d spine %d spine1 %d%s",
+                reinterpret_cast<void*>(model), s_w[0], s_w[1], s_w[2], s_w[3], s_w[4], s_w[5], s_l[0], s_l[1], s_l[2], s_l[3],
+                s_modelLines == 1 ? " | first line, logged unconditionally" : "");
+        }
+    }
+    static LARGE_INTEGER s_f = {};
+    if (s_f.QuadPart == 0) { QueryPerformanceFrequency(&s_f); }
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    BodyCapSample s;
+    s.atS = static_cast<double>(c.QuadPart) / static_cast<double>(s_f.QuadPart);
+    s.model = modelU;
+    for (int k = 0; k < 3; ++k) { s.anchor[k] = anchor[k]; s.headRep[k] = headRep[k]; }
+    s.cby = cby;
+    s.sby = sby;
+    s.folded = HeadFollowFoldedDeg();
+    for (int i = 0; i < kBodyCapW; ++i) { s.haveW[i] = (s_w[i] >= 0 && ReadAccessorMtx(g_getWorld, model, s_w[i], s.w[i])) ? 1 : 0; }
+    for (int i = 0; i < kBodyCapL; ++i) { s.haveL[i] = (s_l[i] >= 0 && ReadAccessorMtx(g_getLocal, model, s_l[i], s.l[i])) ? 1 : 0; }
+    s.neckYaw = camyaw::follow::g_neck.yaw;
+    s.neckLastH = camyaw::follow::g_neck.lastH;
+    s.neckHave = camyaw::follow::g_neck.have ? 1 : 0;
+    s.fieldsOk = BodyCapFields(camyaw::g_addedObj, &s.look, &s.facing) ? 1 : 0;
+    InterlockedIncrement(&g_bcSeq);   // odd = writing
+    s.solves = ++g_bcSolves;
+    g_bc = s;
+    InterlockedIncrement(&g_bcSeq);
+}
+
+bool BodyCapRead(BodyCapSample* out)
+{
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        const LONG s0 = g_bcSeq;
+        if (s0 & 1) { continue; }
+        MemoryBarrier();
+        *out = g_bc;
+        MemoryBarrier();
+        if (g_bcSeq == s0) { return out->atS >= 0.0; }
     }
     return false;
 }
@@ -37211,6 +37318,103 @@ void FingerTrackApply(void* mats)
     }
 }
 
+// [LOADBEARING: lid_by_hand] A CARRIED LID ITEM IN JAY's APPROVED GRIP (trace 20261120_2057; plan 2026-11-20-lid-item-hand-poses; grips
+// approved 2026-11-20: right posed in Blender, left mirrored). Per side whose LidHandPoseRow >= 0 (from lidhand's take to its release),
+// its 17 pins (hand1 + 16 finger joints) = authored x (rest^T x pin), translation pinT (ThrowableFingersApply's rule). Runs LAST in the
+// finger pass, so it owns the carrying hand's fingers over every writer above (the hand's weapon is hidden while carrying - ITEMHIDE
+// "lid item"); the other hand is untouched. Keyed on lidhand's own published row, never a mats compare (memory gate-finger-writers-on-
+// owner-state). Refuses a SIDE by name once if a table rest is not the authored latch (> 0.02); nothing before every pin's authored latch
+// exists (INV-646). The first carried pass per side is logged unconditionally.
+// COST: not carrying = one bool test + two volatile loads; carrying = 17 x (two 3x3 multiplies + a 12-float copy) per carrying side.
+volatile LONG64 g_lidFingerPasses[2] = { 0, 0 };   // passes that WROTE that side (INV-10)
+void LidFingersApply(void* mats)
+{
+    if (!mats || !RigSubtreeRest || !RigSubtreeFingers) { return; }
+    static int s_pin[2][17];
+    static volatile LONG s_init = 0, s_claim = 0, s_checked[2] = { 0, 0 }, s_refused[2] = { 0, 0 }, s_said[2] = { 0, 0 };
+    for (int s = 0; s < 2; ++s) {
+        const int row = LidHandPoseRow(s);
+        if (row < 0) { continue; }
+        const float (*pin)[9] = nullptr;
+        const float (*pinT)[3] = nullptr;
+        const float (*rest)[9] = nullptr;
+        const char* const* names = nullptr;
+        const char* mesh = nullptr;
+        if (LidHandPinCount() != 17 || !LidHandPoseData(row, s, &pin, &pinT, &rest, &names, &mesh)) { continue; }
+        if (!s_init) {
+            if (InterlockedCompareExchange(&s_claim, 1, 0) != 0) { return; }   // another pass thread is resolving the pins
+            for (int ss = 0; ss < 2; ++ss) {
+                const float (*p2)[9]; const float (*t2)[3]; const float (*r2)[9]; const char* const* n2; const char* m2;
+                if (!LidHandPoseData(0, ss, &p2, &t2, &r2, &n2, &m2)) { continue; }
+                for (int j = 0; j < 17; ++j) {
+                    s_pin[ss][j] = -1;
+                    for (int i = 0; i < kSubtreePinCount; ++i) {
+                        if (kSubtreePins[i].side == ss && std::strcmp(kSubtreePins[i].name, n2[j]) == 0) { s_pin[ss][j] = i; break; }
+                    }
+                }
+            }
+            MemoryBarrier();
+            InterlockedExchange(&s_init, 1);
+        }
+        if (!s_checked[s]) {
+            // once per side, when every pin's authored latch exists: is the table's rest the pin's?
+            int missing = 0, worstPin = -1;
+            float worst = 0.0f;
+            for (int j = 0; j < 17; ++j) {
+                const int i = s_pin[s][j];
+                if (i < 0) { ++missing; continue; }
+                bool latched = false;
+                for (int k = 0; k < 12; ++k) { if (g_pinAuthored[i][k] != 0.0f) { latched = true; break; } }
+                if (!latched) { goto next_side; }   // not latched yet - nothing written, nothing claimed
+                for (int k = 0; k < 9; ++k) {
+                    const float dd = std::fabs(g_pinAuthored[i][(k / 3) * 4 + (k % 3)] - rest[j][k]);
+                    if (dd > worst) { worst = dd; worstPin = j; }
+                }
+            }
+            InterlockedExchange(&s_refused[s], (missing || worst > 0.02f) ? 1 : 0);
+            InterlockedExchange(&s_checked[s], 1);
+            // [PROBE: LIDPOSE] gate=lid_by_hand,rig_subtree_fingers  site=HEADSET  log-only=no
+            LOG("boneblend: [LIDPOSE] %s hand FINGERS %s - %d of 17 pins matched by name (%d missing); largest difference between the "
+                "table's rest and the authored pin %.5f (%s) [refused above 0.02].", s == 0 ? "RIGHT" : "LEFT",
+                s_refused[s] ? "*** REFUSED: Jay's lid-item grips are NOT applied on this hand, the fingers stay with the other writers ***"
+                             : "CHECKED: Jay's lid-item grips apply", 17 - missing, missing, worst, worstPin >= 0 ? names[worstPin] : "none");
+        }
+        if (s_refused[s]) { continue; }
+        if (InterlockedCompareExchange(&s_said[s], 1, 0) == 0) {
+            // [PROBE: LIDPOSE] gate=lid_by_hand,rig_subtree_fingers  site=HEADSET  log-only=no
+            LOG("boneblend: [LIDPOSE] FIRST carried pass on the %s hand: row %d '%s' - its 17 pins written in Jay's grip (every later "
+                "pass counted in g_lidFingerPasses).", s == 0 ? "RIGHT" : "LEFT", row, mesh);
+        }
+        for (int j = 0; j < 17; ++j) {
+            const int i = s_pin[s][j];
+            if (i < 0) { continue; }
+            const int pe = g_pinElem[i];
+            if (pe < 0) { continue; }
+            const float* A = g_pinAuthored[i];
+            if (A[0] == 0.0f && A[1] == 0.0f && A[2] == 0.0f) { continue; }   // a dropped authored pose is never written
+            float q[9];   // rest^T x pin
+            for (int y = 0; y < 3; ++y) {
+                for (int x = 0; x < 3; ++x) { q[3 * y + x] = rest[j][y] * pin[j][x] + rest[j][3 + y] * pin[j][3 + x] + rest[j][6 + y] * pin[j][6 + x]; }
+            }
+            float out[12];
+            for (int r = 0; r < 3; ++r) {
+                for (int cc = 0; cc < 3; ++cc) {
+                    out[r * 4 + cc] = A[r * 4 + 0] * q[cc] + A[r * 4 + 1] * q[3 + cc] + A[r * 4 + 2] * q[6 + cc];
+                }
+                out[r * 4 + 3] = pinT[j][r];
+            }
+            __try {
+                float* m = reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(mats) + static_cast<uintptr_t>(pe) * kBoneStride);
+                for (int k = 0; k < 12; ++k) { m[k] = out[k]; }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                InterlockedIncrement64(&g_pinRefused);
+            }
+        }
+        InterlockedIncrement64(&g_lidFingerPasses[s]);
+    next_side:;
+    }
+}
+
 // The 1 Hz [FINGERTRACK] summary's view of the writer (controllers.cpp logs it - it owns the inputs). side 0 right, 1 left.
 void FingerTrackWriteStats(int side, long long* passes, long* reason)
 {
@@ -40551,6 +40755,26 @@ bool RigArmAnchorRead(int side, float elbow[3], float fore[9], float wrist[3], f
         return true;
     }
     return false;
+}
+
+// The DRAWN hand's grip socket in game world (trace 20261120_2000): basis = the solve's drawn hand basis, position = the achieved wrist
+// + drawn x the handholder's AUTHORED local translation (INV-161; latched from the mesh asset) - the same point SolveArmIk composes as
+// achievedGrip (:15654-15662) and ItemCtlPlace places weapons from. out12 = mtx34 rows (basis in the COLUMNS, translation [3] [7] [11]).
+// False = no anchor published or the holder local not latched (no pose - INV-6). Read-only. COST: one seqlock read.
+bool RigDrawnHolderRead(int side, float out12[12])
+{
+    if ((side != 0 && side != 1) || !g_haveHandHolder[side]) { return false; }
+    float elbow[3], fore[9], wrist[3], hand[9];
+    if (!RigArmAnchorRead(side, elbow, fore, wrist, hand, nullptr)) { return false; }
+    const float* const ht = g_handHolderLocal[side];
+    const float t[3] = { ht[3], ht[7], ht[11] };
+    for (int r = 0; r < 3; ++r) {
+        out12[4 * r + 0] = hand[3 * r + 0];
+        out12[4 * r + 1] = hand[3 * r + 1];
+        out12[4 * r + 2] = hand[3 * r + 2];
+        out12[4 * r + 3] = wrist[r] + hand[3 * r] * t[0] + hand[3 * r + 1] * t[1] + hand[3 * r + 2] * t[2];
+    }
+    return true;
 }
 
 // [LOADBEARING: buggy hand poses] (buggy_hand_steer) RUN BK3: the key is grabbed by the fingertips. The same offset and basis the arm

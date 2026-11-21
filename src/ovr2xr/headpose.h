@@ -22,6 +22,9 @@ bool GetAppBase(float pos[3], float* yawDeg);
 // The head's height above the runtime's floor (STAGE), metres (2026-11-16, trace 20261116_1545_standing_posture). False = no floor
 // (no STAGE space, or it has not located yet). Any thread; the frame Guard.
 bool GetEyeAboveFloor(float* metres);
+// The runtime's system name (xrGetSystemProperties, e.g. "Meta Quest 3"); "" until the session has read it. Written once. Any thread.
+// Plan 2026-11-20-holster-pivot-posture-rings Task 4: keys the learned holster pivot per headset (dlvr\holster_pivot.txt).
+const char* XrSystemNameNow();
 
 // ===== HEAD-YAW DECOUPLE (docs/SPEC-HEAD-YAW-DECOUPLE-2026-09-26.md, R10) =====
 // When active, ovr_GetTrackingState reports the head to the ENGINE with its yaw
