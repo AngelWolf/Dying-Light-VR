@@ -18,6 +18,7 @@
 #include "bladeline_logic.h"     // the blade-length hit line - the drawn weapon's segment (spec 2026-10-26-blade-length-hit-line)
 #include "twohand_logic.h"       // twohand::NormMesh - the mesh-name normalisation the blade table is keyed by
 #include "throwable.h"      // ThrowableBusy - ruling R24
+#include "lidhand.h"        // LidHandCarrying - no hit while the right hand carries a lid item (trace 20261120_1815)
 
 #include <windows.h>
 
@@ -2697,7 +2698,25 @@ void DriverFrame(void* self)
     // two-handed shove reads as a swing - but only from 500 ms into the grab (breakout_logic.h MeleeGateClosed; Jay 2026-10-27 / 11-16:
     // an attack as the zombie grabs should count, "change the timing on the gate"). breakout_physical=0 -> always false.
     // COST: one volatile load + GetTickCount64.
-    const bool grabbing = BodyGrabHandActive(1) || BreakoutMeleeGateClosed();
+    // A lid item in the RIGHT hand (the swing's hand) - Jay 2026-11-20: "a swing can't fire in the hand it's being held till it's
+    // either dropped or put away" (HP1: two swings fired carrying an item to the shoulder). Same latch as the grabs: a swing that
+    // overlapped the carry stays off to its END, after the stow too (trace 20261120_1815). COST: one bool test + one volatile load.
+    const bool carrying = LidHandCarrying(0);
+    {
+        static bool s_carrySaid = false;   // one line per swing refused while the item is in the hand
+        static long s_nCarry = 0;
+        if (carrying && !s_carrySaid && (st.fired || st.state == swing::State::Active)) {
+            s_carrySaid = true;
+            ++s_nCarry;
+            // [PROBE: SWING] gate=melee_swing_mode  site=HEADSET  log-only=no
+            LOG("swing: [SWING] SUPPRESSED #%ld - the right hand carries a lid item (LidHandCarrying): %s - the hit (B1) is not "
+                "called until it is stowed or put back", s_nCarry, st.fired ? "this FIRE" : "the swing already in progress");
+        }
+        if (st.ended || st.fired) {
+            if (!(carrying && st.fired)) { s_carrySaid = false; }   // re-arm per swing
+        }
+    }
+    const bool grabbing = BodyGrabHandActive(1) || BreakoutMeleeGateClosed() || carrying;
     // A swing under way while either grab was on keeps its hit off to its END (swing_logic.h HoldLatch; Jay 2026-10-27: a thrown
     // body dismembered on release, "gate the grab too") - the throw / shove still moving after the release is not a new swing.
     // COST: a few compares.
@@ -2709,8 +2728,9 @@ void DriverFrame(void* self)
         s_holdSaid = true;
         ++s_nHoldOff;
         // [PROBE: SWING] gate=melee_swing_mode  site=HEADSET  log-only=no
-        LOG("swing: [SWING] HELD-SWING OFF #%ld - swing #%ld was under way while a body grab (right hand) or a zombie grab past "
-            "its first 500 ms was on, and is still running after it: no hit (B1) until its END", s_nHoldOff, g_totFires);
+        LOG("swing: [SWING] HELD-SWING OFF #%ld - swing #%ld was under way while a body grab (right hand), a zombie grab past "
+            "its first 500 ms or a lid item in the right hand was on, and is still running after it: no hit (B1) until its END",
+            s_nHoldOff, g_totFires);
     }
     if (st.ended || holdAllows) { s_holdSaid = false; }
     if (MeleeSwingMode == 2 && !throwMute && !throwableBusy && holdAllows) {   // g_disabled is already refused by SwingUpdateThunk

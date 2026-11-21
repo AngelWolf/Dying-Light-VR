@@ -89,6 +89,11 @@ extern int g_holsterShowZone;
 // (ruling R11: the panel draws on top); it starts no ImGui frame, so its order against OverlayRender / OverlayRenderToMirror
 // does not matter to them. Same frame. False = nothing to submit. COST when no zone is selected: one int test.
 bool OverlayRenderHolsterSphere(XrSpace appSpace, XrCompositionLayerQuad* out);
+// The visible holster rings (plan 2026-11-20-holster-pivot-posture-rings Task 5): up to maxOut (<= 3) quads in `appSpace` - each
+// holster its hand comes near, option B, fading in over 0.30 m (holster.cpp HolsterRingTargets). None while holster_rings is off,
+// the panel is open / a placement sphere shows, or in a menu / pause / calibration / vehicle / cutscene. STARTS AN IMGUI FRAME per
+// ring (never with the panel open). Returns the quads written. Render / submit thread.
+int OverlayRenderHolsterRings(XrSpace appSpace, XrCompositionLayerQuad* out, int maxOut);
 
 // The mod menu's title (dlvr\menu\title.png) on its own head-locked quad ABOVE the panel's top-left corner, at the panel's pixel
 // scale (Jay 2026-11-11). Only while the panel is drawn and title.png loaded. No ImGui frame (own ImDrawList, as the sphere), so

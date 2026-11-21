@@ -381,6 +381,9 @@ extern bool AfwEnable;
 // Data3 check: false while the bootstrap does NOT report this build's Data3.pak (DlvrData3State != 1) - SyncFollowers then holds
 // afw_alt_eye and afw_rebuild off whatever afw_enable says. Logs once per verdict change. Cheap after the first final verdict.
 bool AfwData3Allowed();
+// [AFWNET] (trace docs/traces/20261121_1057_afw_tonemap_net.md): true while the safety net holds the AFW followers off - the bootstrap
+// had not seen the tonemap draw 5 s after the eye alternation started, so no rebuild is possible. SyncFollowers keeps them off then.
+bool AfwNetHeld();
 // The AFW rebuild gate's eye-position check needs this submit's eye separation (metres), handed in before the pairing.
 void CamHookAfwNoteEyeSep(float sepM);
 void StartAfwAltEyeOnce();
@@ -579,6 +582,9 @@ void CamHookMainMenuViewSwitchStats(long* caught, long* refused, uintptr_t* cull
 // INV-620 (c): boneblend's camyaw::Hook (game thread) says a cutscene owns the look and the raw OpenXR yaw (radians) of the stripped
 // head at its start; CamHookCutsceneTick (submit thread, once per submit, beside uipin::Tick) names the root and logs [CINYAW].
 void CamHookSetCutsceneTurn(bool active, float y0RawRad);
+// True while a cutscene owns the look (the flag CamHookSetCutsceneTurn sets). Any thread: one volatile load. Plan 2026-11-20-holster-
+// pivot-posture-rings Task 5 - no holster ring is drawn in a cutscene.
+bool CamHookCutsceneActive();
 void CamHookCutsceneTick();
 void CamHookMainMenuTurnStats(long* hits, float* addedDeg, float* engineYawDeg);
 long CamHookMainMenuTurnForced();   // root copies levelled only because it is the root (a still page), since the last call

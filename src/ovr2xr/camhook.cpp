@@ -3830,6 +3830,73 @@ double g_wSumMs = 0.0, g_wMaxMs = 0.0;
 bool g_wOn = false, g_lastOn = false, g_firstLogged = false;
 ULONGLONG g_wStart = 0;
 
+// ===== [AFWNET] THE SAFETY NET (trace docs/traces/20261121_1057_afw_tonemap_net.md; STATE 2026-11-21 (60)) =====
+// A held eye is only right if the bootstrap REBUILDS it, and it cannot rebuild without the tonemap draw (the depth copies and the
+// DLSS colour latch hang off it). On a tester's PC the bootstrap never saw that draw while this hook skipped every other eye render
+// for the whole session (no rebuild, the image wobbling on head turns). Archive: 337 sessions that alternated all saw it no later
+// than the alternation's start; the tester's never did. So: two eyes rendered + afw_enable + Data3 ours, and the bootstrap reports
+// "not seen" for kNetMs continuously -> the AFW followers are held OFF (AfwAltEye / AfwRebuild = false: the AFW-off path every
+// reader has; SyncFollowers keeps them off via AfwNetHeld) until the bootstrap first reports "seen", then restored. afw_enable and
+// the settings file are never touched. COST: one export call per frame (two loads in the bootstrap).
+constexpr ULONGLONG kNetMs = 5000;
+typedef int (*PFN_TonemapSeen)();
+PFN_TonemapSeen g_tsFn = nullptr;
+bool      g_tsLooked = false;
+ULONGLONG g_netSinceMs = 0;         // the alternation wanted with the tonemap draw not seen, since (0 = not now)
+volatile LONG g_netHeld = 0;        // 1 = the followers are held off by the net
+LONG64    g_netHeldAt = 0;          // g_frame at the hold, for the resume line
+int       g_netHolds = 0;
+
+void NetTick(ULONGLONG now, bool two)
+{
+    if (!g_tsLooked) {
+        g_tsLooked = true;
+        HMODULE b = GetModuleHandleA("xinput1_3.dll");
+        g_tsFn = b ? reinterpret_cast<PFN_TonemapSeen>(reinterpret_cast<void*>(GetProcAddress(b, "DlvrTonemapSeen"))) : nullptr;
+        // [PROBE: AFWNET] gate=none (once per session, logged unconditionally, at the first eye-0 Scene replay)  site=HEADSET  log-only=no
+        LOG("[AFWNET] ARMED (logged unconditionally): %s | tonemap draw seen now %d (1 yes, 0 not yet, 2 the bootstrap's AFW capture is "
+            "off on this AA path - NO AA / aa_native / a missing marker, -1 the bootstrap's colour hook is not installed: no verdict, "
+            "the net does nothing) | the eye alternation is held off if the answer is still 0 or 2 %.1f s after it starts, and "
+            "resumes the moment it is 1",
+            g_tsFn ? "DlvrTonemapSeen resolved" : "DlvrTonemapSeen NOT resolved (an older bootstrap) - the net does nothing",
+            g_tsFn ? g_tsFn() : -2, static_cast<double>(kNetMs) / 1000.0);
+    }
+    if (!g_tsFn) { return; }
+    const int seen = g_tsFn();
+    if (g_netHeld) {
+        if (seen == 1 || !AfwEnable) {
+            InterlockedExchange(&g_netHeld, 0);
+            const bool back = AfwEnable && AfwData3Allowed();
+            AfwAltEye = back;
+            AfwRebuild = back;
+            g_netSinceMs = 0;
+            // [PROBE: AFWNET] gate=afw_enable (a resume after a hold; event)  site=HEADSET  log-only=no
+            LOG("[AFWNET] RESUMED at frame %lld (held %lld frames): %s - afw_alt_eye / afw_rebuild back to %d", g_frame,
+                g_frame - g_netHeldAt, seen == 1 ? "the bootstrap has now seen the tonemap draw" : "afw_enable was unticked",
+                back ? 1 : 0);
+        }
+        return;
+    }
+    const bool intent = AfwEnable && two && AfwData3Allowed();
+    // 0 = the tonemap draw not seen yet; 2 = the bootstrap's AFW capture cannot run on this AA path. Either way no rebuild.
+    if (!intent || (seen != 0 && seen != 2)) { g_netSinceMs = 0; return; }
+    if (g_netSinceMs == 0) { g_netSinceMs = now; return; }
+    if (now - g_netSinceMs < kNetMs) { return; }
+    InterlockedExchange(&g_netHeld, 1);
+    g_netHeldAt = g_frame;
+    ++g_netHolds;
+    AfwAltEye = false;
+    AfwRebuild = false;
+    // [PROBE: AFWNET] gate=afw_enable + two eyes rendered (a hold; event, at most once per tonemap verdict)  site=HEADSET  log-only=no
+    LOG("[AFWNET] *** HELD OFF *** at frame %lld (hold #%d): the eye alternation ran %.1f s and %s, so no AFW rebuild is possible - "
+        "both eyes are rendered every frame from now (AFW's frame-rate gain is lost, the image stays right). afw_enable stays as set "
+        "(%d); resumes when the bootstrap reports the tonemap draw seen with its AFW capture on.", g_frame, g_netHolds,
+        static_cast<double>(now - g_netSinceMs) / 1000.0,
+        seen == 2 ? "the bootstrap's AFW capture is OFF on this AA path (NO AA, aa_native.txt or a missing marker)"
+                  : "the bootstrap has NOT seen the tonemap draw",
+        AfwEnable ? 1 : 0);
+}
+
 // [PROBE: AFWALT] gate=afw_alt_eye (the patch installs the first time the box is ticked; the window line then runs on or off)  site=HEADSET (the per-eye Scene replays exist only in sub_1802B9680's VR branch)  log-only=no
 void Report(ULONGLONG now)
 {
@@ -3884,6 +3951,7 @@ void* __fastcall Detour(void* ctx, int layerId, void* queue, void* params, char 
                 g_lastEye1Frame < 0 ? -1LL : g_lastEye1Frame);
         }
         g_twoEyes = two;
+        NetTick(now, two);   // [AFWNET]: may hold AfwAltEye off (or give it back) for THIS frame's decision below
     }
     if (eye == 1) { g_lastEye1Frame = g_frame; }
     const bool on = AfwAltEye && g_twoEyes;
@@ -3952,6 +4020,11 @@ void Install()
 // For the bootstrap's DLSS upscale path (exported as dlvr_AfwRenderedEye): the eye the CURRENT frame renders while
 // afw_alt_eye is active, else -1 (both eyes rendered). Read at the upscale draw, i.e. during the frame's D3D work, which
 // INV-369 measured runs after that frame's layers are recorded, on the same thread - so this is that frame's stamp.
+bool AfwNetHeld()
+{
+    return afwalt::g_netHeld != 0;
+}
+
 int CamHookAfwRenderedEye()
 {
     if (!AfwAltEye || afwalt::g_state != 1) { return -1; }
@@ -11543,6 +11616,8 @@ void CamHookMainMenuViewSwitchStats(long* caught, long* refused, uintptr_t* cull
 }
 
 // ---- INV-620 (c): cutscene head turn ----
+bool CamHookCutsceneActive() { return g_cinActive != 0; }   // camhook.h (plan 2026-11-20 Task 5)
+
 void CamHookSetCutsceneTurn(bool active, float y0RawRad)
 {
     LONG bits = 0;

@@ -72,7 +72,10 @@ typedef char (__fastcall* SortFn)(void*, void*);
 typedef void (__fastcall* HideFn)(void*, unsigned char, void*);
 typedef void (__fastcall* ClearFn)(void*);
 
-struct GameVec { void** d; uint32_t n; uint32_t cap; };   // the enumeration's out vector (data, count, capacity), freed with free
+// the enumeration's out vector (data, count, capacity), freed with free - 24 bytes, as the game's (INV-760, trace 20261121_1614): every
+// enumeration target writes a DWORD at +16; with 16 bytes those 4 landed past v (an unreferenced slot in BETA 7a9c7850 - luck of layout)
+struct GameVec { void** d; uint32_t n; uint32_t cap; uint32_t grow; uint32_t pad; };
+static_assert(sizeof(GameVec) == 24, "the game's inventory out vector is 24 bytes (INV-760)");
 
 uintptr_t     g_gd = 0;
 int           g_state = 0;            // 0 not tried / waiting, 1 live, -1 refused (final)
@@ -139,6 +142,10 @@ bool MixItem(uint64_t& h, uintptr_t p, void* owner)
 {
     __try {
         h = Mix(h, p);
+        // +64 = the item's description-with-context; its first dword is the STACK COUNT (InventoryMain's add +CD4D60 raises it in place
+        // for an item already owned). Without it a pick-up onto an existing stack read "nothing changed" and the screen kept the old
+        // count (trace 20261120_1745: Jay's pouch stow, RUN CS1 17:03:35 -> 17:03:37 KEPT).
+        h = Mix(h, *reinterpret_cast<const uint32_t*>(p + 64));
         // bit 0x08 of +264 = the "seen" mark the list focus handler sets (+8D3FE0); the built button never shows it (round 2)
         h = Mix(h, *reinterpret_cast<const uint32_t*>(p + 264) & ~0x08u);
         h = Mix(h, *reinterpret_cast<const uint32_t*>(p + 272));

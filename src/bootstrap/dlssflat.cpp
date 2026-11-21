@@ -94,6 +94,18 @@ typedef void(STDMETHODCALLTYPE* OMSetRenderTargetsFn)(
 OMSetRenderTargetsFn g_origOMSetRenderTargets = nullptr;
 volatile LONG        g_gbufferReported = 0;
 
+// [CTXSITE] (trace docs/traces/20261121_1036_ctxsite_detours.md): rd3d11's own setter call sites call ctxsite's detours. When the
+// context's vtable entry no longer holds our hook (a tester's PC, STATE 2026-11-21 (60)), the detour puts that entry here for ONE
+// call and runs our hook body, which forwards the game's call to it (consumed once) instead of the saved original. t_ctxInFwd is
+// true only while that forward runs: a hook entered then (the foreign function calling ours back) forwards straight to the saved
+// original. Index [0] OMSetRenderTargets, [1] PSSetShaderResources, [2] RSSetViewports. Outside a detour both stay null / false.
+thread_local void* t_ctxFwd[3] = {};
+thread_local bool  t_ctxInFwd[3] = {};
+namespace ctxsite {
+extern bool g_wantFromBind;            // the eye-texture route: install from the first render-target bind (render thread)
+void Install(const char* who);
+}
+
 // ---------------------------------------------------------------------------
 // MILESTONE C STATE - the four DLSS inputs, kept alive.
 //
@@ -1272,12 +1284,25 @@ void STDMETHODCALLTYPE HookedOMSetRenderTargets(
     ID3D11DeviceContext* self, UINT NumViews,
     ID3D11RenderTargetView* const* ppRTVs, ID3D11DepthStencilView* pDSV)
 {
+    // [CTXSITE] re-entry while a site detour forwards the game's call to a FOREIGN entry (that function calling ours back):
+    // the saved original only - no second observation, no loop. False everywhere else (one TLS bool read).
+    if (t_ctxInFwd[0]) { g_origOMSetRenderTargets(self, NumViews, ppRTVs, pDSV); return; }
+    // [CTXSITE] the eye-texture route asks for the site install from here: the render thread, the one D3D thread (INV-152).
+    if (ctxsite::g_wantFromBind) { ctxsite::g_wantFromBind = false; ctxsite::Install("the first render-target bind (eye-texture route)"); }
     // ALWAYS call through first. This must never change what the game renders,
     // and an early-out on our side must not be able to drop a bind.
     // ONE EXCEPTION, opt-in (dlvr\hud_layer.txt AND the pak's bracket binds): hudlayer may issue THIS bind itself with its
     // own per-eye HUD layer in place of the eye's RIFT target (true = issued; it never drops a bind). Off = one int test.
     if (!(hudlayer::g_mode && hudlayer::OnBind(self, NumViews, ppRTVs, pDSV))) {
-        g_origOMSetRenderTargets(self, NumViews, ppRTVs, pDSV);
+        // [CTXSITE] a site detour handed us the context's CURRENT entry (not our hook): forward the game's call to it.
+        if (void* f = t_ctxFwd[0]) {
+            t_ctxFwd[0] = nullptr;
+            t_ctxInFwd[0] = true;
+            reinterpret_cast<OMSetRenderTargetsFn>(f)(self, NumViews, ppRTVs, pDSV);
+            t_ctxInFwd[0] = false;
+        } else {
+            g_origOMSetRenderTargets(self, NumViews, ppRTVs, pDSV);
+        }
     }
 
     // GPU FRAME BREAKDOWN v2 ([GPUFRAME], INV-583): a mark when the (RTV0, DSV) pair changes. Inert unless dlvr\gpu_frame.txt.
@@ -3535,8 +3560,17 @@ void STDMETHODCALLTYPE HookedPSSetShaderResources(
     ID3D11DeviceContext* self, UINT StartSlot, UINT NumViews,
     ID3D11ShaderResourceView* const* ppSRVs)
 {
-    // ALWAYS call through first, as with the render-target hook.
-    g_origPSSetShaderResources(self, StartSlot, NumViews, ppSRVs);
+    // [CTXSITE] re-entry during a site detour's foreign forward: the saved original only (see t_ctxInFwd).
+    if (t_ctxInFwd[1]) { g_origPSSetShaderResources(self, StartSlot, NumViews, ppSRVs); return; }
+    // ALWAYS call through first, as with the render-target hook. [CTXSITE]: to the entry a site detour handed us, if any.
+    if (void* f = t_ctxFwd[1]) {
+        t_ctxFwd[1] = nullptr;
+        t_ctxInFwd[1] = true;
+        reinterpret_cast<PSSetShaderResourcesFn>(f)(self, StartSlot, NumViews, ppSRVs);
+        t_ctxInFwd[1] = false;
+    } else {
+        g_origPSSetShaderResources(self, StartSlot, NumViews, ppSRVs);
+    }
     lensmask::Rearm();   // F2: the runtime rewrites slot 53 ~4-5x per frame (lensmask_run1) - re-arm here too; one compare
 
     // [AFWFG]: the draw slots are overwritten by the runtime (INV-15) and a render-target bind is too rare to re-arm
@@ -4099,7 +4133,17 @@ RSSetViewportsFn g_origRSSetViewports = nullptr;
 void STDMETHODCALLTYPE HookedRSSetViewports(
     ID3D11DeviceContext* self, UINT NumViewports, const D3D11_VIEWPORT* pViewports)
 {
-    g_origRSSetViewports(self, NumViewports, pViewports);
+    // [CTXSITE] re-entry during a site detour's foreign forward: the saved original only (see t_ctxInFwd).
+    if (t_ctxInFwd[2]) { g_origRSSetViewports(self, NumViewports, pViewports); return; }
+    // [CTXSITE]: to the entry a site detour handed us, if any; else the saved original, as before.
+    if (void* f = t_ctxFwd[2]) {
+        t_ctxFwd[2] = nullptr;
+        t_ctxInFwd[2] = true;
+        reinterpret_cast<RSSetViewportsFn>(f)(self, NumViewports, pViewports);
+        t_ctxInFwd[2] = false;
+    } else {
+        g_origRSSetViewports(self, NumViewports, pViewports);
+    }
 
     // MILESTONE E UI PROBE - completes a pending swapchain bind with the
     // viewport it will actually be drawn with. This is the ONLY correct moment
@@ -4142,7 +4186,11 @@ void STDMETHODCALLTYPE HookedRSSetViewports(
     // [GBVP] (the per-GBuffer-viewport check above, its question answered 2026-09-13: "the viewport hypothesis is DEAD")
     // REMOVED 2026-11-08 (Jay: "Yes" to stripping it). It read nothing anything else used.
 
-    if ((!g_vrRecon && !g_vrMode) || g_eyeSwapCount <= 0 || !pViewports || NumViewports == 0) { return; }
+    // EVERY AA PATH (trace docs/traces/20261121_1216_composite_event_every_aa.md): the composite 'D' event below is what tells the
+    // layer's submit_drawn_image which image this frame drew (INV-429). It used to need g_vrMode (DLSS VR), so on NO AA (g_vrMode forced
+    // off) the layer never heard of a composite and every submit released the wrong image - world doubling on head turns (RUNS NA1-NA3).
+    // g_eyeSwapCount > 0 = the layer registered its VR eye swapchain (flat never does). The DLSS-only rails below keep `if (g_vrMode)`.
+    if (g_eyeSwapCount <= 0 || !pViewports || NumViewports == 0) { return; }
     // Cheap rejects first: this is a hot call and most viewports are not the
     // composite. A double-wide eye target is at least two per-eye renders
     // across, and g_renderW is MEASURED from the GBuffer rather than assumed.
@@ -11513,6 +11561,8 @@ void* NearStub(const unsigned char* nearAddr, void* target)
 
 bool PatchCall(unsigned char* site, const unsigned char* expect, int len, void* target)
 {
+    // 6 / 7 (the draw sites) or 9 (ctxsite's mov rax,[rcx]; call [rax+disp32] sites, trace 20261121_1036). Anything else refused.
+    if (len != 6 && len != 7 && len != 9) { return false; }
     void* stub = NearStub(site, target);
     if (!stub) { return false; }
     const long long rel = static_cast<unsigned char*>(stub) - (site + 5);
@@ -11520,10 +11570,11 @@ bool PatchCall(unsigned char* site, const unsigned char* expect, int len, void* 
     DWORD old = 0;
     if (!VirtualProtect(site, static_cast<SIZE_T>(len), PAGE_EXECUTE_READWRITE, &old)) { return false; }
     if (memcmp(site, expect, static_cast<size_t>(len)) != 0) { VirtualProtect(site, static_cast<SIZE_T>(len), old, &old); return false; }
-    unsigned char buf[8] = { 0xE8, 0, 0, 0, 0, 0x90, 0x90, 0x90 };
+    unsigned char buf[9] = { 0xE8, 0, 0, 0, 0, 0x90, 0x90, 0x90, 0x90 };
     const int rel32 = static_cast<int>(rel);
     memcpy(buf + 1, &rel32, 4);
     if (len == 7) { buf[5] = 0x66; buf[6] = 0x90; }              // a 2-byte nop
+    if (len == 9) { buf[5] = 0x0F; buf[6] = 0x1F; buf[7] = 0x40; buf[8] = 0x00; }   // a 4-byte nop (nop dword ptr [rax+0])
     memcpy(site, buf, static_cast<size_t>(len));
     VirtualProtect(site, static_cast<SIZE_T>(len), old, &old);
     FlushInstructionCache(GetCurrentProcess(), site, static_cast<SIZE_T>(len));
@@ -17652,6 +17703,166 @@ void LogAdapter(ID3D11Device* dev)
 }
 
 void InstallOnAcquiredDevice();   // below: every hook that hangs off g_device / g_context, from either acquisition route
+void ModuleOfAddress(const void* p, char* out, size_t cap);   // below, with the eye-texture route
+
+// ===== [CTXSITE] rd3d11's SETTER CALL SITES (trace docs/traces/20261121_1036_ctxsite_detours.md; STATE 2026-11-21 (60)) =====
+// On a tester's PC the context-vtable hooks on slots 33 / 8 / 44 fired once and then never again (no GBuffer, no HUD pass, no DLSS,
+// no AFW rebuild, while the eye alternation ran). Every game call to those three setters comes from rd3d11 (the engine and the game
+// DLL import neither d3d11 nor dxgi): OMSetRenderTargets at the command replay's case 12 (+30943) and three unbinds (+3943D, +3AC77,
+// +3AD0E), PSSetShaderResources at replay case 30 (+30B73), RSSetViewports at replay case 6 (+3087D) - IDA ctx1 / ctx2 on our rd3d11
+// 3804f0b1; the Epic one 497b84e4 holds the same bytes at all six. The same move as rd3d11's draw sites (D-353 / INV-726): each site
+// calls a detour here, patched ONCE, byte-checked. A detour reads the context's CURRENT vtable entry: our hook (every PC we have
+// measured) -> it calls exactly that, as the unpatched site would; anything else -> our hook's work runs and the game's call is
+// forwarded to that entry (t_ctxFwd), never to a stale copy. Nothing here writes a vtable (the probe build's fault test aside).
+namespace ctxsite {
+bool  g_wantFromBind = false;
+int   g_tried = 0;
+bool  g_patched[6] = {};
+void* g_seen[3][4] = {};   // the foreign entries already named, per slot (4 at most each); render thread only (INV-152)
+int   g_seenN[3] = {};
+long  g_foreignCalls[3] = {};
+const char* const kSlotName[3] = { "OMSetRenderTargets (slot 33)", "PSSetShaderResources (slot 8)", "RSSetViewports (slot 44)" };
+
+void NoteForeign(int i, void* cur, void* orig)
+{
+    ++g_foreignCalls[i];
+    for (int k = 0; k < g_seenN[i]; ++k) { if (g_seen[i][k] == cur) { return; } }
+    if (g_seenN[i] >= 4) { return; }
+    g_seen[i][g_seenN[i]++] = cur;
+    char owner[MAX_PATH] = {};
+    ModuleOfAddress(cur, owner, sizeof(owner));
+    // [PROBE: CTXSITE] gate=none (once per slot per distinct foreign entry, 4 at most per slot; only when the slot is not our hook)  site=FLAT  log-only=yes
+    LOG("[CTXSITE] %s: the context's vtable entry is NOT our hook - it holds %p (%s, %s) | the rd3d11 site runs our hook's work and "
+        "forwards the game's call to that entry | foreign entry #%d for this slot, site calls through a foreign entry so far %ld",
+        kSlotName[i], cur, owner, cur == orig ? "== the original saved at install" : "a different function", g_seenN[i],
+        g_foreignCalls[i]);
+}
+
+void STDMETHODCALLTYPE SiteOMSetRenderTargets(ID3D11DeviceContext* ctx, UINT n, ID3D11RenderTargetView* const* r,
+                                              ID3D11DepthStencilView* d)
+{
+    void* cur = (*reinterpret_cast<void* const* const*>(ctx))[kOMSetRenderTargetsSlot];
+    if (cur == reinterpret_cast<void*>(&HookedOMSetRenderTargets) || !g_origOMSetRenderTargets) {
+        reinterpret_cast<OMSetRenderTargetsFn>(cur)(ctx, n, r, d);   // exactly what the unpatched site calls
+        return;
+    }
+    NoteForeign(0, cur, reinterpret_cast<void*>(g_origOMSetRenderTargets));
+    t_ctxFwd[0] = cur;
+    HookedOMSetRenderTargets(ctx, n, r, d);
+    t_ctxFwd[0] = nullptr;
+}
+
+void STDMETHODCALLTYPE SitePSSetShaderResources(ID3D11DeviceContext* ctx, UINT start, UINT n,
+                                                ID3D11ShaderResourceView* const* v)
+{
+    void* cur = (*reinterpret_cast<void* const* const*>(ctx))[kPSSetShaderResourcesSlot];
+    if (cur == reinterpret_cast<void*>(&HookedPSSetShaderResources) || !g_origPSSetShaderResources) {
+        reinterpret_cast<PSSetShaderResourcesFn>(cur)(ctx, start, n, v);
+        return;
+    }
+    NoteForeign(1, cur, reinterpret_cast<void*>(g_origPSSetShaderResources));
+    t_ctxFwd[1] = cur;
+    HookedPSSetShaderResources(ctx, start, n, v);
+    t_ctxFwd[1] = nullptr;
+}
+
+void STDMETHODCALLTYPE SiteRSSetViewports(ID3D11DeviceContext* ctx, UINT n, const D3D11_VIEWPORT* vp)
+{
+    void* cur = (*reinterpret_cast<void* const* const*>(ctx))[kRSSetViewportsSlot];
+    if (cur == reinterpret_cast<void*>(&HookedRSSetViewports) || !g_origRSSetViewports) {
+        reinterpret_cast<RSSetViewportsFn>(cur)(ctx, n, vp);
+        return;
+    }
+    NoteForeign(2, cur, reinterpret_cast<void*>(g_origRSSetViewports));
+    t_ctxFwd[2] = cur;
+    HookedRSSetViewports(ctx, n, vp);
+    t_ctxFwd[2] = nullptr;
+}
+
+#if defined(DLVR_CTXSITE_FAULT_TEST)
+// PROBE BUILD ONLY (CMake DLVR_CTXSITE_FAULT_TEST, src_beta/build_probe): with dlvr\ctxsite_fault_test.txt present, slots 33 / 8 / 44
+// are written back to the saved originals ONCE, here, before any frame - the tester's state - so the sites' foreign path runs on a
+// PC whose slots are never lost. Not compiled into the shipped BETA.
+void FaultTest()
+{
+    char path[MAX_PATH] = {};
+    if (!GetFullPathNameA("dlvr\\ctxsite_fault_test.txt", MAX_PATH, path, nullptr)) {
+        strncpy_s(path, sizeof(path), "dlvr\\ctxsite_fault_test.txt", _TRUNCATE);
+    }
+    const bool on = GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+    int wrote = 0;
+    if (on && g_context) {
+        void** vt = *reinterpret_cast<void***>(g_context);
+        const int   slot[3] = { kOMSetRenderTargetsSlot, kPSSetShaderResourcesSlot, kRSSetViewportsSlot };
+        void* const orig[3] = { reinterpret_cast<void*>(g_origOMSetRenderTargets),
+                                reinterpret_cast<void*>(g_origPSSetShaderResources),
+                                reinterpret_cast<void*>(g_origRSSetViewports) };
+        for (int i = 0; i < 3; ++i) {
+            if (!orig[i]) { continue; }   // that hook was not installed in this mode
+            DWORD old = 0;
+            if (!VirtualProtect(&vt[slot[i]], sizeof(void*), PAGE_READWRITE, &old)) { continue; }
+            vt[slot[i]] = orig[i];
+            VirtualProtect(&vt[slot[i]], sizeof(void*), old, &old);
+            ++wrote;
+        }
+    }
+    // [PROBE: CTXSITE] gate=the probe build (DLVR_CTXSITE_FAULT_TEST) + dlvr\ctxsite_fault_test.txt (logged either way, naming the path)  site=FLAT  log-only=no
+    LOG("[CTXSITE] FAULT TEST (probe build, logged unconditionally): marker %s %s - %s",
+        path, on ? "PRESENT" : "absent",
+        on ? (wrote ? "the context's vtable slots 33 / 8 / 44 were written back to the saved originals now, before any frame (the "
+                      "tester's state). Expect one 'NOT our hook ... == the original saved at install' line per slot, then the GBuffer, "
+                      "colour latch and AFW rebuild as usual."
+                    : "NOTHING WRITTEN (no context, or no hook installed / VirtualProtect refused)")
+           : "nothing written; the slots keep our hooks.");
+}
+#endif
+
+// Once per process. IAT route: from HookedD3D11CreateDevice, inside the renderer's device creation - no frame has been replayed, so
+// nothing can be executing the bytes. Eye-texture route: from the first HookedOMSetRenderTargets call (render thread, INV-152).
+void Install(const char* who)
+{
+    if (g_tried) { return; }
+    g_tried = 1;
+    struct Site { unsigned rva; int len; unsigned char b[9]; const char* name; };
+    static const Site kSite[6] = {
+        { 0x30940, 9, { 0x48, 0x8B, 0x01, 0xFF, 0x90, 0x08, 0x01, 0x00, 0x00 }, "+30943 OMSetRenderTargets (replay)" },
+        { 0x3943A, 9, { 0x48, 0x8B, 0x01, 0xFF, 0x90, 0x08, 0x01, 0x00, 0x00 }, "+3943D OMSetRenderTargets (unbind)" },
+        { 0x3AC74, 9, { 0x48, 0x8B, 0x01, 0xFF, 0x90, 0x08, 0x01, 0x00, 0x00 }, "+3AC77 OMSetRenderTargets (unbind)" },
+        { 0x3AD0B, 9, { 0x48, 0x8B, 0x01, 0xFF, 0x90, 0x08, 0x01, 0x00, 0x00 }, "+3AD0E OMSetRenderTargets (unbind)" },
+        { 0x30B70, 6, { 0x48, 0x8B, 0x01, 0xFF, 0x50, 0x40 },                   "+30B73 PSSetShaderResources (replay)" },
+        { 0x3087A, 9, { 0x48, 0x8B, 0x01, 0xFF, 0x90, 0x60, 0x01, 0x00, 0x00 }, "+3087D RSSetViewports (replay)" },
+    };
+    void* const to[6] = { reinterpret_cast<void*>(&SiteOMSetRenderTargets), reinterpret_cast<void*>(&SiteOMSetRenderTargets),
+                          reinterpret_cast<void*>(&SiteOMSetRenderTargets), reinterpret_cast<void*>(&SiteOMSetRenderTargets),
+                          reinterpret_cast<void*>(&SitePSSetShaderResources), reinterpret_cast<void*>(&SiteRSSetViewports) };
+    HMODULE m = GetModuleHandleA("rd3d11_x64_rwdi.dll");
+    unsigned char* base = reinterpret_cast<unsigned char*>(m);
+    bool bytesOk[6] = {};
+    int n = 0;
+    for (int i = 0; i < 6; ++i) {
+        if (base) {
+            __try { bytesOk[i] = memcmp(base + kSite[i].rva, kSite[i].b, static_cast<size_t>(kSite[i].len)) == 0; }
+            __except (EXCEPTION_EXECUTE_HANDLER) { bytesOk[i] = false; }
+        }
+        g_patched[i] = bytesOk[i] && afwmask::PatchCall(base + kSite[i].rva, kSite[i].b, kSite[i].len, to[i]);
+        n += g_patched[i] ? 1 : 0;
+    }
+    char list[512] = {};
+    for (int i = 0; i < 6; ++i) {
+        char one[96];
+        _snprintf_s(one, sizeof(one), _TRUNCATE, "%s%s %s", i ? " | " : "", kSite[i].name,
+                    g_patched[i] ? "PATCHED" : !base ? "NO rd3d11" : !bytesOk[i] ? "bytes NOT AS EXPECTED" : "patch FAILED");
+        strncat_s(list, sizeof(list), one, _TRUNCATE);
+    }
+    // [PROBE: CTXSITE] gate=none (once per process, logged unconditionally)  site=FLAT  log-only=no
+    LOG("[CTXSITE] rd3d11 setter call sites %s %d of 6 (logged unconditionally), from %s: rd3d11 %p | %s. A refused site keeps today's "
+        "vtable path. The patches stay until the game closes.", n == 6 ? "PATCHED" : n ? "PARTLY PATCHED" : "REFUSED", n, who,
+        static_cast<void*>(m), list);
+#if defined(DLVR_CTXSITE_FAULT_TEST)
+    FaultTest();
+#endif
+}
+}  // namespace ctxsite
 
 HRESULT WINAPI HookedD3D11CreateDevice(
     IDXGIAdapter* adapter, D3D_DRIVER_TYPE driverType, HMODULE software, UINT flags,
@@ -17689,6 +17900,11 @@ HRESULT WINAPI HookedD3D11CreateDevice(
         "featureLevel=%X", g_device, g_context, static_cast<int>(driverType), flags,
         outFeatureLevel ? static_cast<unsigned>(*outFeatureLevel) : 0u);
     InstallOnAcquiredDevice();
+    // [LOADBEARING: CTXSITE] where the context's vtable entries are not kept (a tester's PC: [DLSSC] "NO tonemap draw seen ... the
+    //      GBuffer bind was never seen" for the whole session, STATE 2026-11-21 (60)) the GBuffer match, the HUD pass, the DLSS colour
+    //      latch and with them the AFW rebuild run only because rd3d11's own call sites reach our hooks (ctxsite::Site*, above).
+    //      Inside the device creation: no frame replayed yet, so no thread is executing the patched bytes.
+    ctxsite::Install("device acquisition (before the first frame)");
     return hr;
 }
 
@@ -17715,7 +17931,10 @@ void InstallOnAcquiredDevice()
     // created early, and one created before the hook keeps the engine's own
     // bias.
     InstallSamplerHook();
-    if (g_vrRecon || g_vrMode) { InstallRsViewportHook(); }
+    // [LOADBEARING: COMPOSITE-EVENT] on every AA path (trace docs/traces/20261121_1216_composite_event_every_aa.md): the RSSetViewports
+    //      hook carries the eye-composite event submit_drawn_image pairs each submit with (INV-429); gated on g_vrMode it was absent on NO AA
+    //      ("[SWAPORD] ... event sink" 0 in NA1 / NA3) and the world doubled. Here, before any frame; flat returns at its first test.
+    InstallRsViewportHook();
     if (g_vrMode) { lensmask::Arm(); }   // F2: installed by lensmask::Rearm() only once the layer's lens_mask is on (Jay 2026-10-16)
     // Only under the UI probe's marker: four hooks on the hottest calls in the
     // API have no business being live in a normal run.
@@ -17787,6 +18006,9 @@ void TryDeviceFromEyeTexture(ID3D11Texture2D* tex)
         g_device, g_context, g_device->GetCreationFlags(), static_cast<unsigned>(g_device->GetFeatureLevel()), now, owner,
         whose);
     InstallOnAcquiredDevice();
+    // [CTXSITE] the renderer may already be replaying frames here (the layer's session start): the sites are patched from the
+    // first render-target bind instead, on the render thread (HookedOMSetRenderTargets).
+    ctxsite::g_wantFromBind = true;
 }
 
 // One check, ~5 s after the eye-texture route acquired: is OUR OMSetRenderTargets hook still in the context's vtable?
@@ -17832,6 +18054,20 @@ extern "C" __declspec(dllexport) void DlvrGpuFrameBoundary()
 {
     if (!gpuframe::g_on) { return; }
     gpuframe::Boundary();
+}
+
+// [AFWNET] (trace docs/traces/20261121_1057_afw_tonemap_net.md): has the bootstrap EVER seen the tonemap draw - the draw the AFW
+// depth copies and the DLSS colour latch hang off? 1 yes, 0 not yet, -1 the colour hook is not installed (no verdict: the layer's
+// net does nothing). The same counter the "[DLSSC] ... NO tonemap draw seen" line tests; never reset. Read by the layer's
+// eye-alternation hook once per frame: a few loads.
+// 2 (trace docs/traces/20261121_1121_afwnet_capture_off.md): the AFW capture at the tonemap draw CANNOT RUN on this path - the matrix
+// push (its only call site) needs g_visibleMode, g_vrMode, no recon and g_cbSnap, and NO AA / aa_native.txt / recon force the first
+// two off (BG8: 0 rebuilds of 72,575 while the colour latch still fired). No rebuild is possible, whatever the sighting says.
+extern "C" __declspec(dllexport) int DlvrTonemapSeen()
+{
+    if (!::dlvr::dlssflat::Enabled || !g_origPSSetShaderResources) { return -1; }
+    if (!(g_visibleMode && g_vrMode && !g_vrRecon && g_cbSnap)) { return 2; }
+    return g_hdrSightings > 0 ? 1 : 0;
 }
 
 // ---------------------------------------------------------------------------

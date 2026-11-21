@@ -23,6 +23,7 @@
 
 #include "../common/log.h"
 #include "calibraw_logic.h"   // build B: RawMatches / ForearmInHand for the raw store
+#include "headpose.h"         // GetEyeAboveFloor - the calibration's eye height (plan 2026-11-20-holster-pivot-posture-rings Task 3)
 
 #define LOG(...) ::dlvr::LogTo("dlvr_ovr2xr.log", __VA_ARGS__)
 
@@ -127,6 +128,13 @@ volatile LONG g_stepSource = 0;                  // 0 = in-level (+ raw side by 
 // Build C (Jay 2026-11-15): 1 = this step run is SEATED - pose 3 is "down and out at 45 deg" (MatchesPose / RawMatches case 4) and
 // the run measures no rest hand (FinishWith keeps the loaded one, Jay: "Keep previous hips"). 0 = standing / the timed run.
 volatile LONG g_stepSeated = 0;
+// Plan 2026-11-20-holster-pivot-posture-rings Task 3 (trace 20261120_1230_calib_eye_floor): the eye's height above the STAGE floor at
+// each accepted RIGHT-arm step sample of this run (one per accepted pair), and the loaded / last calibration's median + posture.
+// Under g_lock.
+std::vector<float> g_eyeFloorRun;
+float         g_fitEyeFloor = 0.0f;
+bool          g_fitEyeFloorHave = false;
+bool          g_fitEyeFloorStanding = true;
 
 // The pose's name for the log - pose 3 of a seated step run is the 45 deg pose.
 const char* StepPoseName(int p)
@@ -424,6 +432,7 @@ void LoadFit()
     g_fitLoaded = true;
     g_fitHave = false;
     g_fitRestHave[0] = g_fitRestHave[1] = false;
+    g_fitEyeFloorHave = false;   // Task 3
     char path[MAX_PATH] = {};
     FILE* f = nullptr;
     if (!ArmFitPath(path, sizeof(path)) || fopen_s(&f, path, "r") != 0 || !f) {
@@ -437,6 +446,8 @@ void LoadFit()
     float anat[2] = { -1.0f, -1.0f };                                           // -1 = not in the file
     float rest[2][3] = {};
     int restN[2] = { 0, 0 };   // how many of the three rest-hand lines were read per arm (all three or none)
+    float eyeFloor = -1.0f;    // Task 3: eye_floor_m (-1 = not in the file)
+    int eyeFloorPosture = -1;  // Task 3: eye_floor_posture (1 standing, 0 seated, -1 not in the file)
     char line[256];
     while (fgets(line, sizeof(line), f)) {
         float v = 0.0f;
@@ -458,6 +469,9 @@ void LoadFit()
         if (sscanf_s(line, "l_pivot_out_m=%f", &v) == 1) { piv[1][2] = v; }
         if (sscanf_s(line, "r_anat_len_m=%f", &v) == 1)  { anat[0] = v; }
         if (sscanf_s(line, "l_anat_len_m=%f", &v) == 1)  { anat[1] = v; }
+        if (sscanf_s(line, "eye_floor_m=%f", &v) == 1)   { eyeFloor = v; }   // Task 3
+        if (strncmp(line, "eye_floor_posture=seated", 24) == 0)   { eyeFloorPosture = 0; }
+        if (strncmp(line, "eye_floor_posture=standing", 26) == 0) { eyeFloorPosture = 1; }
         float fx = 0.0f, fy = 0.0f, fz = 0.0f;
         for (int s = 0; s < 2; ++s) {
             const char* key = s ? "l_forearm_in_hand=%f %f %f" : "r_forearm_in_hand=%f %f %f";
@@ -469,6 +483,14 @@ void LoadFit()
         }
     }
     fclose(f);
+    // Task 3: both lines or neither (holster_logic.h PostureLinesFrom checks plausibility). Said once per load.
+    g_fitEyeFloorHave = eyeFloor > 0.0f && eyeFloorPosture >= 0;
+    g_fitEyeFloor = g_fitEyeFloorHave ? eyeFloor : 0.0f;
+    g_fitEyeFloorStanding = eyeFloorPosture != 0;
+    // [PROBE: ARMFIT] (Task 3 - the loaded calibration's eye height, once per load)
+    LOG("boneblend: [ARMFIT] EYE FLOOR loaded: %s%.3f m (%s)%s", g_fitEyeFloorHave ? "" : "NONE in the file - ",
+        g_fitEyeFloorHave ? eyeFloor : 0.0f, g_fitEyeFloorHave ? (g_fitEyeFloorStanding ? "calibrated standing" : "calibrated seated") : "-",
+        g_fitEyeFloorHave ? "" : " | the holsters use the 1.38 / 1.33 m lines until you recalibrate");
     // holster_hip_from_calib: an arm's resting hand counts only with all three lines (holster.cpp checks it is plausible).
     for (int s = 0; s < 2; ++s) {
         g_fitRestHave[s] = restN[s] == 3;
@@ -653,6 +675,23 @@ bool FinishWith(ArmResult R[2], bool raw)
                 "fixed hip centre for this side.", sn[s], g_run, n, kMinPerPose);
         }
     }
+    // Task 3 (plan 2026-11-20-holster-pivot-posture-rings, spec §5.2): the eye's height above the STAGE floor in the posture this run
+    // was taken in - the median of the accepted right-arm samples, only with >= kMinPerPose readings (no floor = none, said here).
+    float eyeFloorMed = 0.0f;
+    const bool eyeFloorOk = g_stepMode && static_cast<int>(g_eyeFloorRun.size()) >= kMinPerPose;
+    if (eyeFloorOk) {
+        std::vector<float> e = g_eyeFloorRun;
+        std::nth_element(e.begin(), e.begin() + e.size() / 2, e.end());
+        eyeFloorMed = e[e.size() / 2];
+    }
+    // [PROBE: ARMFIT] (Task 3 - the calibration's eye height above the floor, one line per calibration)
+    LOG("boneblend: [ARMFIT] EYE FLOOR run %ld: %s - %s readings %d (needs %d)%s", g_run,
+        eyeFloorOk ? "MEASURED" : "*** NOT MEASURED ***", seated ? "seated" : "standing", static_cast<int>(g_eyeFloorRun.size()),
+        kMinPerPose, eyeFloorOk ? "" : " - no floor reported while calibrating (or a timed run); the holsters keep the 1.38 / 1.33 m lines");
+    if (eyeFloorOk) {
+        LOG("boneblend: [ARMFIT] EYE FLOOR run %ld: median %.3f m above the floor (%s) -> the holsters' standing / seated lines are "
+            "set from it", g_run, eyeFloorMed, seated ? "seated" : "standing");
+    }
     if (R[0].ok && R[1].ok) {
         char path[MAX_PATH] = {};
         FILE* f = nullptr;
@@ -684,6 +723,9 @@ bool FinishWith(ArmResult R[2], bool raw)
                             restHand[s][1], p, restHand[s][2]);
                 }
             }
+            if (eyeFloorOk) {   // Task 3: read back by LoadFit -> ArmFitEyeFloor -> the holsters' posture lines
+                fprintf(f, "eye_floor_m=%.4f\neye_floor_posture=%s\n", eyeFloorMed, seated ? "seated" : "standing");
+            }
             fclose(f);
             LOG("boneblend: [ARMFIT] run %ld WROTE %s", g_run, path);
         } else {
@@ -703,6 +745,9 @@ bool FinishWith(ArmResult R[2], bool raw)
         }
         g_fitPivHave = true;
         g_fitAnatHave = R[0].anat >= 0.35f && R[0].anat <= 0.85f && R[1].anat >= 0.35f && R[1].anat <= 0.85f;
+        g_fitEyeFloorHave = eyeFloorOk;   // Task 3: a calibration without a floor reading drops the old one (it described another run)
+        g_fitEyeFloor = eyeFloorMed;
+        g_fitEyeFloorStanding = !seated;
         g_fitHave = true;
         g_fitLoaded = true;
         _snprintf_s(g_fitWhy, sizeof(g_fitWhy), _TRUNCATE, "from the calibration just completed (run %ld)", g_run);
@@ -998,6 +1043,7 @@ void ArmFitStart()
         // hand (holster_hip_from_calib) as this run's. Nothing else in the timed run reads g_raw.
         for (int p = 0; p < kFitPoses; ++p) { g_raw[s][p].clear(); }
     }
+    g_eyeFloorRun.clear();   // Task 3: the timed run takes no eye heights; never write a previous run's
     ++g_run;
     g_start = GetTickCount64();
     InterlockedExchange(&g_stepSeated, 0);   // Build C: a timed run is never seated; ArmFitStartStep sets it after this
@@ -1035,6 +1081,7 @@ void ArmFitStartStep(bool seated)
         for (int p = 0; p < kFitPoses; ++p) { g_raw[s][p].clear(); }
         g_rawVerdict[s] = 0; g_rawVerdictAt[s] = 0; g_rawRejShort[s] = 0; g_rawRejDir[s] = 0; g_rawFirstSaid[s] = false;
     }
+    g_eyeFloorRun.clear();   // Task 3
     InterlockedExchange(&g_stepPose, -1);
     InterlockedExchange(&g_stepCollect, 0);
     InterlockedExchange(&g_stepSeated, seated ? 1 : 0);   // Build C - before g_stepMode, so no sample sees the wrong posture
@@ -1123,6 +1170,9 @@ void ArmFitNoteRaw(int side, const float T[3], const float handB[9], const float
     if (side < 0 || side > 1 || !g_stepMode || !g_running) { return; }
     const LONG want = g_stepPose;
     if (want < 0 || want >= kFitPoses) { return; }
+    // Task 3: read BEFORE g_lock (GetEyeAboveFloor enters the frame Guard; g_lock is never held around it). Right arm only.
+    float eyeFloorM = 0.0f;
+    const bool eyeFloorOk = side == 0 && GetEyeAboveFloor(&eyeFloorM);
     AcquireSRWLockExclusive(&g_lock);
     const ULONGLONG now = GetTickCount64();
     const int m = calibraw::RawMatches(T, (want == kDown && g_stepSeated) ? 4 : static_cast<int>(want));   // Build C: 4 = seated 45
@@ -1147,6 +1197,7 @@ void ArmFitNoteRaw(int side, const float T[3], const float handB[9], const float
             sm.hlOk = holsterLocal != nullptr;
             for (int k = 0; k < 3; ++k) { sm.hl[k] = sm.hlOk ? holsterLocal[k] : 0.0f; }
             v.push_back(sm);
+            if (eyeFloorOk) { g_eyeFloorRun.push_back(eyeFloorM); }   // Task 3
         } else if (m == -2) {
             ++g_rawRejShort[side];
         } else if (m != 1) {
@@ -1195,6 +1246,23 @@ int ArmFitRestHand(int side, float out[3], long* seq)
     if (seq) { *seq = g_fitSeq; }
     ReleaseSRWLockShared(&g_lock);
     return r;
+}
+
+bool ArmFitEyeFloor(float* metres, bool* calibratedStanding)
+{
+    if (!g_fitLoaded) {
+        AcquireSRWLockExclusive(&g_lock);
+        if (!g_fitLoaded) { LoadFit(); }   // once per launch, as ArmFitRestHand
+        ReleaseSRWLockExclusive(&g_lock);
+    }
+    AcquireSRWLockShared(&g_lock);
+    const bool have = g_fitEyeFloorHave;
+    if (have) {
+        if (metres) { *metres = g_fitEyeFloor; }
+        if (calibratedStanding) { *calibratedStanding = g_fitEyeFloorStanding; }
+    }
+    ReleaseSRWLockShared(&g_lock);
+    return have;
 }
 
 int ArmFitStepFinish(char* why, size_t n)

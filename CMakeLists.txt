@@ -75,6 +75,14 @@ option(DLVR_HANG_WATCH "Diagnostic build only: the start-up hang watch in the bo
 if(DLVR_HANG_WATCH)
     target_compile_definitions(xinput1_3 PRIVATE DLVR_HANG_WATCH=1)
 endif()
+# The [CTXSITE] fault test (trace docs/traces/20261121_1036_ctxsite_detours.md, Jay 2026-11-21: "marker in the probe build only"):
+# src_beta/build_probe configured -DDLVR_CTXSITE_FAULT_TEST=ON compiles ctxsite::FaultTest in - with dlvr\ctxsite_fault_test.txt the
+# bootstrap writes the context's vtable slots 33 / 8 / 44 back to the originals once at device creation (a tester's lost-hook state).
+# The normal BETA build (OFF, the default) does not contain it.
+option(DLVR_CTXSITE_FAULT_TEST "Diagnostic build only: the [CTXSITE] lost-vtable-hook fault test in the bootstrap" OFF)
+if(DLVR_CTXSITE_FAULT_TEST)
+    target_compile_definitions(xinput1_3 PRIVATE DLVR_CTXSITE_FAULT_TEST=1)
+endif()
 # The NVIDIA DLSS SDK, for dlssflat's milestone C evaluation.
 set(DLVR_NGX_SDK "${CMAKE_CURRENT_SOURCE_DIR}/../DLSS_SDK" CACHE PATH "NVIDIA DLSS SDK root")
 # The AMD FidelityFX SDK 2.3.0 (FSR 3.1.5 + FSR 4.1.1), headers only at build

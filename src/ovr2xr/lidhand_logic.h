@@ -115,6 +115,25 @@ inline float LineDist(const float p[3], const float axis[3], const float q[3])
     return static_cast<float>(std::sqrt(e[0] * e[0] + e[1] * e[1] + e[2] * e[2]));
 }
 
+// The door tie-break (trace 20261121_1549): how far (metres) the hand is PAST this door's own free edge, measured along the door's
+// hinge -> edge direction (perpendicular to the hinge axis); 0 = the hand is over the leaf (between the hinge line and the edge) or
+// behind the hinge. Two doors whose edges meet at a seam: the hand over door A reads 0 for A and > 0 for B.
+inline float LeafOvershoot(const float pivotW[3], const float axisW[3], const float edgeMidW[3], const float handW[3])
+{
+    double ax[3] = { axisW[0], axisW[1], axisW[2] };
+    const double an = std::sqrt(ax[0] * ax[0] + ax[1] * ax[1] + ax[2] * ax[2]);
+    if (an <= 1e-12) { return 0.0f; }
+    for (double& v : ax) { v /= an; }
+    double d[3], h[3];
+    for (int k = 0; k < 3; ++k) { d[k] = static_cast<double>(edgeMidW[k]) - pivotW[k]; h[k] = static_cast<double>(handW[k]) - pivotW[k]; }
+    const double dd = d[0] * ax[0] + d[1] * ax[1] + d[2] * ax[2];
+    for (int k = 0; k < 3; ++k) { d[k] -= dd * ax[k]; }
+    const double R = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    if (R <= 1e-9) { return 0.0f; }
+    const double along = (h[0] * d[0] + h[1] * d[1] + h[2] * d[2]) / R;   // metres from the hinge line toward the edge
+    return along > R ? static_cast<float>(along - R) : 0.0f;
+}
+
 // True only on the frame the lid goes from below frac x open to at / above it.
 inline bool CrossesOpenPoint(float prevDeg, float nowDeg, float openDeg, float frac)
 {
@@ -133,11 +152,229 @@ inline int NearestWithin(const float dist[], int n, float reach)
     return best;
 }
 
-enum class ItemRelease { Stow, GiveBack };
-// Stow only in the shoulder zone AND with the item's take action 1 (23 = the inventory refuses it, RESEARCH §13.5).
-inline ItemRelease OnItemRelease(bool inShoulderZone, int takeAction)
+// The per-item pose row (trace 20261120_2057): `mesh` as GetMeshName reports it (folder / case / ".msh" vary) -> its lower-case base name
+// -> the index of the EXACT key in names[0..n), else -1 (no row = today's placement). Keys are lower case without folder or extension.
+inline int PoseFind(const char* const* names, int n, const char* mesh)
 {
-    return (inShoulderZone && takeAction == 1) ? ItemRelease::Stow : ItemRelease::GiveBack;
+    if (!names || !mesh || !*mesh) { return -1; }
+    const char* s = mesh;
+    for (const char* q = mesh; *q; ++q) { if (*q == '/' || *q == '\\') { s = q + 1; } }
+    char base[96] = {};
+    int len = 0;
+    for (; s[len] && len < 95; ++len) { const char c = s[len]; base[len] = (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c; }
+    base[len] = 0;
+    for (int i = len - 1; i >= 0; --i) {
+        if (base[i] == '.') { base[i] = 0; break; }
+    }
+    if (!base[0]) { return -1; }
+    for (int i = 0; i < n; ++i) {
+        const char* a = names[i];
+        const char* b = base;
+        while (*a && *a == *b) { ++a; ++b; }
+        if (!*a && !*b) { return i; }
+    }
+    return -1;
+}
+
+// ---- CLIP-FOLLOW rows (plan 2026-11-21-clip-follow-containers Task 2; trace 20261121_2145): a container whose open is NOT one fixed
+// hinge (the van's rear doors, basket B's lift-off cover) is written at the game's OWN clip frame nearest the hand. `frames` = the bone's
+// local (parent frame, 3x4) per table frame; t = a FRAME POSITION (float frames, 0 .. n-1).
+
+// Rotation 3x4 -> unit quaternion (w, x, y, z), Shepperd's method.
+inline void QuatFrom34(const float m[12], double q[4])
+{
+    const double m00 = m[0], m01 = m[1], m02 = m[2], m10 = m[4], m11 = m[5], m12 = m[6], m20 = m[8], m21 = m[9], m22 = m[10];
+    const double tr = m00 + m11 + m22;
+    if (tr > 0.0) {
+        const double s = std::sqrt(tr + 1.0) * 2.0;
+        q[0] = 0.25 * s; q[1] = (m21 - m12) / s; q[2] = (m02 - m20) / s; q[3] = (m10 - m01) / s;
+    } else if (m00 > m11 && m00 > m22) {
+        const double s = std::sqrt(1.0 + m00 - m11 - m22) * 2.0;
+        q[0] = (m21 - m12) / s; q[1] = 0.25 * s; q[2] = (m01 + m10) / s; q[3] = (m02 + m20) / s;
+    } else if (m11 > m22) {
+        const double s = std::sqrt(1.0 + m11 - m00 - m22) * 2.0;
+        q[0] = (m02 - m20) / s; q[1] = (m01 + m10) / s; q[2] = 0.25 * s; q[3] = (m12 + m21) / s;
+    } else {
+        const double s = std::sqrt(1.0 + m22 - m00 - m11) * 2.0;
+        q[0] = (m10 - m01) / s; q[1] = (m02 + m20) / s; q[2] = (m12 + m21) / s; q[3] = 0.25 * s;
+    }
+}
+
+// L(t): the two frames around t, rotation slerped (shortest arc), translation lerped; t clamped to [0, n-1]. n < 1 -> identity.
+inline void ClipLocalAt(const float (*frames)[12], int n, float t, float out[12])
+{
+    if (!frames || n < 1) {
+        const float id[12] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0 };
+        for (int i = 0; i < 12; ++i) { out[i] = id[i]; }
+        return;
+    }
+    if (t <= 0.0f || n == 1) { for (int i = 0; i < 12; ++i) { out[i] = frames[0][i]; } return; }
+    if (t >= static_cast<float>(n - 1)) { for (int i = 0; i < 12; ++i) { out[i] = frames[n - 1][i]; } return; }
+    const int f = static_cast<int>(t);
+    const double u = static_cast<double>(t) - f;
+    const float* a = frames[f];
+    const float* b = frames[f + 1];
+    double qa[4], qb[4];
+    QuatFrom34(a, qa);
+    QuatFrom34(b, qb);
+    double d = qa[0] * qb[0] + qa[1] * qb[1] + qa[2] * qb[2] + qa[3] * qb[3];
+    if (d < 0.0) { for (double& x : qb) { x = -x; } d = -d; }
+    double wa, wb;
+    if (d > 0.9995) {
+        wa = 1.0 - u; wb = u;
+    } else {
+        const double th = std::acos(d), s = std::sin(th);
+        wa = std::sin((1.0 - u) * th) / s; wb = std::sin(u * th) / s;
+    }
+    double q[4];
+    double n2 = 0.0;
+    for (int i = 0; i < 4; ++i) { q[i] = wa * qa[i] + wb * qb[i]; n2 += q[i] * q[i]; }
+    const double nn = std::sqrt(n2);
+    for (double& x : q) { x /= nn; }
+    const double w = q[0], x = q[1], y = q[2], z = q[3];
+    const double R[9] = { 1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y),
+                          2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x),
+                          2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y) };
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) { out[r * 4 + c] = static_cast<float>(R[r * 3 + c]); }
+        out[r * 4 + 3] = static_cast<float>(a[r * 4 + 3] * (1.0 - u) + b[r * 4 + 3] * u);
+    }
+}
+
+// The t minimizing |parentW . L(t) . g - hand| + stickMPerFrame . |t - tNow| over [tNow - window, tNow + window] within [0, n-1],
+// sampled every 0.25 frame. The window keeps the cover on ITS stretch of a turning path and limits a hand that tears away to `window`
+// frames per call; the stickiness (trace 20261121_2225, the basket cover: 0 = the plain nearest frame) makes a far frame win only when
+// it is clearly nearer - a near-tie between two stretches of a looping path no longer flips per tick.
+inline float ClipNearestT(const float (*frames)[12], int n, const float parentW[12], const float g[3], const float hand[3], float tNow,
+                          float window, float stickMPerFrame = 0.0f)
+{
+    if (!frames || n < 1) { return 0.0f; }
+    const float hi = static_cast<float>(n - 1);
+    float lo = tNow - window, up = tNow + window;
+    if (lo < 0.0f) { lo = 0.0f; }
+    if (up > hi) { up = hi; }
+    float best = tNow < 0.0f ? 0.0f : (tNow > hi ? hi : tNow), bestD = -1.0f;
+    for (float t = lo; t <= up + 1e-4f; t += 0.25f) {
+        const float tt = t > hi ? hi : t;
+        float L[12], W[12], p[3];
+        ClipLocalAt(frames, n, tt, L);
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 4; ++c) {
+                W[r * 4 + c] = parentW[r * 4 + 0] * L[0 * 4 + c] + parentW[r * 4 + 1] * L[1 * 4 + c] + parentW[r * 4 + 2] * L[2 * 4 + c] +
+                               (c == 3 ? parentW[r * 4 + 3] : 0.0f);
+            }
+        }
+        MulPoint34(W, g, p);
+        const float dx = p[0] - hand[0], dy = p[1] - hand[1], dz = p[2] - hand[2];
+        // a true distance (metres) when a stickiness is given, so the per-frame cost adds in metres; squared otherwise (as before)
+        const float d = stickMPerFrame > 0.0f ? std::sqrt(dx * dx + dy * dy + dz * dz) + stickMPerFrame * std::fabs(tt - tNow)
+                                              : dx * dx + dy * dy + dz * dz;
+        if (bestD < 0.0f || d < bestD) { bestD = d; best = tt; }
+    }
+    return best;
+}
+
+// The written t eased toward the chosen t (trace 20261121_2225): t + (target - t) . (1 - e^(-dt / tau)); tau <= 0 = no easing.
+inline float ClipEase(float tNow, float target, float dtS, float tauS)
+{
+    if (!(tauS > 0.0f)) { return target; }
+    if (!(dtS > 0.0f)) { return tNow; }
+    return tNow + (target - tNow) * (1.0f - std::exp(-dtS / tauS));
+}
+
+// The point of segment a-b nearest q (the cover's rim point under the hand, trace 20261121_2225).
+inline void SegClosest(const float a[3], const float b[3], const float q[3], float out[3])
+{
+    const float ab[3] = { b[0] - a[0], b[1] - a[1], b[2] - a[2] };
+    const float l2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+    float u = l2 > 1e-12f ? ((q[0] - a[0]) * ab[0] + (q[1] - a[1]) * ab[1] + (q[2] - a[2]) * ab[2]) / l2 : 0.0f;
+    u = u < 0.0f ? 0.0f : (u > 1.0f ? 1.0f : u);
+    for (int k = 0; k < 3; ++k) { out[k] = a[k] + u * ab[k]; }
+}
+
+// Distance between two locals: rotation angle (radians) + translation (metres x 100 - a centimetre ~ a 0.6 deg turn).
+inline double LocalDist(const float a[12], const float b[12])
+{
+    double tr = 0.0;
+    for (int r = 0; r < 3; ++r) {
+        for (int k = 0; k < 3; ++k) { tr += static_cast<double>(a[r * 4 + k]) * b[r * 4 + k]; }
+    }
+    double c = (tr - 1.0) / 2.0;
+    c = c > 1.0 ? 1.0 : (c < -1.0 ? -1.0 : c);
+    const double dx = a[3] - b[3], dy = a[7] - b[7], dz = a[11] - b[11];
+    return std::acos(c) + 100.0 * std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+// The t whose local is nearest `cur`: where the game's clip / our last write left the bone. COST (final review, trace 20261121_2145 - it
+// runs per tick in the item-reach check): one compare per table frame, then 0.25-frame interpolations within +-1 frame of the nearest
+// (<= 9). evals (optional) = interpolations done.
+inline float ClipTFromLocal(const float (*frames)[12], int n, const float cur[12], int* evals = nullptr)
+{
+    if (evals) { *evals = 0; }
+    if (!frames || n < 1) { return 0.0f; }
+    int bf = 0;
+    double bd = LocalDist(frames[0], cur);
+    for (int f = 1; f < n; ++f) {
+        const double d = LocalDist(frames[f], cur);
+        if (d < bd) { bd = d; bf = f; }
+    }
+    float best = static_cast<float>(bf);
+    const float lo = bf > 0 ? static_cast<float>(bf - 1) : 0.0f;
+    const float hi = bf < n - 1 ? static_cast<float>(bf + 1) : static_cast<float>(n - 1);
+    for (float t = lo; t <= hi + 1e-4f; t += 0.25f) {
+        if (t == static_cast<float>(static_cast<int>(t))) { continue; }   // whole frames were compared above
+        float L[12];
+        ClipLocalAt(frames, n, t, L);
+        if (evals) { ++*evals; }
+        const double d = LocalDist(L, cur);
+        if (d < bd) { bd = d; best = t; }
+    }
+    return best;
+}
+
+enum class ItemRelease { Stow, GiveBack, Drop };
+
+// What a carried item is (INV-758): a lid container's ContainerItem, a placed ItemSpawner (it IS the item), or a DroppedItem.
+enum class ItemKind { Chest, Spawner, Dropped };
+// Plan 2026-11-20-world-items-by-hand (Jay: "Just do the physics then instead", "chest items drop with physics too"): shoulder + action 1
+// = Stow; the inventory refusing (23) or an unread action (-1) = GiveBack for an item with a home (Chest / Spawner), Drop for a
+// DroppedItem (no home - it falls where it is); any other release = Drop (the game's take + the game's drop at the hand).
+inline ItemRelease OnItemRelease(bool inShoulderZone, int takeAction, ItemKind kind)
+{
+    if (takeAction == 1) { return inShoulderZone ? ItemRelease::Stow : ItemRelease::Drop; }
+    return kind == ItemKind::Dropped ? ItemRelease::Drop : ItemRelease::GiveBack;
+}
+
+// Which inventory entry a take added or raised, from before / after snapshots (entry pointers + stack counts at entry +64, INV-755):
+// an entry new in `after` = its whole stack (a count of 0 - a non-stacking item - = 1); the same entry with a higher count = the rise.
+// A count that fell is not a take. Returns the index into `after`, -1 = none (ammo / cash / collectables are taken with no entry).
+inline int InvDelta(const void* const* bp, const int* bc, int bn, const void* const* ap, const int* ac, int an, int* count)
+{
+    for (int i = 0; i < an; ++i) {
+        int was = -1;
+        for (int j = 0; j < bn && was < 0; ++j) { if (bp[j] == ap[i]) { was = bc[j]; } }
+        if (was < 0) { *count = ac[i] > 0 ? ac[i] : 1; return i; }
+        if (ac[i] > was) { *count = ac[i] - was; return i; }
+    }
+    return -1;
+}
+
+// The let-go drop's entry BY ITEM IDENTITY (trace 20261121_1627; RUN CL1b dropped the grappling hook - InvDelta's first changed entry):
+// as InvDelta, but only an `after` entry whose ItemID (`aid`, the game's own stack-match key: *vfunc+432 of the desc object, +CD4D60)
+// equals `want`. kNoId (an id that did not read) never matches. -1 = no entry of this item was added or raised.
+constexpr int kNoId = static_cast<int>(0x80000000u);
+inline int InvDeltaMatch(const void* const* bp, const int* bc, int bn, const void* const* ap, const int* ac, const int* aid, int an,
+                         int want, int* count)
+{
+    if (want == kNoId) { return -1; }
+    for (int i = 0; i < an; ++i) {
+        if (aid[i] != want) { continue; }
+        int was = -1;
+        for (int j = 0; j < bn && was < 0; ++j) { if (bp[j] == ap[i]) { was = bc[j]; } }
+        if (was < 0) { *count = ac[i] > 0 ? ac[i] : 1; return i; }
+        if (ac[i] > was) { *count = ac[i] - was; return i; }
+    }
+    return -1;
 }
 
 }  // namespace lidhand

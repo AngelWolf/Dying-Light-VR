@@ -370,6 +370,9 @@ bool RigGripWorldRead(int side, float pos[3], float cWorld[9], long long* qpcOut
 // The wrist HUD's arm anchor (trace docs/traces/20261113_1145_wrist_arm_anchor.md): side 0 right / 1 left - the arm solve's final
 // elbow, forearm world rotation (row-major, basis in the COLUMNS), achieved wrist and drawn hand basis, game world. False = none.
 bool RigArmAnchorRead(int side, float elbow[3], float fore[9], float wrist[3], float hand[9], long long* qpcOut);
+// The DRAWN hand's grip socket (side 0 right / 1 left), game world, mtx34 rows: the drawn hand basis + the achieved wrist + drawn x the
+// handholder's authored local (trace 20261120_2000) - where ItemCtlPlace puts a weapon. False = no pose. lidhand's carried item.
+bool RigDrawnHolderRead(int side, float out12[12]);
 // The RIGHT hand's key-pinch point (world): the published grip point + the commanded hand basis x kKeyPinchFromGrip (buggy_poses.inc,
 // the game's frame-600 thumb / index tip midpoint) - buggywheel.cpp's key grab test (RUN BK3). false = no pose or no hand basis yet.
 bool RigGripPinchRead(float pinch[3]);

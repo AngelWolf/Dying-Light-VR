@@ -101,7 +101,10 @@ void HolsterBodyReset();
 // kHolsterLChest (heal, spec 2026-11-01-manual-reload-design goal 2) is a BODY zone (3 here); holster_place_logic.h numbers it 4.
 enum HolsterZone { kHolsterShoulder = 0, kHolsterRHip = 1, kHolsterLHip = 2, kHolsterLChest = 3 };
 enum HolsterCaller { kHolsterCallerBow = 0, kHolsterCallerThrowable = 1, kHolsterCallerSwing = 2 };
-bool HolsterZoneLocal(int zone, int caller, const float headPos[3], const float headQ[4], const float grip[3], float out[3]);
+// mirrorX (final review I1, trace 20261120_1510): the caller measures against the zone MIRRORED in X (lidhand's left hand at the left
+// shoulder, centre -HolsterCenterX) - the frame is then aligned to the mirrored centre. Default false = the zone as published.
+bool HolsterZoneLocal(int zone, int caller, const float headPos[3], const float headQ[4], const float grip[3], float out[3],
+                      bool mirrorX = false);
 
 // ===== PLACING A HOLSTER BY HAND (docs/superpowers/plans/2026-10-30-holster-place-by-hand.md Task 3) =====
 // Placing (spec goal 2). Render thread. Begin is ignored while one is running.
@@ -158,5 +161,41 @@ void HolsterHudHideTick();
 // base (position + yaw); it writes one line per display time to dlvr_hipcap.log. Any LocateViews thread. COST off: one bool load.
 extern bool DiagHipCapture;
 void HolsterHipCapture(long long t, bool headValid, const float hp[3], const float hq[4], const float base[3], float baseYawDeg);
+// BODYCAP (trace docs/traces/20261120_1044_bodycap_probe.md; Jay 2026-11-20, the holster-bone redesign: "Setup whatever capture we
+// need"): while diag_hip_capture is on, the RIGHT-arm solve (boneblend.cpp SolveArmIk, at the pelvis read) publishes the drawn torso
+// chain with the map that carries the game world into tracking space - tracking = headRep + TrackingFromWorld(world - anchor, cby, sby)
+// - and the neck hold's state; HolsterHipCapture appends it to each dlvr_hipcap.log line. Log-only. Defined in boneblend.cpp.
+constexpr int kBodyCapW = 6;   // world 3x4: bip01, pelvis, hspine, spine1, spine3, hspine1
+constexpr int kBodyCapL = 4;   // local 3x4: pelvis, hspine, spine, spine1
+struct BodyCapSample {
+    double             atS = -1.0;        // QPC seconds of the publish (the clock holster.cpp NowS reads)
+    long long          solves = 0;        // publishes so far this launch
+    unsigned long long model = 0;
+    float              anchor[3] = {};    // SolveArmIk `anchor` at the pelvis read (world)
+    float              headRep[3] = {};   // the tracking point it maps to (NeckPivotReportedPos)
+    float              cby = 1.0f, sby = 0.0f;   // the mapping yaw's cos / sin
+    float              folded = 0.0f;     // HeadFollowFoldedDeg()
+    unsigned char      haveW[kBodyCapW] = {};
+    unsigned char      haveL[kBodyCapL] = {};
+    float              w[kBodyCapW][12] = {};   // rows of 4, translation in [3] [7] [11] (ReadAccessorMtx layout)
+    float              l[kBodyCapL][12] = {};
+    float              neckYaw = 0.0f, neckLastH = 0.0f;   // follow::g_neck: the body heading / last head yaw (OpenXR deg, no flip)
+    unsigned char      neckHave = 0;
+    unsigned char      fieldsOk = 0;      // look / facing read from the local player object
+    float              look = 0.0f, facing = 0.0f;   // +4468 / +4588
+};
+void BodyCapPublish(unsigned long long model, const float anchor[3], const float headRep[3], float cby, float sby);
+bool BodyCapRead(BodyCapSample* out);   // false = nothing published yet, or 8 torn reads
+// Plan 2026-11-20-holster-pivot-posture-rings Task 4 (spec §5.1): the neck pivot n (head frame, metres) THE HOLSTERS use - learned in
+// play (pivotfit_logic.h, fed by BodyFrameUpdate), loaded per headset from dlvr\holster_pivot.txt, NeckOffsetM() until either. The
+// view / roomscale / physcrouch keep NeckOffsetM(). Any thread (seqlock). COST: a few loads.
+void HolsterPivotM(float out[3]);
+// Plan 2026-11-20-holster-pivot-posture-rings Task 5 (spec §5.3, Jay: option B, "with a switch defaulting on"): the visible rings.
+extern bool HolsterRings;            // holster_rings ("Show holsters", VR Comfort), default ON
+// False while the game's menu / pause, the calibration screen, a vehicle or a cutscene is up - no ring then. Render thread.
+bool HolsterRingsAllowed();
+// The rings to draw this frame: each enabled holster's live centre (HolsterZoneWorld's frame - the grab's), its radius and its alpha
+// (ring_logic.h: its own hand's grip distance to the zone edge), nearest first, at most maxOut (<= 3). Render thread. Returns the count.
+int HolsterRingTargets(float centre[][3], float radius[], float alpha[], int maxOut);
 
 }  // namespace dlvr

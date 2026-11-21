@@ -920,6 +920,104 @@ static void v21_held_turn_followed_only_standing()
     }
 }
 
+// Direction-free zones (spec 2026-11-20-holster-direction-free-design, trace 20261120_1400): a hand on the zone's ring at ANY bearing
+// round the anchor is at the zone centre; off the ring by d it is d away; near the axis the fallback yaw is used.
+static void align_hand_on_ring_any_bearing()
+{
+    const Vec3 anchor{ 0.3f, 1.5f, -0.2f };
+    const Vec3 off{ 0.20f, -0.60f, 0.10f };          // a right-back hip offset, body frame (+X right, +Z behind)
+    for (int k = 0; k < 8; ++k) {
+        const float yawHand = (-170.0f + 45.0f * k) * kD2R;
+        const Vec3 w = ToWorldYaw(off, yawHand);
+        const Vec3 palm{ anchor.x + w.x, anchor.y + w.y, anchor.z + w.z };
+        const float y = AlignYawToHand(anchor, off, palm, 0.0f);
+        CHECK(NearV(LocalOffsetYaw(anchor, y, palm), off));
+        const Vec3 up{ palm.x, palm.y + 0.05f, palm.z };   // 5 cm above the ring: 5 cm from the centre
+        const Vec3 lu = LocalOffsetYaw(anchor, AlignYawToHand(anchor, off, up, 0.0f), up);
+        CHECK(Near(std::sqrt((lu.x - off.x) * (lu.x - off.x) + (lu.y - off.y) * (lu.y - off.y) + (lu.z - off.z) * (lu.z - off.z)), 0.05f, 1e-4f));
+    }
+}
+static void align_near_axis_uses_fallback()
+{
+    const Vec3 anchor{ 0.0f, 1.5f, 0.0f };
+    CHECK(Near(AlignYawToHand(anchor, { 0.2f, -0.6f, 0.1f }, { 0.01f, 0.9f, 0.01f }, 0.7f), 0.7f, 1e-6f));   // hand on the axis
+    CHECK(Near(AlignYawToHand(anchor, { 0.01f, -0.3f, 0.01f }, { 0.3f, 1.2f, 0.0f }, -0.4f), -0.4f, 1e-6f));  // zone on the axis
+}
+static void shoulder_front_of_face_excluded()
+{
+    const Vec3 neck{ 0.0f, 1.5f, 0.0f };
+    CHECK(InFrontOfFace(neck, 0.0f, { 0.0f, 1.5f, -0.3f }, kShoulderFrontR));             // straight ahead
+    const Vec3 at50 = ToWorldYaw({ 0.0f, 0.0f, -0.3f }, 50.0f * kD2R), at70 = ToWorldYaw({ 0.0f, 0.0f, -0.3f }, 70.0f * kD2R);
+    CHECK(InFrontOfFace(neck, 0.0f, { at50.x, 1.5f, at50.z }, kShoulderFrontR));         // 50 deg off the head: in front
+    CHECK(!InFrontOfFace(neck, 0.0f, { at70.x, 1.5f, at70.z }, kShoulderFrontR));        // 70 deg: not
+    CHECK(!InFrontOfFace(neck, 0.0f, { 0.25f, 1.6f, 0.05f }, kShoulderFrontR));          // over the right shoulder: not
+    CHECK(!InFrontOfFace(neck, 0.0f, { 0.01f, 1.6f, 0.01f }, kShoulderFrontR));          // on the axis: no bearing, not excluded
+}
+// Final review I1 (2026-11-20, trace 20261120_1510): lidhand's LEFT hand tests the shoulder zone mirrored (-centre.x). The frame must
+// be aligned with the MIRRORED target (holster.cpp HolsterZoneLocal mirrorX), as the poll's chain does it: VirtualHead + LocalOffsetYaw.
+// Aligned with the right shoulder's own target, a left hand on the left ring reads ~2 x 0.19 m from the mirrored centre (never in).
+static void align_mirrored_shoulder_for_the_left_hand()
+{
+    const Vec3 anchor{ 0.0f, 1.5f, 0.0f };
+    Latch L; L.have = true; L.eyeFromAnchor = { 0.008f, 0.112f, -0.090f };   // Jay's learned n, roughly
+    const Vec3 c{ 0.193f, -0.089f, 0.019f }, cm{ -c.x, c.y, c.z };          // the right shoulder's centre and its mirror
+    const Vec3 tR{ L.eyeFromAnchor.x + c.x, L.eyeFromAnchor.y + c.y, L.eyeFromAnchor.z + c.z };
+    const Vec3 tM{ L.eyeFromAnchor.x + cm.x, L.eyeFromAnchor.y + cm.y, L.eyeFromAnchor.z + cm.z };
+    for (int k = 0; k < 8; ++k) {
+        const float yawBody = (-170.0f + 45.0f * k) * kD2R;
+        const Vec3 w = ToWorldYaw(tM, yawBody);
+        const Vec3 palm{ anchor.x + w.x, anchor.y + w.y, anchor.z + w.z };   // the left hand on the left-shoulder ring
+        const float yM = AlignYawToHand(anchor, tM, palm, 0.0f);
+        CHECK(NearV(LocalOffsetYaw(VirtualHead(anchor, yM, L), yM, palm), cm));
+        const float yR = AlignYawToHand(anchor, tR, palm, 0.0f);
+        const Vec3 lr = LocalOffsetYaw(VirtualHead(anchor, yR, L), yR, palm);
+        const float dx = lr.x - cm.x, dy = lr.y - cm.y, dz = lr.z - cm.z;
+        CHECK(std::sqrt(dx * dx + dy * dy + dz * dz) > 0.15f);               // the bug: outside the 0.15 m radius
+    }
+}
+
+// RUN HP2 (2026-11-20, trace 20261120_1325_lookdown_limit): a real turn, then a look DOWN for the holster - the look-down hold left
+// the facing 100-173 deg behind. Past kLookDownLimitR (70) the hold lets go; within it a look at the belt still holds.
+static void lookdown_past_limit_follows_standing()
+{
+    Facing f; double t = 0.0;
+    Vec3 l, r;
+    HandsAt(0.0f, 0.15f, -0.20f, -0.60f, l, r);   // hands out in front: never a hands confirmation
+    for (int i = 0; i * kDt < 0.5f; ++i, t += kDt) {
+        FacingStepV2(f, kNeck, l, r, true, true, 0.0f, 0.0f, false, false, false, t, kDt, true);
+    }
+    for (int i = 0; i * kDt < 4.0f; ++i, t += kDt) {     // turned 100 deg AND looking down at -50
+        FacingStepV2(f, kNeck, l, r, true, true, 100.0f * kD2R, -50.0f * kD2R, false, false, false, t, kDt, true);
+    }
+    CHECK(Near(f.yaw / kD2R, 100.0f, 6.0f));
+}
+static void lookdown_within_limit_still_holds_standing()
+{
+    Facing f; double t = 0.0;
+    Vec3 l, r;
+    HandsAt(0.0f, 0.15f, -0.20f, -0.60f, l, r);
+    for (int i = 0; i * kDt < 0.5f; ++i, t += kDt) {
+        FacingStepV2(f, kNeck, l, r, true, true, 0.0f, 0.0f, false, false, false, t, kDt, true);
+    }
+    for (int i = 0; i * kDt < 4.0f; ++i, t += kDt) {     // a 60 deg look at the belt, pitched -50: the hold stays
+        FacingStepV2(f, kNeck, l, r, true, true, 60.0f * kD2R, -50.0f * kD2R, false, false, false, t, kDt, true);
+    }
+    CHECK(Near(f.yaw, 0.0f, 1e-4f));
+}
+static void lookdown_past_limit_seated_needs_hands()
+{
+    Facing f; double t = 0.0;
+    Vec3 l, r;
+    HandsAt(0.0f, 0.15f, -0.20f, -0.60f, l, r);
+    for (int i = 0; i * kDt < 0.5f; ++i, t += kDt) {
+        FacingStepV2(f, kNeck, l, r, true, true, 0.0f, 0.0f, false, false, false, t, kDt, false);
+    }
+    for (int i = 0; i * kDt < 4.0f; ++i, t += kDt) {     // seated, hands not confirming: no follow, as before
+        FacingStepV2(f, kNeck, l, r, true, true, 100.0f * kD2R, -50.0f * kD2R, false, false, false, t, kDt, false);
+    }
+    CHECK(Near(f.yaw, 0.0f, 1e-4f));
+}
+
 static void v21_posture_hysteresis()
 {
     Posture p; double t = 0.0;
@@ -933,8 +1031,51 @@ static void v21_posture_hysteresis()
     t = 8.0;  PostureStep(p, false, 0.0f, t); CHECK(!p.standing);         // no floor: seated
 }
 
+// Plan 2026-11-20-holster-pivot-posture-rings Task 2: the posture lines from the player's own calibration.
+static void posture_lines_jay_standing()
+{
+    const PostureLines l = PostureLinesFrom(true, 1.67f, true);
+    CHECK(Near(l.standEyeM, 1.379f, 0.005f)); CHECK(Near(l.seatEyeM, 1.329f, 0.005f)); CHECK(l.source == 1);
+}
+static void posture_lines_jay_seated()
+{
+    const PostureLines l = PostureLinesFrom(true, 1.14f, false);
+    CHECK(Near(l.standEyeM, 1.379f, 0.005f)); CHECK(Near(l.seatEyeM, 1.330f, 0.005f)); CHECK(l.source == 2);
+}
+static void posture_lines_short_stander()
+{
+    const PostureLines l = PostureLinesFrom(true, 1.35f, true);
+    CHECK(Near(l.standEyeM, 1.115f, 0.005f)); CHECK(Near(l.seatEyeM, 1.075f, 0.005f));
+    Posture p; double t = 0.0;                                             // a 1.35 m standing eye now reads STANDING
+    PostureStep(p, true, 1.35f, t, l); t = 2.1; PostureStep(p, true, 1.35f, t, l); CHECK(p.standing);
+}
+static void posture_lines_fallback()
+{
+    const PostureLines l = PostureLinesFrom(false, 0.0f, true);
+    CHECK(Near(l.standEyeM, 1.38f, 1e-6f)); CHECK(Near(l.seatEyeM, 1.33f, 1e-6f)); CHECK(l.source == 0);
+}
+static void posture_lines_implausible()
+{
+    const PostureLines a = PostureLinesFrom(true, 2.5f, true);
+    const PostureLines b = PostureLinesFrom(true, 0.4f, false);
+    CHECK(a.source == 0 && Near(a.standEyeM, 1.38f, 1e-6f));
+    CHECK(b.source == 0 && Near(b.seatEyeM, 1.33f, 1e-6f));
+}
+
 int main()
 {
+    align_hand_on_ring_any_bearing();
+    align_near_axis_uses_fallback();
+    shoulder_front_of_face_excluded();
+    align_mirrored_shoulder_for_the_left_hand();
+    lookdown_past_limit_follows_standing();
+    lookdown_within_limit_still_holds_standing();
+    lookdown_past_limit_seated_needs_hands();
+    posture_lines_jay_standing();
+    posture_lines_jay_seated();
+    posture_lines_short_stander();
+    posture_lines_fallback();
+    posture_lines_implausible();
     v21_held_turn_followed_only_standing();
     v21_posture_hysteresis();
     v2_holds_inside_the_band();

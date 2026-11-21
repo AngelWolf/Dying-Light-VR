@@ -27,4 +27,19 @@ void LidHandPoll(bool vrGrip, bool leftOwned, bool rightOwned, bool& withholdL1,
 // hips. lid_by_hand=0 / not ready -> false. COST: one interlocked read.
 bool LidHandHandInZone(int side);
 
+// True while hand `side` (0 = RIGHT, 1 = LEFT) carries a lid container's item - from the take to the release (stowed, given back, or
+// forgotten). The VR swing's hit is withheld while the right hand carries (trace 20261120_1815, Jay: "a swing can't fire in the hand
+// it's being held till it's either dropped or put away"). lid_by_hand=0 -> false. COST: one bool test + one volatile load.
+bool LidHandCarrying(int side);
+
+// Jay's approved per-item grip (trace 20261120_2057): the carried mesh's row in lid_item_poses.inc for hand `side` (0 RIGHT, 1 LEFT),
+// from the take to the release; -1 = not carrying, or the mesh has no row (today's placement and the game's fingers), or lid_by_hand=0.
+// Read by boneblend's LidFingersApply on the finger pass. COST: one bool test + one volatile load.
+int LidHandPoseRow(int side);
+// The row's data for `side`: 17 pins (LidHandPinCount) - local rotation (3x3 row-major), local translation, the skeleton rest rotation,
+// the pin names (r_ / l_) - and the mesh name. Pointers into lidhand.cpp's own table (the only TU that includes it). False = bad row.
+bool LidHandPoseData(int row, int side, const float (**pin)[9], const float (**pinT)[3], const float (**rest)[9],
+                     const char* const** names, const char** mesh);
+int LidHandPinCount();
+
 }  // namespace dlvr
