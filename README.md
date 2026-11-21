@@ -12,6 +12,7 @@ The launcher installs, updates and removes the mod, switches between VR and flat
 you launch. Every release is also listed under [Releases](https://github.com/bymodify-ux/Dying-Light-VR/releases).
 
 ## Instructions
+**DO NOT INSTALL IN C:/PROGRAM FILES OR C:/PROGRAM FILES(X86)**
 
 **THIS MOD IS CURRENTLY ONLY SUPPORTED FOR STEAM AND EPIC GAMES - GOG ENGINE ADDRESSES HAVE NOT BEEN TRANSLATED AT THIS POINT IN TIME - PIRATED VERSIONS ARE NOT SUPPORTED**
 1. Download the latest Launcher from the releases
