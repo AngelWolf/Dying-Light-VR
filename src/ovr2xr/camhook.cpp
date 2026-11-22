@@ -3844,6 +3844,11 @@ PFN_TonemapSeen g_tsFn = nullptr;
 bool      g_tsLooked = false;
 ULONGLONG g_netSinceMs = 0;         // the alternation wanted with the tonemap draw not seen, since (0 = not now)
 volatile LONG g_netHeld = 0;        // 1 = the followers are held off by the net
+// 1 = a view-projection matrix has reached the layer this session (CamHookAfwPushVp, set BEFORE its afw_rebuild return so a hold
+// still sees one arrive; never reset). Trace docs/traces/20261122_1140_afwnet_no_matrix.md: the tonemap draw seen with NO matrix =
+// the rebuild refuses every frame (AfwRebuildRun code 2) - the Q3 + VDXR tester on 1.06. Archive: 646 / 646 healthy alternating
+// sessions had one within ~1 s of the alternation's start.
+volatile LONG g_netVpEver = 0;
 LONG64    g_netHeldAt = 0;          // g_frame at the hold, for the resume line
 int       g_netHolds = 0;
 
@@ -3856,15 +3861,16 @@ void NetTick(ULONGLONG now, bool two)
         // [PROBE: AFWNET] gate=none (once per session, logged unconditionally, at the first eye-0 Scene replay)  site=HEADSET  log-only=no
         LOG("[AFWNET] ARMED (logged unconditionally): %s | tonemap draw seen now %d (1 yes, 0 not yet, 2 the bootstrap's AFW capture is "
             "off on this AA path - NO AA / aa_native / a missing marker, -1 the bootstrap's colour hook is not installed: no verdict, "
-            "the net does nothing) | the eye alternation is held off if the answer is still 0 or 2 %.1f s after it starts, and "
-            "resumes the moment it is 1",
+            "the net does nothing) | the eye alternation is held off if the answer is still 0 or 2, or 1 with no view-projection "
+            "matrix yet, %.1f s after it starts, and resumes the moment it is 1 with a matrix",
             g_tsFn ? "DlvrTonemapSeen resolved" : "DlvrTonemapSeen NOT resolved (an older bootstrap) - the net does nothing",
             g_tsFn ? g_tsFn() : -2, static_cast<double>(kNetMs) / 1000.0);
     }
     if (!g_tsFn) { return; }
     const int seen = g_tsFn();
+    const bool vpEver = InterlockedCompareExchange(&g_netVpEver, 1, 1) == 1;
     if (g_netHeld) {
-        if (seen == 1 || !AfwEnable) {
+        if ((seen == 1 && vpEver) || !AfwEnable) {
             InterlockedExchange(&g_netHeld, 0);
             const bool back = AfwEnable && AfwData3Allowed();
             AfwAltEye = back;
@@ -3872,14 +3878,18 @@ void NetTick(ULONGLONG now, bool two)
             g_netSinceMs = 0;
             // [PROBE: AFWNET] gate=afw_enable (a resume after a hold; event)  site=HEADSET  log-only=no
             LOG("[AFWNET] RESUMED at frame %lld (held %lld frames): %s - afw_alt_eye / afw_rebuild back to %d", g_frame,
-                g_frame - g_netHeldAt, seen == 1 ? "the bootstrap has now seen the tonemap draw" : "afw_enable was unticked",
+                g_frame - g_netHeldAt,
+                seen == 1 ? "the bootstrap has now seen the tonemap draw and a view-projection matrix has reached the layer"
+                          : "afw_enable was unticked",
                 back ? 1 : 0);
         }
         return;
     }
     const bool intent = AfwEnable && two && AfwData3Allowed();
-    // 0 = the tonemap draw not seen yet; 2 = the bootstrap's AFW capture cannot run on this AA path. Either way no rebuild.
-    if (!intent || (seen != 0 && seen != 2)) { g_netSinceMs = 0; return; }
+    // 0 = the tonemap draw not seen yet; 2 = the bootstrap's AFW capture cannot run on this AA path; 1 with no matrix ever = the
+    // rebuild refuses every frame (no camera). Any of them: no rebuild. -1 (no verdict) = the net does nothing, as before.
+    const bool noRebuild = seen == 0 || seen == 2 || (seen == 1 && !vpEver);
+    if (!intent || !noRebuild) { g_netSinceMs = 0; return; }
     if (g_netSinceMs == 0) { g_netSinceMs = now; return; }
     if (now - g_netSinceMs < kNetMs) { return; }
     InterlockedExchange(&g_netHeld, 1);
@@ -3893,7 +3903,8 @@ void NetTick(ULONGLONG now, bool two)
         "(%d); resumes when the bootstrap reports the tonemap draw seen with its AFW capture on.", g_frame, g_netHolds,
         static_cast<double>(now - g_netSinceMs) / 1000.0,
         seen == 2 ? "the bootstrap's AFW capture is OFF on this AA path (NO AA, aa_native.txt or a missing marker)"
-                  : "the bootstrap has NOT seen the tonemap draw",
+        : seen == 1 ? "the tonemap draw is seen but NO view-projection matrix has reached the layer (the rebuild needs one)"
+                    : "the bootstrap has NOT seen the tonemap draw",
         AfwEnable ? 1 : 0);
 }
 
@@ -11019,6 +11030,7 @@ const char* CamHookAfwRebuildGateName(int code)
 // Called by the bootstrap (dlvr_AfwPushVp) at each GBuffer-pass view-projection snapshot, on the render thread.
 void CamHookAfwPushVp(const float vp[16])
 {
+    if (vp) { InterlockedExchange(&afwalt::g_netVpEver, 1); }   // [AFWNET]: before the return below, so a hold sees one arrive
     if (!AfwRebuild || !vp) { return; }   // the rebuild's gate is the only reader
     const LONG64 n = afwcam::g_pushes;
     afwcam::Slot& s = afwcam::g_ring[static_cast<int>(n % afwcam::kRing)];
