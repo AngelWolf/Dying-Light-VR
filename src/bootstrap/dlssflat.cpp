@@ -99,8 +99,9 @@ volatile LONG        g_gbufferReported = 0;
 // call and runs our hook body, which forwards the game's call to it (consumed once) instead of the saved original. t_ctxInFwd is
 // true only while that forward runs: a hook entered then (the foreign function calling ours back) forwards straight to the saved
 // original. Index [0] OMSetRenderTargets, [1] PSSetShaderResources, [2] RSSetViewports. Outside a detour both stay null / false.
-thread_local void* t_ctxFwd[3] = {};
-thread_local bool  t_ctxInFwd[3] = {};
+// [3] VSSetConstantBuffers (trace docs/traces/20261122_1110_ctxsite_vs_cb_site.md - the view-projection latch, a tester's dead matrix).
+thread_local void* t_ctxFwd[4] = {};
+thread_local bool  t_ctxInFwd[4] = {};
 namespace ctxsite {
 extern bool g_wantFromBind;            // the eye-texture route: install from the first render-target bind (render thread)
 void Install(const char* who);
@@ -6716,7 +6717,23 @@ int FramePhaseOf(const float* m)
 // edging on buildings"). Reset after each eye's eval (ReadViewProj -> EndEyeVote).
 vpstorelogic::Vote g_vote;
 LONG g_outvoted = 0;                // served blocks whose phase lost the vote (the snapshot kept the majority's)
-void EndEyeVote() { vpstorelogic::VoteReset(g_vote); }
+// FRESH SERVES ONLY (2026-11-22, trace docs/traces/20261122_1505_vpstore_fresh_serve.md; vpstore_logic.h StoredSinceEval): session
+// totals, so BETA (whose 5 s lines never print) still shows them - the report below and the event lines in Serve / ReadViewProj.
+long long g_oldRefusedTotal = 0;    // serves refused: the entry's matrix was stored before the most recent eval
+long long g_sameAsPrevTotal = 0;    // evals whose taken matrix equals the previous eval's, bit for bit (ReadViewProj)
+// Called by ReadViewProj once per eval: the vote resets, the eval is counted (an entry stored before it is old from now on).
+void EndEyeVote()
+{
+    vpstorelogic::VoteReset(g_vote);
+    vpstorelogic::NoteEval(g_t);
+    const unsigned long long n = g_t.evals;
+    if (n >= 4096 && (n & (n - 1)) == 0) {
+        // [PROBE: VPSTORE] gate=dlss_cbsnap.txt + dlss_mvfix.txt (g_cbSnap, g_mvFix)  site=HEADSET  log-only=yes
+        LOG("[VPSTORE] FRESH-SERVE REPORT at eval %llu (logged unconditionally at 4096, 8192, 16384 ...): old matrices not served "
+            "%lld | evals that took the previous eval's matrix bit for bit %lld (the AFW gate's STALE camera case - expected 0)",
+            n, g_oldRefusedTotal, g_sameAsPrevTotal);
+    }
+}
 // A VS slot-2 bind: the buffer's entry, added (evicting when full) if new, stamped as bound now.
 Ent* Add(ID3D11Buffer* b) { return vpstorelogic::Bind(g_t, b); }
 // The matrix this eye's GBuffer pass draws with becomes the snapshot every AFW / DLSS reader takes.
@@ -6727,6 +6744,19 @@ void Serve(Ent* e)
 {
     if (!e) { return; }
     if (!e->have) { ++g_noData; vpstorelogic::OnServeRefused(g_snapGuard, true); return; }
+    // [LOADBEARING: VP-FRESH-SERVE] a matrix stored before the most recent eval is an earlier upload (a command list's opening bind
+    //      comes before that list's upload) - under AFW the other eye's. It never reaches the snapshot; this eye's own upload, served
+    //      when it is replayed, does. Without this the AFW gate's "STALE camera" frames hand DLSS the other eye's camera.
+    if (!vpstorelogic::StoredSinceEval(g_t, *e)) {
+        const long long n = ++g_oldRefusedTotal;
+        if ((n & (n - 1)) == 0) {
+            // [PROBE: VPSTORE] gate=dlss_cbsnap.txt + dlss_mvfix.txt (g_cbSnap, g_mvFix)  site=HEADSET  log-only=no
+            LOG("[VPSTORE] OLD MATRIX NOT SERVED #%lld (logged at 1, 2, 4, 8 ...): buffer %p was stored %llu eval(s) ago - an earlier "
+                "upload (a command list binds its buffer before it uploads), so it does not reach the snapshot | GBuffer pass %ld",
+                n, const_cast<void*>(e->buf), g_t.evals - e->storedEval, g_inGbufferPass);
+        }
+        return;
+    }
     const int phase = FramePhaseOf(e->m);
     if (phase < 0) { ++g_noPhase; vpstorelogic::OnServeRefused(g_snapGuard, false); return; }   // not a jittered camera block (2026-10-20)
     const float* win = vpstorelogic::VoteAdd(g_vote, phase, e->m);
@@ -6751,8 +6781,9 @@ void STDMETHODCALLTYPE DetourReplayUnmap(ID3D11DeviceContext* ctx, ID3D11Resourc
             const UINT off = *reinterpret_cast<const UINT*>(rec + 0x10);
             const UINT size = *reinterpret_cast<const UINT*>(rec + 0x14);
             if (off == 0 && size >= sizeof(float) * 16) {
-                memcpy(e->m, rec + 0x20, sizeof(float) * 16);
-                e->have = true;
+                float m[16];
+                memcpy(m, rec + 0x20, sizeof(m));
+                vpstorelogic::StoreMatrix(g_t, *e, m);   // stamped with the eval count (StoredSinceEval)
                 ++g_stores;
                 if (!g_firstStoreSaid) {
                     g_firstStoreSaid = true;
@@ -6868,7 +6899,17 @@ void STDMETHODCALLTYPE HookedVSSetConstantBuffers(
     ID3D11DeviceContext* self, UINT StartSlot, UINT NumBuffers,
     ID3D11Buffer* const* ppConstantBuffers)
 {
-    g_origVSSetConstantBuffers(self, StartSlot, NumBuffers, ppConstantBuffers);
+    // [CTXSITE] re-entry during a site detour's foreign forward: the saved original only (see t_ctxInFwd).
+    if (t_ctxInFwd[3]) { g_origVSSetConstantBuffers(self, StartSlot, NumBuffers, ppConstantBuffers); return; }
+    // ALWAYS call through first. [CTXSITE]: to the entry a site detour handed us, if any; else the saved original, as before.
+    if (void* f = t_ctxFwd[3]) {
+        t_ctxFwd[3] = nullptr;
+        t_ctxInFwd[3] = true;
+        reinterpret_cast<VSSetConstantBuffersFn>(f)(self, StartSlot, NumBuffers, ppConstantBuffers);
+        t_ctxInFwd[3] = false;
+    } else {
+        g_origVSSetConstantBuffers(self, StartSlot, NumBuffers, ppConstantBuffers);
+    }
 
     // vpstore (fix A): the slot-2 buffer is tracked on EVERY bind - which buffer is bound decides which stored matrix a GBuffer
     // bind or the pass start serves. Before the GBuffer-only gate below on purpose. Not installed = one int compare.
@@ -16720,6 +16761,21 @@ bool ReadViewProj(ID3D11DeviceContext* ctx, int eye, float out[16])
             InterlockedIncrement(&g_vpRejected[eye]);
             return false;
         }
+        {   // FRESH-SERVE detector (2026-11-22, log only): the matrix this eval takes equals the previous eval's, bit for bit
+            static float s_prevTaken[16] = {};
+            static bool s_havePrevTaken = false;
+            if (s_havePrevTaken && memcmp(out, s_prevTaken, sizeof(s_prevTaken)) == 0) {
+                const long long n = ++vpstore::g_sameAsPrevTotal;
+                if ((n & (n - 1)) == 0) {
+                    // [PROBE: VPSTORE] gate=dlss_cbsnap.txt + dlss_mvfix.txt (g_cbSnap, g_mvFix)  site=HEADSET  log-only=yes
+                    LOG("[VPSTORE] EVAL TOOK THE PREVIOUS EVAL's MATRIX #%lld (logged at 1, 2, 4, 8 ...): eye %d - bit for bit the "
+                        "matrix the previous eval took (the AFW gate's STALE camera case; a still camera with no jitter also does it)",
+                        n, eye);
+                }
+            }
+            memcpy(s_prevTaken, out, sizeof(s_prevTaken));
+            s_havePrevTaken = true;
+        }
         InterlockedIncrement(&g_vpFromSnap[eye]);   // [MVSNAP] served from the snapshot
         InterlockedIncrement(&g_vpAccepted[eye]);
         InterlockedIncrement(&g_vpDepthHist[eye][0]);
@@ -17717,11 +17773,12 @@ void ModuleOfAddress(const void* p, char* out, size_t cap);   // below, with the
 namespace ctxsite {
 bool  g_wantFromBind = false;
 int   g_tried = 0;
-bool  g_patched[6] = {};
-void* g_seen[3][4] = {};   // the foreign entries already named, per slot (4 at most each); render thread only (INV-152)
-int   g_seenN[3] = {};
-long  g_foreignCalls[3] = {};
-const char* const kSlotName[3] = { "OMSetRenderTargets (slot 33)", "PSSetShaderResources (slot 8)", "RSSetViewports (slot 44)" };
+bool  g_patched[7] = {};
+void* g_seen[4][4] = {};   // the foreign entries already named, per slot (4 at most each); render thread only (INV-152)
+int   g_seenN[4] = {};
+long  g_foreignCalls[4] = {};
+const char* const kSlotName[4] = { "OMSetRenderTargets (slot 33)", "PSSetShaderResources (slot 8)", "RSSetViewports (slot 44)",
+                                   "VSSetConstantBuffers (slot 7)" };
 
 void NoteForeign(int i, void* cur, void* orig)
 {
@@ -17779,6 +17836,23 @@ void STDMETHODCALLTYPE SiteRSSetViewports(ID3D11DeviceContext* ctx, UINT n, cons
     t_ctxFwd[2] = nullptr;
 }
 
+// The replay's VS constant-buffer bind (case 35, +30C0E - the ONLY context VSSetConstantBuffers call in rd3d11, IDA vcb1). Our hook
+// latches the view-projection CB (g_vpCb) and tracks vpstore's bound slot-2 buffer: without it DLSS gets no camera term and the told
+// jitter falls back to the table (a tester's 1.06 log: matrix all zero, 288 of 288 reports). g_orig null = the hook was not installed
+// (dlss_mvfix off) -> the current entry, as the unpatched site.
+void STDMETHODCALLTYPE SiteVSSetConstantBuffers(ID3D11DeviceContext* ctx, UINT start, UINT n, ID3D11Buffer* const* b)
+{
+    void* cur = (*reinterpret_cast<void* const* const*>(ctx))[kVSSetConstantBuffersSlot];
+    if (cur == reinterpret_cast<void*>(&HookedVSSetConstantBuffers) || !g_origVSSetConstantBuffers) {
+        reinterpret_cast<VSSetConstantBuffersFn>(cur)(ctx, start, n, b);
+        return;
+    }
+    NoteForeign(3, cur, reinterpret_cast<void*>(g_origVSSetConstantBuffers));
+    t_ctxFwd[3] = cur;
+    HookedVSSetConstantBuffers(ctx, start, n, b);
+    t_ctxFwd[3] = nullptr;
+}
+
 #if defined(DLVR_CTXSITE_FAULT_TEST)
 // PROBE BUILD ONLY (CMake DLVR_CTXSITE_FAULT_TEST, src_beta/build_probe): with dlvr\ctxsite_fault_test.txt present, slots 33 / 8 / 44
 // are written back to the saved originals ONCE, here, before any frame - the tester's state - so the sites' foreign path runs on a
@@ -17793,11 +17867,12 @@ void FaultTest()
     int wrote = 0;
     if (on && g_context) {
         void** vt = *reinterpret_cast<void***>(g_context);
-        const int   slot[3] = { kOMSetRenderTargetsSlot, kPSSetShaderResourcesSlot, kRSSetViewportsSlot };
-        void* const orig[3] = { reinterpret_cast<void*>(g_origOMSetRenderTargets),
+        const int   slot[4] = { kOMSetRenderTargetsSlot, kPSSetShaderResourcesSlot, kRSSetViewportsSlot, kVSSetConstantBuffersSlot };
+        void* const orig[4] = { reinterpret_cast<void*>(g_origOMSetRenderTargets),
                                 reinterpret_cast<void*>(g_origPSSetShaderResources),
-                                reinterpret_cast<void*>(g_origRSSetViewports) };
-        for (int i = 0; i < 3; ++i) {
+                                reinterpret_cast<void*>(g_origRSSetViewports),
+                                reinterpret_cast<void*>(g_origVSSetConstantBuffers) };
+        for (int i = 0; i < 4; ++i) {
             if (!orig[i]) { continue; }   // that hook was not installed in this mode
             DWORD old = 0;
             if (!VirtualProtect(&vt[slot[i]], sizeof(void*), PAGE_READWRITE, &old)) { continue; }
@@ -17809,7 +17884,7 @@ void FaultTest()
     // [PROBE: CTXSITE] gate=the probe build (DLVR_CTXSITE_FAULT_TEST) + dlvr\ctxsite_fault_test.txt (logged either way, naming the path)  site=FLAT  log-only=no
     LOG("[CTXSITE] FAULT TEST (probe build, logged unconditionally): marker %s %s - %s",
         path, on ? "PRESENT" : "absent",
-        on ? (wrote ? "the context's vtable slots 33 / 8 / 44 were written back to the saved originals now, before any frame (the "
+        on ? (wrote ? "the context's vtable slots 33 / 8 / 44 / 7 were written back to the saved originals now, before any frame (the "
                       "tester's state). Expect one 'NOT our hook ... == the original saved at install' line per slot, then the GBuffer, "
                       "colour latch and AFW rebuild as usual."
                     : "NOTHING WRITTEN (no context, or no hook installed / VirtualProtect refused)")
@@ -17824,22 +17899,24 @@ void Install(const char* who)
     if (g_tried) { return; }
     g_tried = 1;
     struct Site { unsigned rva; int len; unsigned char b[9]; const char* name; };
-    static const Site kSite[6] = {
+    static const Site kSite[7] = {
         { 0x30940, 9, { 0x48, 0x8B, 0x01, 0xFF, 0x90, 0x08, 0x01, 0x00, 0x00 }, "+30943 OMSetRenderTargets (replay)" },
         { 0x3943A, 9, { 0x48, 0x8B, 0x01, 0xFF, 0x90, 0x08, 0x01, 0x00, 0x00 }, "+3943D OMSetRenderTargets (unbind)" },
         { 0x3AC74, 9, { 0x48, 0x8B, 0x01, 0xFF, 0x90, 0x08, 0x01, 0x00, 0x00 }, "+3AC77 OMSetRenderTargets (unbind)" },
         { 0x3AD0B, 9, { 0x48, 0x8B, 0x01, 0xFF, 0x90, 0x08, 0x01, 0x00, 0x00 }, "+3AD0E OMSetRenderTargets (unbind)" },
         { 0x30B70, 6, { 0x48, 0x8B, 0x01, 0xFF, 0x50, 0x40 },                   "+30B73 PSSetShaderResources (replay)" },
         { 0x3087A, 9, { 0x48, 0x8B, 0x01, 0xFF, 0x90, 0x60, 0x01, 0x00, 0x00 }, "+3087D RSSetViewports (replay)" },
+        { 0x30C0B, 6, { 0x48, 0x8B, 0x01, 0xFF, 0x50, 0x38 },                   "+30C0E VSSetConstantBuffers (replay)" },
     };
-    void* const to[6] = { reinterpret_cast<void*>(&SiteOMSetRenderTargets), reinterpret_cast<void*>(&SiteOMSetRenderTargets),
+    void* const to[7] = { reinterpret_cast<void*>(&SiteOMSetRenderTargets), reinterpret_cast<void*>(&SiteOMSetRenderTargets),
                           reinterpret_cast<void*>(&SiteOMSetRenderTargets), reinterpret_cast<void*>(&SiteOMSetRenderTargets),
-                          reinterpret_cast<void*>(&SitePSSetShaderResources), reinterpret_cast<void*>(&SiteRSSetViewports) };
+                          reinterpret_cast<void*>(&SitePSSetShaderResources), reinterpret_cast<void*>(&SiteRSSetViewports),
+                          reinterpret_cast<void*>(&SiteVSSetConstantBuffers) };
     HMODULE m = GetModuleHandleA("rd3d11_x64_rwdi.dll");
     unsigned char* base = reinterpret_cast<unsigned char*>(m);
-    bool bytesOk[6] = {};
+    bool bytesOk[7] = {};
     int n = 0;
-    for (int i = 0; i < 6; ++i) {
+    for (int i = 0; i < 7; ++i) {
         if (base) {
             __try { bytesOk[i] = memcmp(base + kSite[i].rva, kSite[i].b, static_cast<size_t>(kSite[i].len)) == 0; }
             __except (EXCEPTION_EXECUTE_HANDLER) { bytesOk[i] = false; }
@@ -17848,15 +17925,15 @@ void Install(const char* who)
         n += g_patched[i] ? 1 : 0;
     }
     char list[512] = {};
-    for (int i = 0; i < 6; ++i) {
+    for (int i = 0; i < 7; ++i) {
         char one[96];
         _snprintf_s(one, sizeof(one), _TRUNCATE, "%s%s %s", i ? " | " : "", kSite[i].name,
                     g_patched[i] ? "PATCHED" : !base ? "NO rd3d11" : !bytesOk[i] ? "bytes NOT AS EXPECTED" : "patch FAILED");
         strncat_s(list, sizeof(list), one, _TRUNCATE);
     }
     // [PROBE: CTXSITE] gate=none (once per process, logged unconditionally)  site=FLAT  log-only=no
-    LOG("[CTXSITE] rd3d11 setter call sites %s %d of 6 (logged unconditionally), from %s: rd3d11 %p | %s. A refused site keeps today's "
-        "vtable path. The patches stay until the game closes.", n == 6 ? "PATCHED" : n ? "PARTLY PATCHED" : "REFUSED", n, who,
+    LOG("[CTXSITE] rd3d11 setter call sites %s %d of 7 (logged unconditionally), from %s: rd3d11 %p | %s. A refused site keeps today's "
+        "vtable path. The patches stay until the game closes.", n == 7 ? "PATCHED" : n ? "PARTLY PATCHED" : "REFUSED", n, who,
         static_cast<void*>(m), list);
 #if defined(DLVR_CTXSITE_FAULT_TEST)
     FaultTest();
@@ -17903,6 +17980,7 @@ HRESULT WINAPI HookedD3D11CreateDevice(
     // [LOADBEARING: CTXSITE] where the context's vtable entries are not kept (a tester's PC: [DLSSC] "NO tonemap draw seen ... the
     //      GBuffer bind was never seen" for the whole session, STATE 2026-11-21 (60)) the GBuffer match, the HUD pass, the DLSS colour
     //      latch and with them the AFW rebuild run only because rd3d11's own call sites reach our hooks (ctxsite::Site*, above).
+    //      2026-11-22: the 7th site (+30C0E, VS constant buffers) carries the view-projection latch - DLSS's camera term and told jitter.
     //      Inside the device creation: no frame replayed yet, so no thread is executing the patched bytes.
     ctxsite::Install("device acquisition (before the first frame)");
     return hr;

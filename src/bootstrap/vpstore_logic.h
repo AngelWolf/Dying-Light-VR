@@ -18,6 +18,7 @@ struct Ent {
     bool have = false;                  // m holds a whole-buffer store of THIS buffer
     unsigned long long lastBound = 0;   // the table clock at its last bind
     unsigned long long liveWin = 0;     // the window it was last counted live in
+    unsigned long long storedEval = 0;  // the table's eval count when m was stored (2026-11-22, StoredSinceEval)
 };
 
 struct Table {
@@ -27,6 +28,7 @@ struct Table {
     unsigned long long window = 1;      // the 5 s window number
     long evicted = 0;                   // this window
     int live = 0;                       // distinct buffers bound this window
+    unsigned long long evals = 0;       // evals so far (NoteEval, one per eye eval) - 2026-11-22
 };
 
 inline Ent* Find(Table& t, const void* buf)
@@ -61,6 +63,20 @@ inline Ent* Bind(Table& t, const void* buf)
     }
     return e;
 }
+
+// FRESH SERVES ONLY (2026-11-22, trace docs/traces/20261122_1505_vpstore_fresh_serve.md). Every rd3d11 command list opens with a
+// bind of the context's slot-2 buffer BEFORE that list's upload (ida/rord1-rord4_rd3d11_out.txt), so at the bind the store still
+// holds the buffer's PREVIOUS upload - under AFW the other eye's, one frame old; with the doubled AFW table it carries this frame's
+// phase and lands in this frame's vote bucket (the AFW gate's "STALE camera" frames). An entry may be served only when its matrix
+// was stored since the most recent eval: this eye's own uploads always are (they are replayed after the other eye's eval).
+inline void NoteEval(Table& t) { ++t.evals; }
+inline void StoreMatrix(Table& t, Ent& e, const float* m)
+{
+    for (int i = 0; i < 16; ++i) { e.m[i] = m[i]; }
+    e.have = true;
+    e.storedEval = t.evals;
+}
+inline bool StoredSinceEval(const Table& t, const Ent& e) { return e.have && e.storedEval == t.evals; }
 
 // 2026-10-20 (docs/superpowers/specs/2026-10-20-vpstore-jittered-only-design.md): does a block's jitter offset (render px, from
 // realjit::Offsets) equal a phase of the active jitter table (n entries of x, y)? Worker-context blocks carry NO jitter (INV-560)

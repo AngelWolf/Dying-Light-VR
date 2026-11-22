@@ -398,6 +398,62 @@ static void refusal_reports_the_pass()
     CHECK(g.lastPass.serves == 0 && g.lastPass.vtable == 0 && g.lastPass.noPhase == 2 && g.lastPass.noData == 1);
 }
 
+// ===== Fresh serves only (2026-11-22, docs/traces/20261122_1505_vpstore_fresh_serve.md) =====
+// Before any eval, a store is fresh (the first pass of the session).
+static void store_before_first_eval_is_fresh()
+{
+    Reset();
+    float a[16];
+    Mat(a, 1.0f);
+    Ent* e = Bind(g_t, P(1));
+    StoreMatrix(g_t, *e, a);
+    CHECK(StoredSinceEval(g_t, *e));
+    CHECK(e->have && e->m[0] == 1.0f);
+}
+
+// THE CASE: a buffer stored in the previous eye's pass, bound again (a list's opening bind) after that eye's eval - old.
+static void store_before_eval_is_old_after_it()
+{
+    Reset();
+    float a[16];
+    Mat(a, 1.0f);
+    Ent* e = Bind(g_t, P(1));
+    StoreMatrix(g_t, *e, a);   // eye A's upload
+    NoteEval(g_t);             // eye A's eval
+    e = Bind(g_t, P(1));       // eye B's list opens: the bind, before its own upload
+    CHECK(e && !StoredSinceEval(g_t, *e));
+    CHECK(e && e->have);       // the bytes are still there - only no longer served
+    StoreMatrix(g_t, *e, a);   // eye B's own upload
+    CHECK(StoredSinceEval(g_t, *e));
+}
+
+// AFW frames 0..19 with one eval each: an upload in a frame is fresh until that frame's eval, old after it.
+static void every_frame_own_upload_fresh()
+{
+    Reset();
+    float a[16];
+    Mat(a, 1.0f);
+    int fresh = 0, old = 0;
+    for (int f = 0; f < 20; ++f) {
+        Ent* e = Bind(g_t, P(1));                     // the opening bind
+        if (StoredSinceEval(g_t, *e)) { ++fresh; } else { ++old; }
+        StoreMatrix(g_t, *e, a);                      // the upload
+        CHECK(StoredSinceEval(g_t, *e));
+        NoteEval(g_t);
+    }
+    CHECK(fresh == 0);    // every opening bind sees the previous frame's upload (frame 0: nothing stored yet, have false)
+    CHECK(old == 20);
+}
+
+// A new / evicted entry carries no matrix and is never fresh.
+static void new_entry_never_fresh()
+{
+    Reset();
+    NoteEval(g_t);
+    Ent* e = Bind(g_t, P(7));
+    CHECK(e && !e->have && !StoredSinceEval(g_t, *e));
+}
+
 int main()
 {
     find_misses_unknown();
@@ -426,6 +482,10 @@ int main()
     sustained_burst_refuses_first_only();
     run_resets_on_own_write();
     longest_is_window_max();
+    store_before_first_eval_is_fresh();
+    store_before_eval_is_old_after_it();
+    every_frame_own_upload_fresh();
+    new_entry_never_fresh();
     std::printf("%s (%d failure(s))\n", g_fail ? "FAILED" : "ALL PASS", g_fail);
     return g_fail;
 }
