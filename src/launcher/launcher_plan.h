@@ -73,6 +73,18 @@ inline bool IsModData3(const std::string& md5)
     return md5 == kFixedData3Md5 || md5 == "394248e75c65b83ad2f26151a9b3566a";   // 1.0 - 1.065
 }
 
+// Which game-folder paths the scan (launcher_sys.cpp Detect) keeps - lower-case, forward slashes. EVERY folder a release puts a file in must be
+// here: Remove, switch to flat and Update's keep-previous only act on what the scan saw (1.07 is the first with DW\Data files).
+inline bool ScanWants(const std::string& r)
+{
+    const auto directlyIn = [&r](const char* dir) {
+        const std::string d = dir;
+        return r.compare(0, d.size(), d) == 0 && r.find('/', d.size()) == std::string::npos;
+    };
+    return r.find('/') == std::string::npos || r.compare(0, 5, "dlvr/") == 0 || directlyIn("dw/") || directlyIn("dw/data/") ||
+           directlyIn("dw_dlc24/");
+}
+
 }  // namespace detail
 
 // Empty + *refusal set = nothing may be done (the reason is for the user, naming what to do).

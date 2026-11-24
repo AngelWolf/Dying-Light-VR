@@ -162,6 +162,24 @@ int main()
         CHECK(IndexOf(f, LAct::Delete, "DW/Data3.pak") < 0 && IndexOf(f, LAct::Delete, "LibOVRRT64_1.dll") < 0);
         CHECK(IndexOf(f, LAct::Delete, "dlvr_ovr2xr.log") >= 0 && f.back().relPath == "dlvr/");
     }
+    {   // the scan keeps every folder a release puts a file in (trace 20261124_2135: 1.07's DW\Data files were left by uninstall / flat)
+        for (const char* p : {"libovrrt64_1.dll", "dlvr/calib/title.png", "dw/data3.pak", "dw_dlc24/datadlc24_2.pak", "dw/data/common_textures_3_pc.rpack",
+                              "dw/data/optimized_dlc29_dx11.mp", "dw/data/dlvr_prompts_pc.rpack", "dw", "dw/data"}) {
+            CHECK(detail::ScanWants(p));
+        }
+        for (const char* p : {"dw/data/sub/file.bin", "dw_dlc24/data/file.bin", "dw_dlc17/datadlc17_2.pak", "other/file.txt", "dw/menu/file.bin"}) {
+            CHECK(!detail::ScanWants(p));
+        }
+        // Remove with a DW/Data release file: ours goes, the game's own neighbour is never named
+        Release r2 = r;
+        r2.files.push_back({kOurs, "DW/Data/dlvr_prompts_PC.rpack", false});
+        DetectedState s;
+        s.modPresent = true;
+        s.present = {"libovrrt64_1.dll", "dw/data/dlvr_prompts_pc.rpack", "dw/data/menu_common_pc.rpack"};
+        const auto a = PlanLauncherRemove(s, r2, {}, false);
+        CHECK(IndexOf(a, LAct::Delete, "DW/Data/dlvr_prompts_PC.rpack") >= 0);
+        for (const auto& x : a) { CHECK(x.relPath.find("menu_common") == std::string::npos); }
+    }
     std::printf("launcher_plan_test: %d failure(s)\n", g_fail);
     return g_fail;
 }
