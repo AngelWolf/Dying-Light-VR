@@ -408,8 +408,49 @@ static void TestSegClosest()
     Check(Near(o[0], 1.0, 1e-6), "SegClosest clamps past the end");
 }
 
+// THE FREE LIFT (trace 20261122_1830): the rigid inverse round-trips, a hand-carried pose reproduces itself, the ring distance is right
+// on, inside and above the rim, and the let-go opens only past 0.20 m.
+static void TestFreeLift()
+{
+    // a rigid 3x4: 30 deg about z, translated
+    const double a = 30.0 * 3.14159265358979 / 180.0;
+    const float M[12] = { static_cast<float>(std::cos(a)), static_cast<float>(-std::sin(a)), 0.0f, 0.4f,
+                          static_cast<float>(std::sin(a)), static_cast<float>(std::cos(a)), 0.0f, -1.2f,
+                          0.0f, 0.0f, 1.0f, 0.9f };
+    float Mi[12], I[12];
+    lh::InvRigid34(M, Mi);
+    lh::Compose34(Mi, M, I);
+    const float id[12] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0 };
+    double worst = 0.0;
+    for (int k = 0; k < 12; ++k) { worst = std::fmax(worst, std::fabs(I[k] - id[k])); }
+    Check(worst < 1e-5, "InvRigid34 . M == identity");
+    // the carry: rel = inv(D0) . W0; with the hand still (D = D0), W = D . rel reproduces W0
+    const float D0[12] = { 0, -1, 0, 1.5f, 1, 0, 0, 0.2f, 0, 0, 1, 1.1f };
+    float D0i[12], rel[12], W[12];
+    lh::InvRigid34(D0, D0i);
+    lh::Compose34(D0i, M, rel);
+    lh::Compose34(D0, rel, W);
+    worst = 0.0;
+    for (int k = 0; k < 12; ++k) { worst = std::fmax(worst, std::fabs(W[k] - M[k])); }
+    Check(worst < 1e-5, "D0 . (inv(D0) . W0) == W0 (a still hand leaves the cover where it was)");
+    // the ring (the basket's rim: radius 0.358 m, normal z)
+    const float c[3] = { 0, 0, 0 }, n[3] = { 0, 0, 1 };
+    const float on[3] = { 0.358f, 0, 0 }, centre[3] = { 0, 0, 0 }, above[3] = { 0, 0.358f, 0.1f }, out[3] = { 0.558f, 0, 0 };
+    Check(Near(lh::RingDist(c, n, 0.358f, on), 0.0, 1e-6), "RingDist on the rim = 0");
+    Check(Near(lh::RingDist(c, n, 0.358f, centre), 0.358, 1e-6), "RingDist at the centre = the radius");
+    Check(Near(lh::RingDist(c, n, 0.358f, above), 0.1, 1e-6), "RingDist 0.1 m above a rim point = 0.1");
+    Check(Near(lh::RingDist(c, n, 0.358f, out), 0.2, 1e-6), "RingDist 0.2 m outside the rim = 0.2");
+    // the let-go rule
+    const float rest[3] = { 1.0f, 2.0f, 0.9f };
+    const float lifted[3] = { 1.0f, 2.0f, 1.15f }, nudged[3] = { 1.05f, 2.0f, 0.95f };
+    Check(lh::FreeLiftOpens(rest, lifted), "a 0.25 m lift opens");
+    Check(!lh::FreeLiftOpens(rest, nudged), "a 0.07 m nudge goes back on");
+    Check(!lh::FreeLiftOpens(rest, rest), "no movement goes back on");
+}
+
 int main()
 {
+    TestFreeLift();
     TestClipStick(false);
     TestClipStick(true);
     TestClipEase();

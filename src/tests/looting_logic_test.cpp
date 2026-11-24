@@ -659,8 +659,24 @@ static void late_wait_then_a_torso_press_still_arms()
     CHECK(Is(o.event, "ARM"));
 }
 
+// 2026-11-22 (71): the search's Square is a start tap under every X hold (Survivor Sense 0.5 s, the shortest 0.3 s) while the lookup
+// hold is live; without it, the whole search as before; never outside a search.
+static void square_is_a_start_tap_with_the_lookup_hold()
+{
+    static_assert(looting::kSearchTapS < 0.3, "the tap must stay under the shortest X hold (FORCE_RESPAWN 0.3 s)");
+    CHECK(looting::SquareForSearch(true, 0.0, true));
+    CHECK(looting::SquareForSearch(true, 0.149, true));
+    CHECK(!looting::SquareForSearch(true, 0.15, true));
+    CHECK(!looting::SquareForSearch(true, 0.5, true));     // Survivor Sense's hold is never reached
+    CHECK(!looting::SquareForSearch(true, -1.0, true));    // no start seen
+    CHECK(looting::SquareForSearch(true, 5.0, false));     // no lookup hold: X for the whole search
+    CHECK(!looting::SquareForSearch(false, 0.0, true));
+    CHECK(!looting::SquareForSearch(false, 0.0, false));
+}
+
 int main()
 {
+    square_is_a_start_tap_with_the_lookup_hold();
     late_reading_arms_a_drag();
     late_reading_none_is_a_no_arm();
     late_reading_times_out();

@@ -53,6 +53,7 @@
 #include "throwable.h"
 #include "looting.h"    // loot by hand (spec 2026-10-23-loot-by-hand-design): LootPoll / LootPadByte, the loot_* settings
 #include "lidhand.h"    // hand-open lids (spec 2026-11-18-hand-open-lids-design): LidHandPoll, the lid_* settings
+#include "promptquad.h" // the in-world prompt (trace 20261123_1356): the inworld_prompts setting
 #include "bodygrab.h"   // body grab (plan 2026-10-23-body-grab): BodyGrabHandActive - the trigger bytes; the body_grab_* settings
 #include "camogesture.h"   // the camouflage gesture (plan 2026-11-07-camouflage-gesture): the camo_* settings
 #include "breakout.h"   // physical breakout (plan 2026-10-24-physical-breakout): BreakoutPoll; the breakout_* settings
@@ -713,14 +714,18 @@ bool  g_fovCenterCorrect = false;  // declaring != rendered warps the image
 // half-angle so no field of view is lost, and render some that sits outside the
 // lens - but it keeps the game's maths on ground it was written for, and
 // fov_center_correct puts the image back in the right place at submit time.
-int   g_symmetricFov = 2;
+// COMPILED 0 since 2026-11-24 (Jay: ships 0 in 1.07 - "That was the reason I wanted you to make sure it would work regardless of
+// runtime, headset, etc."; trace docs/traces/20261124_2030_symfov0_default.md): every off-centre path reads each eye's matrix (STATE
+// (170)-(194)). The text above is the original rationale for 2. DEV stays 2 (it has none of the off-centre work).
+int   g_symmetricFov = 0;
 
 // [LOADBEARING: FOV-META-OWN-FOV] Meta's PC OpenXR runtime (Quest Link / Air Link) shows each eye's image over ITS OWN FOV,
 //      whatever fov the projection view declares (Venture PR #79 on "Oculus" 1.208.0), so the symmetric superset lands squeezed
 //      and off-centre = the cross-eye + jitter a tester reported at symmetric_fov=2, both gone at 0 (Jay 2026-11-16: "A"; trace
-//      docs/traces/20261116_1835_meta_runtime_symmetric_fov.md). Set once in ovr_Create from the runtime's name; every reader of
-//      the mode goes through SymmetricFovMode(). The setting itself (file, config: dump) is never rewritten. VDXR / SteamVR keep
-//      the setting (D-265: 0 misaligns the eyes on VDXR).
+//      docs/traces/20261116_1835_meta_runtime_symmetric_fov.md). Set once in ovr_Create from the runtime's name. Since 2026-11-24 (Jay:
+//      "Go ahead with 1"; trace 20261124_1550_meta_panel_crop.md) it no longer forces symmetric_fov to 0: ovr_SubmitFrame cuts each view
+//      to that runtime's own FOV window (SteamVrPanelCrop, ownFov), so the game renders what it renders on VDXR and AFW can run.
+//      Removing the cut there puts the cross-eye back.
 bool  g_runtimeStretchesFov = false;
 // The runtime's name starts "SteamVR/OpenXR" (menuchord::RuntimeIsSteamVr) - set once in ovr_Create, before the first pad poll.
 // SteamVR takes the left Touch menu button (Jay 2026-11-18: "SteamVR eats the input"), so there the X + Y chord is the menu
@@ -729,7 +734,7 @@ bool  g_runtimeIsSteamVr = false;
 
 int SymmetricFovMode()
 {
-    return dlvr::eyefov::EffectiveSymmetric(g_symmetricFov, g_runtimeStretchesFov);
+    return g_symmetricFov;   // the setting on every runtime (Meta's too since 2026-11-24 - see g_runtimeStretchesFov)
 }
 
 // Where the FOV we hand the game comes from.
@@ -869,7 +874,7 @@ XrPosef PitchPose(const XrPosef& p, float degrees)
 
 ovrFovPort SymmetriseFov(ovrFovPort f)
 {
-    const int mode = SymmetricFovMode();   // 0 on Meta's runtime (FOV-META-OWN-FOV)
+    const int mode = SymmetricFovMode();
     if (mode >= 1) {
         const float v = (f.UpTan > f.DownTan) ? f.UpTan : f.DownTan;
         f.UpTan = v;
@@ -1832,8 +1837,8 @@ const Setting kSettings[] = {
            "the controllers; turn a hand away and its pieces fade out. Needs Alternate Frame Warp on. Takes effect at the next "
            "launch."),
     S_ENUM("ui_wrist_preset", UiWristPreset, "Wrist HUD layout", "VR Comfort",
-           "A: minimap and quest list on the back of the right hand, health on the back of the left, the weapon boxes above the "
-           "palms. B: health and minimap on the left wrist, both weapon boxes on the right wrist, no quest list. Custom: your own.",
+           "A: minimap on the left hand; health, quest list and quick item on the left forearm; weapon on the right forearm. "
+           "B: health and minimap on the left wrist, both weapon boxes on the right wrist, no quest list. Custom: your own.",
            kWristPreset),
     S_FLOAT("ui_wrist_size", UiWristSize, 0.3f, 3.0f, "Wrist HUD size", "VR Comfort",
             "The size of every piece on the hands. 1.0 = the minimap about 9 cm wide. Live."),
@@ -2112,6 +2117,20 @@ const Setting kSettings[] = {
            "nothing on these containers while this is on. HEADSET only."),
     S_FLOAT("lid_open_frac", dlvr::LidOpenFrac, 0.1f, 0.9f, "Lid: open point (fraction)", "Controller Bindings",
             "How far the lid must be swung, as a share of its full opening, before the game opens the container."),
+    // group "VR Comfort" = BETA keeps the text; the HUD tab draws these three (overlay.cpp TabForSetting / DrawHudTab, trace 20261123_1730)
+    S_BOOL("inworld_prompts", dlvr::InworldPrompts, "Prompts in the world", "VR Comfort",
+           "trace 20261123_1356. The game's interaction prompt (Open, Take, Search, Use, Talk ...) is also shown as a small panel "
+           "in the world, just above the object, facing you, in the game's own words and language. Doors, switches, containers, "
+           "items and bodies show the grip icon; people, traders, lockpicking and breaking doors show X. Needs \"Loot by hand\" "
+           "installed and the two prompt files in DW\\Data. HEADSET only."),
+    S_FLOAT("ui_prompt_brightness", dlvr::InworldPromptBrightness, 0.05f, 4.0f, "Prompts in the world: brightness", "VR Comfort",
+            "trace 20261123_1700. How bright the in-world prompt is (the game's prompt multiplied by this). Takes effect at once."),
+    S_FLOAT("ui_prompt_size", dlvr::InworldPromptSize, 0.25f, 4.0f, "Prompts in the world: size", "VR Comfort",
+            "trace 20261123_1700. How big the in-world prompt is: 1.0 = a one-line prompt about 15 cm wide. The same size on every "
+            "headset. Takes effect at once."),
+    S_FLOAT("ui_prompt_plate", dlvr::InworldPromptPlate, 0.0f, 1.0f, "Prompts in the world: backing", "VR Comfort",
+            "trace 20261123_1830. How dark the backing behind the in-world prompt is: 1.0 = as the game darkens behind its own prompt, "
+            "0 = none. Takes effect at once."),
     S_BOOL("body_grab", dlvr::BodyGrab, "Grab bodies by hand", "Controller Bindings",
            "Needs \"Loot by hand\" on. Squeeze a grip with your hand on a dead body away from its torso - an arm, a leg, the "
            "head - and that part follows your hand while the rest drags behind. On the torso, a still hand loots as before; "
@@ -6655,7 +6674,7 @@ const Setting kSettings[] = {
           "NVIDIA PCSS on. Installs on first use; set it before loading a level."),
     S_INT("shadow_stagger_first", ShadowStaggerFirst, 1, 3,
           "Shadow stagger: first staggered cascade", "Camera hook",
-          "Cascades below this index render every frame. 2 = cascades 0 and 1 every frame."),
+          "Cascades below this index render every frame. 1 (default) = only cascade 0 every frame; 2 = cascades 0 and 1."),
     S_BOOL("lens_mask", LensMask,
            "Lens mask (skip pixels the headset cannot show)", "Camera hook",
            "VR only. Each eye's pixels outside what the headset can display (its own field of view plus the margin "
@@ -7190,7 +7209,7 @@ ovrFovPort GameEyeFov(Session* s, int idx, const char** srcOut)
     //      draws the held eye with the FRESH eye's projection (dlssflat.cpp AfwRebuildRun, INV-597), so two different
     //      frustums put every rebuilt frame off in zoom - 1.9 % on the Steam Frame (eye0 1.7260 / eye1 1.6938). Mirror-image
     //      headsets compute identical frustums here and are unchanged. Modes 0 / 1 hand over deliberately mirrored frustums
-    //      and are left alone. SymmetricFovMode(): Meta's runtime reads 0 here (FOV-META-OWN-FOV).
+    //      and are left alone.
     if (SymmetricFovMode() >= 2) {
         const ovrFovPort o = OwnEyeFov(s, 1 - (idx & 1), nullptr);
         const dlvr::eyefov::Tans own{ f.LeftTan, f.RightTan, f.UpTan, f.DownTan };
@@ -8595,6 +8614,7 @@ void HiccupFrame(Session* s, double endMs, bool haveDecl, const XrQuaternionf& d
 // ============================================================================
 
 namespace vsyncoff { void PatchEngineVsyncStore(); void PatchFrameLimiter(); void LogRecordOnce(); }   // defined with the rest of vr_force_vsync_off, below
+namespace vrresblock { void PatchResolutionSetters(); }   // the video-options Apply cannot change the size in VR - defined after vsyncoff
 
 OVR_PUBLIC_FUNCTION(ovrResult) ovr_Initialize(const ovrInitParams* params)
 {
@@ -8723,14 +8743,14 @@ OVR_PUBLIC_FUNCTION(ovrResult) ovr_Create(ovrSession* pSession, ovrGraphicsLuid*
             LOG("runtime: %s %u.%u.%u", ip.runtimeName,
                 XR_VERSION_MAJOR(ip.runtimeVersion), XR_VERSION_MINOR(ip.runtimeVersion),
                 XR_VERSION_PATCH(ip.runtimeVersion));
-            // [LOADBEARING: FOV-META-OWN-FOV] the runtime's name decides the symmetric_fov mode used; logged either way.
+            // [LOADBEARING: FOV-META-OWN-FOV] the runtime's name decides whether each view is cut to its own window; logged either way.
             g_runtimeStretchesFov = dlvr::eyefov::RuntimeStretchesToOwnFov(ip.runtimeName);
             g_runtimeIsSteamVr = dlvr::menuchord::RuntimeIsSteamVr(ip.runtimeName);
             LOG("symmetric_fov: file value %d -> using %d (runtime \"%s\" %s)", g_symmetricFov, SymmetricFovMode(),
                 ip.runtimeName,
                 g_runtimeStretchesFov
-                    ? "= Meta's runtime, which shows the image over its own FOV - the runtime's own frustum is used, not symmetrised"
-                    : "keeps the setting");
+                    ? "= Meta's runtime, which shows the image over its own FOV - each eye is submitted as that runtime's own window"
+                    : "shows the declared FOV");
         } else {
             LOG("runtime: xrGetInstanceProperties failed");
             g_runtimeStretchesFov = false;
@@ -8813,6 +8833,7 @@ OVR_PUBLIC_FUNCTION(ovrResult) ovr_Create(ovrSession* pSession, ovrGraphicsLuid*
     g_session = s;
     *pSession = reinterpret_cast<ovrSession>(s);
     vsyncoff::PatchFrameLimiter();   // VR confirmed here (flat fails above with no HMD); once per process
+    vrresblock::PatchResolutionSetters();   // same: VR only, once per process, before any menu exists
     LOG("ovr_Create OK (session=%p)", s);
     return ovrSuccess;
 }
@@ -9732,6 +9753,106 @@ void LogRecordOnce()
 
 }  // namespace vsyncoff
 
+// ============================================================================
+//  VR RESOLUTION BLOCK - a video-options Apply cannot change the screen size in VR (2026-11-24, Jay: "Yes, build it").
+//  Trace docs/traces/20261124_1840_vr_resolution_block.md; STATE (196). Static, our engine e9fbfc2c / gamedll 97046bba.
+// ============================================================================
+// WHY: in VR the live size is the headset's (the Oculus bring-up +2E6010 replaces video.scr's Resolution at load). The video
+// menu's current-mode lookup (ITools +0x770 -> engine +261220) finds that size in no monitor mode -> -1; its list (modes of
+// width >= 1024, gamedll +12A2760) then selects item 0 by default (+1174A30) = 1024x768 on a typical monitor, and every Apply
+// sees "selected != current" and calls ITools::SetResolutionMode (gamedll +12A49D0). ApplyChanges (+23EF50) then re-creates the
+// renderer at 1024x768 and the menu is rebuilt for it, drawn into the eye image = the huge menu. A restart fixes it because the
+// VR save keeps the file's resolution (helper +8) and the bring-up runs again.
+// WHAT: two 2-byte jumps, once at ovr_Create OK (VR only - flat fails ovr_Create): ITools::SetResolution (+2609E0) skips its
+// two stores to its ret; ITools::SetResolutionMode (+260A00) skips its two stores AND its notify tail call (+2FE6F0, which
+// writes the 2D screen globals) to its epilogue. Each is byte-checked first with no rip-relative byte in the check (the Epic
+// build's identical code passes the same check through buildrva); anything else REFUSES by name and leaves it alone.
+// Callers (all read): the menu Apply +12A49D0, RevertResolutionChange +11FC5A0, SetRes1024 / SetRes800 +11FC710 / +11FC790,
+// the safe-mode defaults +1112DD0; none reads the return. The engine never calls them itself (uir33).
+// COST: once per process; nothing per frame.
+namespace vrresblock {
+
+constexpr uintptr_t     kSetResRva = 0x2609E0;    // ITools slot 211 (+0x698) SetResolution(w, h)
+constexpr uintptr_t     kSetModeRva = 0x260A00;   // ITools slot 212 (+0x6A0) SetResolutionMode(mode, bpp)
+// SetResolution: +07 mov rcx,[rax+0C0h] / +0E mov [rcx+18h],edx / +11 mov [rcx+1Ch],r8d / +15 ret
+const unsigned char     kSetResExpect[15] = { 0x48, 0x8B, 0x88, 0xC0, 0x00, 0x00, 0x00, 0x89, 0x51, 0x18, 0x44, 0x89, 0x41, 0x1C, 0xC3 };
+constexpr size_t        kSetResCheckOff = 0x07;
+constexpr size_t        kSetResPatchOff = 0x0E;
+const unsigned char     kSetResPatch[2] = { 0xEB, 0x05 };   // jmp +5: from +10 to the ret at +15
+// SetResolutionMode: +30 test al,al / +32 jz +3A / +34 mov [rbx+18h],ecx / +37 mov [rbx+1Ch],edx ... +57 add rsp,40h / pop rbx / ret
+const unsigned char     kSetModeExpect[10] = { 0x84, 0xC0, 0x74, 0x06, 0x89, 0x4B, 0x18, 0x89, 0x53, 0x1C };
+constexpr size_t        kSetModeCheckOff = 0x30;
+const unsigned char     kSetModeEpilogue[6] = { 0x48, 0x83, 0xC4, 0x40, 0x5B, 0xC3 };
+constexpr size_t        kSetModeEpiOff = 0x57;
+constexpr size_t        kSetModePatchOff = 0x30;
+const unsigned char     kSetModePatch[2] = { 0xEB, 0x25 };  // jmp +25h: from +32 to the epilogue at +57
+volatile LONG           g_done = 0;
+
+// One site: verify the check window(s), then write the 2-byte jump. Returns a short verdict for the summary line.
+const char* PatchSite(unsigned char* fn, const char* what, uintptr_t rva, size_t checkOff, const unsigned char* expect,
+                      size_t nExpect, size_t epiOff, const unsigned char* epi, size_t nEpi, size_t patchOff,
+                      const unsigned char* patch)
+{
+    unsigned char got[16] = {};
+    unsigned char gotEpi[8] = {};
+    __try {
+        memcpy(got, fn + checkOff, nExpect);
+        if (epi) { memcpy(gotEpi, fn + epiOff, nEpi); }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // [PROBE: RESBLOCK] gate=none (always, VR) site=HEADSET log-only=no
+        LOG("[RESBLOCK] *** REFUSED %s: engine+0x%llX is not readable - Apply CAN still change the size this session ***", what,
+            static_cast<unsigned long long>(rva));
+        return "REFUSED (unreadable)";
+    }
+    if (memcmp(got, expect, nExpect) != 0 || (epi && memcmp(gotEpi, epi, nEpi) != 0)) {
+        char hex[3 * 24 + 1] = {};
+        size_t at = 0;
+        for (size_t i = 0; i < nExpect && at + 3 < sizeof(hex); ++i) {
+            at += static_cast<size_t>(_snprintf_s(hex + at, sizeof(hex) - at, _TRUNCATE, "%02X ", got[i]));
+        }
+        // [PROBE: RESBLOCK] gate=none (always, VR) site=HEADSET log-only=no
+        LOG("[RESBLOCK] *** REFUSED %s: engine+0x%llX +0x%zX holds %s- not the expected bytes (a different engine build?); "
+            "Apply CAN still change the size this session ***", what, static_cast<unsigned long long>(rva), checkOff, hex);
+        return "REFUSED (bytes)";
+    }
+    DWORD old = 0;
+    if (!VirtualProtect(fn + patchOff, 2, PAGE_EXECUTE_READWRITE, &old)) {
+        // [PROBE: RESBLOCK] gate=none (always, VR) site=HEADSET log-only=no
+        LOG("[RESBLOCK] *** REFUSED %s: VirtualProtect on engine+0x%llX failed (%lu) - Apply CAN still change the size ***", what,
+            static_cast<unsigned long long>(rva + patchOff), GetLastError());
+        return "REFUSED (protect)";
+    }
+    memcpy(fn + patchOff, patch, 2);   // ovr_Create OK: no menu exists yet, nothing executes these two functions now
+    VirtualProtect(fn + patchOff, 2, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), fn + patchOff, 2);
+    return "patched";
+}
+
+void PatchResolutionSetters()
+{
+    if (InterlockedCompareExchange(&g_done, 1, 0) != 0) { return; }
+    auto* base = reinterpret_cast<unsigned char*>(GetModuleHandleA("engine_x64_rwdi.dll"));
+    if (!base) {
+        // [PROBE: RESBLOCK] gate=none (always, VR) site=HEADSET log-only=no
+        LOG("[RESBLOCK] *** REFUSED: engine_x64_rwdi.dll is not loaded - Apply CAN still change the size this session ***");
+        return;
+    }
+    const uintptr_t resRva = ::dlvr::buildrva::Eng(kSetResRva);     // the Epic rva on EGL (buildrva_table.h), else Steam
+    const uintptr_t modeRva = ::dlvr::buildrva::Eng(kSetModeRva);
+    const char* a = PatchSite(base + resRva, "SetResolution", resRva, kSetResCheckOff, kSetResExpect, sizeof(kSetResExpect),
+                              0, nullptr, 0, kSetResPatchOff, kSetResPatch);
+    const char* b = PatchSite(base + modeRva, "SetResolutionMode", modeRva, kSetModeCheckOff, kSetModeExpect,
+                              sizeof(kSetModeExpect), kSetModeEpiOff, kSetModeEpilogue, sizeof(kSetModeEpilogue),
+                              kSetModePatchOff, kSetModePatch);
+    // [PROBE: RESBLOCK] gate=none (always, VR) site=HEADSET log-only=no
+    LOG("[RESBLOCK] engine build %s: ITools::SetResolution engine+0x%llX %s, ITools::SetResolutionMode engine+0x%llX %s - "
+        "in VR a video-options Apply keeps the headset size (shadows, draw distance and the rest still apply)",
+        ::dlvr::buildrva::BuildName(::dlvr::buildrva::ModuleBuild(::dlvr::buildrva::kEngine)),
+        static_cast<unsigned long long>(resRva), a, static_cast<unsigned long long>(modeRva), b);
+}
+
+}  // namespace vrresblock
+
 // ===== [EYEALPHA] - what ALPHA does the eye image carry when the compositor gets it? (2026-10-18, Jay: "Sure") =====
 // The game's projection layer is submitted with XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT (the layer build
 // below), so a runtime may blend any texel whose alpha < 1. Two SteamVR testers see AFW-only warping / glitches that Jay's
@@ -10215,6 +10336,10 @@ OVR_PUBLIC_FUNCTION(void) ovr_DestroyMirrorTexture(ovrSession session, ovrMirror
 // at symmetric_fov=2, correct with the SteamVR dashboard open. Called AFTER the wrist HUD, the lens mask and lsVp took the
 // uncropped values (they describe the whole image). COST: a bitwise compare of the cached inputs per eye per submit; on a change
 // 8 tan + 4 atan.
+// META'S RUNTIME (ownFov; Jay 2026-11-24 "Go ahead with 1"; trace docs/traces/20261124_1550_meta_panel_crop.md): it spreads the submitted
+// rectangle over its OWN FOV, so it gets the same cut. Two differences: a pitched pose does not stop it (the window is cut in the image's
+// own frame and declared at the image's pose - what that runtime was given before), and a panel past the image is zoomed to fit
+// (CropScaled) instead of left whole.
 namespace {
 struct PanelCropCache {
     bool                    have = false;
@@ -10238,11 +10363,11 @@ const char* PanelCropGateName(int gate)
     }
 }
 
-void SteamVrPanelCrop(int e, XrCompositionLayerProjectionView& pv, const XrFovf& panel, float pitchDeg, bool haveGameFov)
+void SteamVrPanelCrop(int e, XrCompositionLayerProjectionView& pv, const XrFovf& panel, float pitchDeg, bool haveGameFov, bool ownFov)
 {
     if (e < 0 || e > 1) { return; }
     PanelCropCache& c = g_pcCache[e];
-    const int gate = fabsf(pitchDeg) >= 0.01f ? kPcGatePitched
+    const int gate = (!ownFov && fabsf(pitchDeg) >= 0.01f) ? kPcGatePitched
                    : (g_fovCenterCorrect ? kPcGateCentre : (!haveGameFov ? kPcGateNoGameFov : -1));
     const XrRect2Di& vp = pv.subImage.imageRect;
     const bool same = c.have && c.gate == gate && memcmp(&c.img, &pv.fov, sizeof(XrFovf)) == 0 &&
@@ -10254,16 +10379,17 @@ void SteamVrPanelCrop(int e, XrCompositionLayerProjectionView& pv, const XrFovf&
         c.vp = vp;
         c.gate = gate;
         if (gate < 0) {
-            c.res = ::dlvr::fovcrop::Crop(::dlvr::fovcrop::Fov{ pv.fov.angleLeft, pv.fov.angleRight, pv.fov.angleUp, pv.fov.angleDown },
-                                          ::dlvr::fovcrop::Fov{ panel.angleLeft, panel.angleRight, panel.angleUp, panel.angleDown },
-                                          ::dlvr::fovcrop::Rect{ vp.offset.x, vp.offset.y, vp.extent.width, vp.extent.height });
+            const ::dlvr::fovcrop::Fov cImg{ pv.fov.angleLeft, pv.fov.angleRight, pv.fov.angleUp, pv.fov.angleDown };
+            const ::dlvr::fovcrop::Fov cPan{ panel.angleLeft, panel.angleRight, panel.angleUp, panel.angleDown };
+            const ::dlvr::fovcrop::Rect cVp{ vp.offset.x, vp.offset.y, vp.extent.width, vp.extent.height };
+            c.res = ownFov ? ::dlvr::fovcrop::CropScaled(cImg, cPan, cVp) : ::dlvr::fovcrop::Crop(cImg, cPan, cVp);
         }
         const int decision = gate >= 0 ? gate : c.res.why;
         if (decision != g_pcLastLogged[e] && g_pcLines < 20) {
             ++g_pcLines;
             const float k = 57.2957795f;
-            const bool cut = gate < 0 && c.res.why == ::dlvr::fovcrop::kCropped;
-            // [PROBE: FOVCROP] gate=none (SteamVR runtime; first decision per eye unconditionally, then each change, 20 lines max)  site=HEADSET  log-only=no
+            const bool cut = gate < 0 && (c.res.why == ::dlvr::fovcrop::kCropped || c.res.why == ::dlvr::fovcrop::kScaled);
+            // [PROBE: FOVCROP] gate=none (SteamVR or Meta runtime; first decision per eye unconditionally, then each change, 20 lines max)  site=HEADSET  log-only=no
             LOG("[FOVCROP] eye%d %s: %s | image deg L%.2f R%.2f U%.2f D%.2f rect (%d,%d %dx%d) | panel deg L%.2f R%.2f U%.2f D%.2f | "
                 "margin px L%.1f R%.1f T%.1f B%.1f | -> declared deg L%.2f R%.2f U%.2f D%.2f rect (%d,%d %dx%d)",
                 e, g_pcLastLogged[e] == -99 ? "FIRST (logged unconditionally)" : "decision changed", PanelCropGateName(decision),
@@ -10278,7 +10404,7 @@ void SteamVrPanelCrop(int e, XrCompositionLayerProjectionView& pv, const XrFovf&
             g_pcLastLogged[e] = decision;
         }
     }
-    if (c.gate < 0 && c.res.why == ::dlvr::fovcrop::kCropped) {
+    if (c.gate < 0 && (c.res.why == ::dlvr::fovcrop::kCropped || c.res.why == ::dlvr::fovcrop::kScaled)) {
         pv.fov = XrFovf{ c.res.fov.left, c.res.fov.right, c.res.fov.up, c.res.fov.down };
         pv.subImage.imageRect.offset.x = c.res.rect.x;
         pv.subImage.imageRect.offset.y = c.res.rect.y;
@@ -10368,6 +10494,7 @@ ovr_SubmitFrame(ovrSession session, long long frameIndex,
 
     XrCompositionLayerProjectionView projViews[2]{};
     XrFovf imgFov0{};   // eye 0's frustum of the WHOLE image, before the SteamVR panel crop: the menu panel / loading quads draw the whole pass
+    XrFovf imgFov1{};   // eye 1's, taken at the same point - the menu / HUD panel size and centre eye 1's quad from it (trace 20261124_1345)
     XrCompositionLayerProjection proj{ XR_TYPE_COMPOSITION_LAYER_PROJECTION };
     XrCompositionLayerQuad overlayQuad{ XR_TYPE_COMPOSITION_LAYER_QUAD };
     XrCompositionLayerQuad grappleQuad{ XR_TYPE_COMPOSITION_LAYER_QUAD };   // grapple_reticle_3d
@@ -10694,6 +10821,27 @@ ovr_SubmitFrame(ovrSession session, long long frameIndex,
             }
         }
 
+        // THE IN-WORLD PROMPT (trace docs/traces/20261123_1535_inworld_prompt_routed.md): the bootstrap copies the routed prompt widget into
+        // our quad's live texture - once per submit, whatever owns the HUD pass (the HUD panel included). inworld_prompts off at launch:
+        // one bool test. COST on: one export call; a 768 x 192 clear + scaled copy only while the prompt is routed.
+        // [LOADBEARING: inworld_prompts] the per-submit prompt copy
+        if (::dlvr::PromptQuadOnThisLaunch()) {
+            typedef int (*PFN_PromptCopy)(float, float);   // DlvrPromptCopy(fade, plate) - ui_prompt_brightness / ui_prompt_plate, live
+                                                           // (traces 20261123_1700, 20261123_1830)
+            static PFN_PromptCopy s_pc = nullptr;
+            static bool s_pcLooked = false;
+            if (!s_pcLooked) {
+                if (HMODULE b = GetModuleHandleA("xinput1_3.dll")) {
+                    s_pcLooked = true;
+                    s_pc = reinterpret_cast<PFN_PromptCopy>(GetProcAddress(b, "DlvrPromptCopy"));
+                    // [PROBE: PROMPTQ] gate=inworld_prompts  site=FLAT  log-only=yes
+                    LOG("promptquad: [PROMPTQ] the bootstrap's DlvrPromptCopy %s (logged unconditionally)", s_pc ? "found - called each submit"
+                        : "*** NOT FOUND - the prompt is never copied (an older bootstrap?) ***");
+                }
+            }
+            if (s_pc) { s_pc(::dlvr::InworldPromptBrightness, ::dlvr::InworldPromptPlate); }
+        }
+
         // AFW HUD LAYER v4 (2026-10-07; the bootstrap's dlvr\hud_layer.txt + DlvrHudLayerSubmit, INV-482 / INV-483). Under
         // afw_alt_eye the bootstrap keeps the bracketed HUD pass (sprite50.ppfx) OUT of each eye's RIFT target, so the rebuild
         // above never re-projects a HUD; each eye's HUD is laid on its viewport of the shared eye image here - after the
@@ -11004,11 +11152,13 @@ ovr_SubmitFrame(ovrSession session, long long frameIndex,
             projViews[e].subImage.imageRect.extent.height = viewport[src].Size.h;
             lsVp[e] = projViews[e].subImage.imageRect;   // the loading-screen void cuts this eye's HUD box from here
             if (e == 0) { imgFov0 = projViews[0].fov; }
+            if (e == 1) { imgFov1 = projViews[1].fov; }
             // [LOADBEARING: STEAMVR-PANEL-CROP] on SteamVR the view handed to xrEndFrame is cut to the runtime's panel window (pixels +
             //      their exact frustum). Removing it puts back the Pimax ("aapvr") doubled image: that driver shows a layer with the
             //      panel's frustum, not the layer's (Crystal Light, 2026-11-18; correct with the SteamVR dashboard open).
-            if (g_runtimeIsSteamVr) {
-                SteamVrPanelCrop(e, projViews[e], s->views[e].fov, pitch, layerFov != nullptr);
+            // [LOADBEARING: FOV-META-OWN-FOV] and on Meta's runtime, which shows the rectangle over its own FOV (2026-11-24).
+            if (g_runtimeIsSteamVr || g_runtimeStretchesFov) {
+                SteamVrPanelCrop(e, projViews[e], s->views[e].fov, pitch, layerFov != nullptr, g_runtimeStretchesFov);
             }
         }
 
@@ -11150,7 +11300,7 @@ ovr_SubmitFrame(ovrSession session, long long frameIndex,
     const XrPosef menuEyes[2] = { projViews[0].pose, projViews[1].pose };
     // The desktop window: the menu panel is laid over it only on a submit that redrew it (deskmirror.h DrawPanel, trace 20261114_1125).
     ::dlvr::deskmirror::SetFresh(mirrorRefreshed && !s->mirrors.empty() ? s->mirrors[0]->tex : nullptr);
-    const int menuQuads = ::dlvr::uipanel::Render(s->appSpace, proj.viewCount == 2, menuEyes, menuRendered0, imgFov0,
+    const int menuQuads = ::dlvr::uipanel::Render(s->appSpace, proj.viewCount == 2, menuEyes, menuRendered0, imgFov0, imgFov1,
                                                   menuQuad, s->frameState.predictedDisplayTime);
     for (int mq = 0; mq < menuQuads && submitted < 5; ++mq) {
         layers[submitted++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&menuQuad[mq]);
@@ -11201,7 +11351,7 @@ ovr_SubmitFrame(ovrSession session, long long frameIndex,
     // sphere (kLayerCap - 1 keeps the panel's slot). No ImGui frame (own draw list), so before OverlayRender is safe. Worst case
     // with it: one more than the sphere's 7 of 12. COST menu closed: two bool tests inside the call.
     if (submitted < static_cast<uint32_t>(kLayerCap - 1)) {
-        if (OverlayRenderTitle(s->viewSpace, &titleQuad)) {
+        if (OverlayRenderTitle(s->viewSpace, s->appSpace, s->frameState.predictedDisplayTime, &titleQuad)) {
             layers[submitted++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&titleQuad);
         }
     } else if (::dlvr::OverlayVisible()) {

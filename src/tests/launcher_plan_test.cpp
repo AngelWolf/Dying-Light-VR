@@ -95,6 +95,26 @@ int main()
         CHECK(a.empty());
         CHECK(refusal.find("Data3") != std::string::npos && refusal.find("erify") != std::string::npos);
     }
+    {   // an OLDER release's Data3 left on disk (1.0 - 1.065), no mod, no stock copy -> refused too (trace 20261124_2110)
+        DetectedState s;
+        InstallInputs in = Fresh(r, s);
+        in.diskMd5 = {{"dw/data3.pak", "394248e75c65b83ad2f26151a9b3566a"}};
+        std::string refusal;
+        const auto a = PlanLauncherInstall(in, &refusal);
+        CHECK(a.empty());
+        CHECK(refusal.find("Data3") != std::string::npos && refusal.find("erify") != std::string::npos);
+    }
+    {   // any OTHER Data3 (the game's own) -> not refused, saved as stock
+        DetectedState s;
+        InstallInputs in = Fresh(r, s);
+        in.diskMd5 = {{"dw/data3.pak", kOther}};
+        std::string refusal;
+        const auto a = PlanLauncherInstall(in, &refusal);
+        CHECK(refusal.empty());
+        bool saved = false;
+        for (const auto& x : a) { saved = saved || (x.kind == LAct::SaveStock && x.relPath == "DW/Data3.pak"); }
+        CHECK(saved);
+    }
     {   // an UPDATE (launcher record present): our older files are NOT saved as stock
         DetectedState s;
         s.modPresent = true;

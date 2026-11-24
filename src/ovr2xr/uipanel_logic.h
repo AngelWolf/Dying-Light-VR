@@ -46,6 +46,21 @@ inline bool UiCrop(int W, int H, const EyeTan& t, Rect* out)
     return true;
 }
 
+// The same UI plane as UiCrop, UNROUNDED, for an OFF-CENTRE frustum only (trace docs/traces/20261124_1500_hud_router_offcentre.md): the
+// HUD router maps each draw through the plane of the eye it draws. False (out untouched) for a frustum symmetric on both axes - the
+// router then keeps its own expression, unchanged - or one not known.
+inline bool UiPlaneExact(int W, int H, const EyeTan& t, float* x, float* y, float* w, float* h)
+{
+    if (!x || !y || !w || !h || W < 64 || H < 64 || !(t.l > 0.0f) || !(t.r > 0.0f) || !(t.u > 0.0f) || !(t.d > 0.0f)) { return false; }
+    if (std::fabs(t.l - t.r) < 1e-6f && std::fabs(t.u - t.d) < 1e-6f) { return false; }
+    const double pw = W * 2.0 * UiTanX(W, H) / (static_cast<double>(t.l) + t.r), ph = H * 2.0 * kUiTanY / (static_cast<double>(t.u) + t.d);
+    *x = static_cast<float>(W * static_cast<double>(t.l) / (static_cast<double>(t.l) + t.r) - pw * 0.5);
+    *y = static_cast<float>(H * static_cast<double>(t.u) / (static_cast<double>(t.u) + t.d) - ph * 0.5);
+    *w = static_cast<float>(pw);
+    *h = static_cast<float>(ph);
+    return true;
+}
+
 // Selection wheels (plan 2026-10-27-vr-selection-wheels Task 6, D13): the game's item wheel WITH its name, stats, cash and repair
 // parts, in the eye image. Our hud.xui (DW_DLC24/DataDLC24_2.pak, which shadows Data0's) puts each wheel group at (471, 191)
 // 338 x 338 on the 1280 x 720 canvas, but its children reach x 380..998, y 110..749 (slots, I_Selection frames), G_Cash
@@ -63,6 +78,20 @@ inline bool WheelRect(int W, int H, const EyeTan& t, Rect* out)
     const int cy = c.y + static_cast<int>(c.h * 360.0 / 720.0 + 0.5);
     *out = Rect{ cx - w / 2, cy - h / 2, w, h };
     return true;
+}
+
+// Eye 1's wheel box (trace docs/traces/20261124_1612_wheel_taa_fsr_offcentre.md): `own` (WheelRect from THAT eye's frustum) re-centred
+// at `size`'s width / height - both eyes' boxes sit side by side in one swapchain image, so they must be the same size - and kept inside
+// the W x H image. On an off-centre frustum each eye's wheel is at its own projection axis (eye 0's box cut eye 1's wheel). Same-size
+// boxes inside the image (every symmetric frustum): `own` returned unchanged.
+inline Rect SameSizeAt(const Rect& size, const Rect& own, int W, int H)
+{
+    int x = own.x + own.w / 2 - size.w / 2, y = own.y + own.h / 2 - size.h / 2;
+    if (x + size.w > W) { x = W - size.w; }
+    if (y + size.h > H) { y = H - size.h; }
+    if (x < 0) { x = 0; }
+    if (y < 0) { y = 0; }
+    return Rect{ x, y, size.w, size.h };
 }
 
 // ---- the UI headset sweep (Jay HARD RULE 2026-11-13; trace 20261113_2125): numbers that follow the running headset ----
@@ -108,6 +137,27 @@ inline void SizeM(const Rect& r, int W, int H, float tanL, float tanR, float tan
 {
     *width = distance * (tanR - tanL) * (static_cast<float>(r.w) / static_cast<float>(W)) * scale;
     *height = distance * (tanU - tanD) * (static_cast<float>(r.h) / static_cast<float>(H)) * scale;
+}
+
+// Where ONE eye's quad centre goes, relative to the panel's latched centre, along the panel's own right (dx) and up (dy), metres
+// (trace docs/traces/20261124_1345_panel_eye_offcentre.md; RUNS SY1-SY3 2026-11-24): the direction of the crop rect's centre in THAT
+// eye's frustum, at `distance` x `scale` - so each eye's image sits where the projection layer would show it. An off-centre frustum's
+// image centre is not straight ahead (SY1 eye 0: tangents l -1.3997 r 0.8533 -> the centre 0.27 to the left); both eyes on one centre
+// gave a ~24 % of the panel width disparity = the doubled menus. Tangents signed as SizeM (left / down negative). A frustum symmetric
+// on both axes returns 0 / 0 EXACTLY - the placement of every symmetric_fov 2 setup is unchanged bit for bit.
+inline void EyeQuadOffset(const Rect& r, int W, int H, float tanL, float tanR, float tanD, float tanU, float distance, float scale,
+                          float* dx, float* dy)
+{
+    *dx = 0.0f;
+    *dy = 0.0f;
+    if (W <= 0 || H <= 0) { return; }
+    if (std::fabs(tanL + tanR) < 1e-6f && std::fabs(tanU + tanD) < 1e-6f) { return; }
+    const float fx = (static_cast<float>(r.x) + 0.5f * static_cast<float>(r.w)) / static_cast<float>(W);
+    const float fy = (static_cast<float>(r.y) + 0.5f * static_cast<float>(r.h)) / static_cast<float>(H);
+    const float tx = tanL + fx * (tanR - tanL);   // image x grows to the right
+    const float ty = tanU - fy * (tanU - tanD);   // image y grows downward
+    *dx = distance * tx * scale;
+    *dy = distance * ty * scale;
 }
 
 // The head's forward direction flattened onto the floor plane. False when the head looks straight up or down (no heading

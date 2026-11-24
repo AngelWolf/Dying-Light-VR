@@ -10,14 +10,18 @@
 namespace dlvr {
 namespace wristleaf {
 
-constexpr int kPieces    = 5;      // 0 HudRadar, 1 health_wrap, 2 StackObjectives, 3 HudPrimaryWeaponIndicator, 4 HudSecondaryWeaponIndicator
+constexpr int kPieces    = 5;      // the WRIST pieces: 0 HudRadar, 1 health_wrap, 2 StackObjectives, 3 HudPrimaryWeaponIndicator, 4 HudSecondaryWeaponIndicator
+// THE IN-WORLD PROMPT (trace docs/traces/20261123_1535_inworld_prompt_routed.md): HUD_DI's direct child "HudTrigger" = a 6th ROUTED
+// piece (never a wrist piece). kRouted sizes everything the bootstrap's router keeps per piece; kPieces stays the wrist's count.
+constexpr int kPrompt    = 5;
+constexpr int kRouted    = 6;
 constexpr int kMaxLeaves = 2048;
 constexpr int kMinimap   = 0;
 
 struct Leaf {
     float at[2];          // the element's global translation = an image quad's corner (local 0, 0)
     float rect[4];        // left, top, right, bottom
-    signed char piece;    // 0..4, -1 = not one of the five
+    signed char piece;    // 0..5 (5 = the prompt), -1 = not a routed piece
     unsigned char text;   // 1 = a text element (RTTI class name holds "Text")
     unsigned char last;   // 1 = the last leaf of its widget in tree order (the next widget's draws start after it)
     unsigned char pad;
@@ -25,12 +29,14 @@ struct Leaf {
 
 struct Header {
     float root[4];                        // HUD_DI's own box
-    float pieceBox[kPieces][4];           // each piece's box (the union of its leaves; the minimap = its largest leaf)
+    float pieceBox[kRouted][4];           // each piece's box (the union of its leaves; the minimap = its largest leaf)
     unsigned long long takenMs;           // GetTickCount64 of the snapshot (0 = never)
     long gen;                             // +1 per publish
     int count;                            // leaves
     int shownMask;                        // bit p = piece p had a visible leaf
     int standDown;                        // 1 = an in-game menu or a selection wheel is open (set by dlvr_WristLeaves; 0 in every publish)
+    int routeMask;                        // bit p = the bootstrap may route piece p (0x1F = the wrist HUD on; bit 5 = the layer's prompt
+                                          // quad is showing) - trace 20261123_1535. Both DLLs ship together: a mixed pair mismatches.
 };
 
 // Exported by LibOVRRT64_1 as dlvr_WristLeaves: copies the latest snapshot. Returns the leaf count (<= max), or -1 when the

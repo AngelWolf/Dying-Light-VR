@@ -33,6 +33,20 @@ namespace fsr {
 
 namespace {
 
+// The frustum's vertical scale P[1][1] off a row-major view-projection (trace docs/traces/20261124_1612_wheel_taa_fsr_offcentre.md): row 1's
+// xyz = P11 x view-up + c x view-forward, where c is the frustum's vertical off-centre (+ the jitter); row 3's xyz is the view-forward
+// axis. |row 1| counted c too, so at symmetric_fov 0 FSR was told a vertical FOV ~1.5 deg too NARROW (RUN SY1's eye 0, u 0.9657 d 1.4281:
+// 98.7 deg told, 2 atan((u + d) / 2) = 100.2 deg the tangent span). The part of row 1 perpendicular to row 3 is P11 alone. Symmetric
+// frustum: only the jitter's ~1e-4 is removed.
+inline float TrueP11(const float* vp)
+{
+    const double d11 = static_cast<double>(vp[4]) * vp[4] + static_cast<double>(vp[5]) * vp[5] + static_cast<double>(vp[6]) * vp[6];
+    const double d13 = static_cast<double>(vp[4]) * vp[12] + static_cast<double>(vp[5]) * vp[13] + static_cast<double>(vp[6]) * vp[14];
+    const double d33 = static_cast<double>(vp[12]) * vp[12] + static_cast<double>(vp[13]) * vp[13] + static_cast<double>(vp[14]) * vp[14];
+    const double perp = d33 > 1e-12 ? d11 - d13 * d13 / d33 : d11;
+    return perp > 0.0 ? static_cast<float>(std::sqrt(perp)) : 0.0f;
+}
+
 constexpr int kMaxEyes = 2;
 // Command allocators (and timestamp slots) in flight. An allocator is only
 // reset once the fence says its last list has finished. MEASURED 2026-09-26:
@@ -1173,7 +1187,7 @@ bool RunOne(ID3D11DeviceContext* ctx, int eye, const OneSpec& s)
     static float s_near = 0.05f, s_fov = 1.0f;
     if (s.viewProj) {
         const float nearZ = s.viewProj[11];
-        const float p11 = std::sqrt(s.viewProj[4] * s.viewProj[4] + s.viewProj[5] * s.viewProj[5] + s.viewProj[6] * s.viewProj[6]);
+        const float p11 = TrueP11(s.viewProj);
         const float fov = p11 > 1e-3f ? 2.0f * std::atan(1.0f / p11) : 0.0f;
         if (nearZ > 0.001f && nearZ < 1.0f && fov > 0.2f && fov < 3.0f) { s_near = nearZ; s_fov = fov; }
     }
@@ -1417,8 +1431,7 @@ bool Dispatch(ID3D11DeviceContext* ctx, int eye, ID3D11Texture2D* colour, ID3D11
     bool camOk = false;
     if (viewProj) {
         const float nearZ = viewProj[11];
-        const float p11 = std::sqrt(viewProj[4] * viewProj[4] + viewProj[5] * viewProj[5] +
-                                    viewProj[6] * viewProj[6]);
+        const float p11 = TrueP11(viewProj);
         const float fov = p11 > 1e-3f ? 2.0f * std::atan(1.0f / p11) : 0.0f;
         if (nearZ > 0.001f && nearZ < 1.0f && fov > 0.2f && fov < 3.0f) {
             s_near = nearZ; s_fov = fov; s_haveCam = true; camOk = true;

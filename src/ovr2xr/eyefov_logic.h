@@ -29,7 +29,8 @@ inline bool Differ(const Tans& a, const Tans& b)
 // the image over its OWN field of view (Venture PR #79, measured on "Oculus" 1.208.0 + Quest 3; OpenXR rendering.adoc says a
 // runtime "will map the view and FOV to the system display appropriately"). A symmetrised frustum then lands squeezed and
 // off-centre per eye = the cross-eye a tester reported at symmetric_fov=2, gone at 0 (Jay 2026-11-16: "A"). "Oculus" is the
-// only name on record for that runtime (tester logs 20261115_210537, Apollonian 2026-10-18).
+// only name on record for that runtime (tester logs 20261115_210537, another tester 2026-10-18). Since 2026-11-24 each view is cut to that
+// runtime's own window at submit (fovcrop_logic.h CropScaled; Jay: "Go ahead with 1") instead of forcing symmetric_fov to 0.
 inline bool RuntimeStretchesToOwnFov(const char* runtimeName)
 {
     static const char kName[] = "Oculus";
@@ -42,13 +43,6 @@ inline bool RuntimeStretchesToOwnFov(const char* runtimeName)
         }
     }
     return true;
-}
-
-// The symmetric_fov mode actually used: 0 on a runtime that shows the image over its own FOV (any symmetrising would declare
-// a frustum it does not honour), the setting everywhere else. The setting itself is never rewritten.
-inline int EffectiveSymmetric(int setting, bool runtimeStretchesToOwnFov)
-{
-    return runtimeStretchesToOwnFov ? 0 : setting;
 }
 
 }  // namespace dlvr::eyefov

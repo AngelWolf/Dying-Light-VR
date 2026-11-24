@@ -19,6 +19,7 @@
 #include "aimhook.h"        // AimMirrorYaw - the gun's yaw-sign convention (the throwables' mapping)
 #include "bodygrab.h"       // body grab: the machine's DRAG / END events start and stop it (plan 2026-10-23-body-grab Task 3)
 #include "bodygrab_logic.h" // YawQuat / QuatMul - the hand's world rotation for the severed-limb rotation hold
+#include "boltwheel.h"      // InputLookupSetTriggerHold / InputLookupTriggerHoldLive - the search hold (trace 20261122_1620)
 #include "boneblend.h"      // InstallSingleGameDetour - the shared verify / suspend / commit path
 #include "calibscreen.h"    // CalibScreenActive - a blocked input for body grab
 #include "camhook.h"        // CamHookGetOpenXrToGameYaw, CamHookGetRenderedViewMatrix
@@ -28,8 +29,10 @@
 #include "looting_logic.h"
 #include "lidhand.h"        // LidHandOnNearby - hand-open lids publish / null pick inside NearbyHook (trace 20261118_1711)
 #include "overlay.h"        // OverlayVisible - a blocked input for body grab
+#include "promptquad.h"     // PromptQuadOnSlot - the in-world prompt reads the X slot here (trace 20261123_1356)
 
 #include <windows.h>
+#include <intrin.h>   // _ReturnAddress - the lid prompt's call-site test
 
 #include <cmath>
 #include <cstddef>
@@ -85,6 +88,50 @@ constexpr unsigned char kNearbyBytes[15] = { 0x4C, 0x8B, 0xDC, 0x49, 0x89, 0x53,
                                                              // / push rsi / push r12 - no RIP-relative operand (§5)
 constexpr uintptr_t kSetterRva = 0xBED850;   // sub_180BED850(player, trigger, char) - writes +5272/+5280 (called, not patched)
 constexpr uintptr_t kBodyVtRva = 0x164B528;  // BodyContainer's primary vftable (RTTI COL-checked, lt3)
+// The PLAIN search containers (2026-11-22 (71), Jay: duffel bags, payphones ... "still under the default X interaction"; INV-764,
+// ida/ctn1): DeclareMeshContainer -> class Container, BodyContainer's base - the same held action 1 in state 1 (+824), its own hold
+// time (+504 x the player's multiplier, 0 = instant), one item into the inventory, then state 5. Gathered like a standalone body,
+// flagged plain: never a body-grab drag, searchable only at state 1 exactly. Trace 20261122_1620.
+constexpr uintptr_t kContainerVtRva = 0x165E268;   // Container's primary vftable (RTTI .?AVContainer@@, ctn1; Epic through buildrva)
+// PlayerDI slot 324 (+BA0F20) passes the lookup the target player + 2288 (ida/ctn2, INV-765) - the search hold's target.
+constexpr uintptr_t kLookupTargetOff = 2288;
+// THE GRIP GLYPH (2026-11-22 (74), Jay: "We need this to be specific"; trace 20261122_1740, INV-766 + its RUN GG1 addendum): OUR
+// HudTriggerSlot::Update +5B66D0 (slot, trigger), only caller HudTrigger::Update +5B8FE0. slot+256 = slot type (0 = the X slot, action
+// 20), slot+120 = the active button preset, its T_Key text element at slot + 40*preset + 48, set with the element's vfunc +1472 (a
+// ttl wide string {ptr, len, cap}) - ida/ctn9_out.txt :200-240 / :651-655. U+E075 = Jay's grip in boxed light 15 (Data3
+// data/panel/boxed_light_15.fm + menu_common_PC.rpack boxed_semibold_30). Prologue: 15 bytes, whole instructions, no RIP-relative, no
+// branch into the range (capstone, set-aside gamedll 97046bba).
+constexpr uintptr_t kSlotUpdateRva = 0x5B66D0;
+constexpr unsigned char kSlotUpdateBytes[15] = { 0x48, 0x8B, 0xC4, 0x48, 0x89, 0x48, 0x08, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54,
+                                                 0x41, 0x55 };   // mov rax,rsp / mov [rax+8],rcx / push rbp,rbx,rsi,rdi,r12,r13
+constexpr size_t    kSlotTypeOff = 256;
+constexpr size_t    kSlotPresetOff = 120;
+constexpr size_t    kSlotPresetStride = 40;
+constexpr size_t    kSlotKeyTextOff = 48;
+constexpr size_t    kSetTextWOff = 1472;      // the text element's vfunc: set from a wide string
+constexpr wchar_t   kGripGlyph = 0xE075;
+// THE LID PROMPT (2026-11-23, trace 20261123_1200; Jay: "Bring the prompt back, but we'd change the text & use the new icon for it",
+// key "Existing translated." -> TriggerGrab, scope "Lids + purses"): the pick getter +B9BB40 (player) has 16 call sites; HudTrigger's
+// +5B9BA0 calls GetNearbyTriggers (our NearbyHook) and IMMEDIATELY the getter (return +5B9CFB), then keeps the result as its OWN
+// copy (ida/ss24_out.txt :469-541). The detour returns the lid NearbyHook just nulled to that one site only; the player's pick stays
+// null (X / holds unchanged). Prologue: 14 bytes = 3 whole instructions, no RIP operand, 0 branches into +B9BB41..+B9BB4D
+// (ida/ss23_out.txt :3-19). The return site is verified at install: an E8 at +5B9CF6 whose target is +B9BB40.
+constexpr uintptr_t kPickGetRva = 0xB9BB40;
+constexpr unsigned char kPickGetBytes[14] = { 0x44, 0x8B, 0x89, 0xB8, 0x14, 0x00, 0x00, 0x48, 0x8B, 0xD1, 0x41, 0x8D, 0x41,
+                                              0xC9 };   // mov r9d,[rcx+14B8h] / mov rdx,rcx / lea eax,[r9-37h]
+constexpr uintptr_t kHudPickRetRva = 0x5B9CFB;   // HudTrigger +5B9BA0's return from the getter (call at -5)
+constexpr size_t    kSlotActionTextOff = 152;    // the slot's action text element (ctn9 :689-697)
+constexpr size_t    kSetTextKeyOff = 1448;       // the text element's vfunc: set from a narrow "&key&" string (localised)
+// THE CAMOUFLAGE PROMPT HIDDEN (2026-11-22 (76), Jay: "We can just hide the camo prompt entirely"; trace 20261122_1800, INV-766
+// camouflage addendum): the infected module's R1-slot handler +30BE80 (kInfectedSlot1Rva) is the ONLY offer of action 53; when the
+// skill and its conditions fail it returns sub_1802B9820(a1, a2) instead - the human module's R1 answer. The detour returns that
+// answer whenever the game would have said 53, so nobody in VR is shown "RB Use Camouflage" (the right grip it names is withheld on
+// those corpses by GripCamoPoll; the VR camouflage is the wipe gesture, which never asks +30BE80). Prologue: 14 bytes, whole
+// instructions, no RIP-relative, no branch into the range (capstone, set-aside gamedll 97046bba).
+constexpr unsigned char kCamoOfferBytes[14] = { 0x48, 0x89, 0x5C, 0x24, 0x10, 0x56, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0x41,
+                                                0x40 };   // mov [rsp+10h],rbx / push rsi / sub rsp,20h / mov rax,[rcx+40h]
+constexpr uintptr_t kNoCamoAnswerRva = 0x2B9820;   // sub_1802B9820(module, ctx) - +30BE80's own fallback
+constexpr int       kCamoAction = 53;
 constexpr size_t    kPickHandle = 5272;      // PlayerDI+5272 != 0 -> +5280 = the stored pick (INV-615)
 constexpr size_t    kPickObj = 5280;
 constexpr size_t    kCtlObjOff = 24;         // candidate + 24 = IControlObject (the gather's own box read, lt4b :1286)
@@ -135,6 +182,50 @@ struct GameVec {   // the out vector GetNearbyTriggers fills: { T** data; u32 co
 uintptr_t g_gd = 0;
 // the rvas as the loaded build has them (Steam values until TryInstall resolves them, before g_gd is published)
 uintptr_t g_rSetter = kSetterRva, g_rBodyVt = kBodyVtRva, g_rAiTrigAct = kAiTrigActRva, g_rInfectedSlot1 = kInfectedSlot1Rva;
+uintptr_t g_rContVt = kContainerVtRva;
+uintptr_t g_rSlotUpdate = kSlotUpdateRva;
+using SlotUpdateFn = void(__fastcall*)(void* slot, void* trigger);
+SlotUpdateFn g_origSlot = nullptr;
+volatile LONG g_glyphState = 0;      // 0 not installed, 1 live, -1 refused (named once)
+volatile LONG g_nGlyph = 0, g_nGlyphFault = 0;
+struct WideStr { wchar_t* p; uint32_t len; uint32_t cap; };   // ttl::string_base<wchar_t> (ctn9 :958-960: 2-byte chars, len, cap)
+wchar_t g_gripText[2] = { kGripGlyph, 0 };                     // static: the element copies it; never freed by anyone
+using CamoOfferFn = long long(__fastcall*)(void* module, void* ctx);   // both return __int64 (lf6): the full rax is passed through
+CamoOfferFn g_origCamoOffer = nullptr;
+uintptr_t g_rNoCamoAnswer = kNoCamoAnswerRva;
+volatile LONG g_camoOfferState = 0, g_nCamoHidden = 0;
+// HUD-ONLY scope (trace 20261122_1815; RUN CH1: swapping 53 for EVERY caller dropped searched infected corpses from the game's trigger
+// gather, so body grab found no body): > 0 only while the game's own HudTriggerSlot::Update runs on this thread (SlotUpdateHook), the
+// one caller whose answer is the prompt. Every other caller of +30BE80 gets the game's answer.
+thread_local int t_inSlotUpdate = 0;
+// THE LID PROMPT (trace 20261123_1200). t_hudLid: the lid / purse THIS thread's NearbyHook just nulled - read once by PickGetHook at
+// HudTrigger's site (the same C call chain). g_promptLid: what that site was last handed - a GLOBAL, because the HUD updates hop
+// worker threads; SlotUpdateHook compares the slot's trigger to it (never dereferenced).
+thread_local void* t_hudLid = nullptr;
+void* volatile g_promptLid = nullptr;
+using PickGetFn = void*(__fastcall*)(void* player);
+PickGetFn g_origPickGet = nullptr;
+uintptr_t g_hudPickRet = 0;          // absolute; 0 never matches a return address
+volatile LONG g_pickGetState = 0;    // 0 not installed, 1 live, -1 refused
+volatile LONG g_nLidPrompt = 0, g_nGrabText = 0, g_nGrabTextFault = 0;
+struct NarrowStr { const char* p; uint32_t len; uint32_t cap; };   // ttl::string_base<char> (ctn9 :169-170 / :510-511: ptr, len, cap)
+const char g_grabKey[] = "&TriggerGrab&";                         // static: +1448 copies it (the game frees its own, ctn9 :1176)
+// Remembered bodies (trace 20261122_1850): a SEARCHED body offers no action, so the game's gather drops it (+EF3E70 / +A5BD30) and
+// body grab could not take it. Every body NearbyHook gathers is remembered by its IGSObject id; one missing from a later gather is
+// re-proven by FindObjectByID (INV-663), the body test and its box, then appended to the box list. Engine exports, the handcarry pattern.
+using MemGetIdFn = int(__fastcall*)(const void* gso);           // ?GetID@IGSObject@@QEBAHXZ  +252080
+using MemFindFn = void*(__fastcall*)(void* gso, int id);        // ?FindObjectByID@IGSObject@@UEBAPEAV1@H@Z  +251DF0
+constexpr size_t kMemGsoOff = 40;      // obj + 40 = IGSObject (handcarry.cpp kGsoOff)
+constexpr int    kMemMax = 16;
+constexpr float  kMemRangeM = 2.6f;    // the gather's own far radius (INV-615)
+struct MemBody { int id; uintptr_t obj; ULONGLONG seenMs; };
+MemBody   g_mem[kMemMax] = {};
+int       g_memN = 0;
+SRWLOCK   g_memLock = SRWLOCK_INIT;
+MemGetIdFn g_memGetId = nullptr;
+MemFindFn  g_memFind = nullptr;
+volatile LONG g_memSaidNoExport = 0, g_memSaidNoPlayerBox = 0;
+volatile LONG g_nMemAppended = 0, g_nMemForgot = 0;
 // The gaze re-pick (2026-10-27, run 8): the gather, the cone's FOV variable and two early gates, as the loaded build has them.
 constexpr uintptr_t kGatherRva2 = 0xEF2FC0, kVarRva2 = 0xC58E40, kUiGateRva2 = 0xCAEB00, kObjGateRva2 = 0x6D5590,
                     kGameDiRva2 = 0x1C16348, kVarAltRva2 = 0x1C122C8;
@@ -158,6 +249,9 @@ float g_boxC[kMaxBoxes][6] = {};   // a dead AI's attached container's box
 bool  g_haveA[kMaxBoxes] = {};
 bool  g_haveC[kMaxBoxes] = {};
 void* g_boxObj[kMaxBoxes] = {};    // what the setter receives: the BodyContainer, or the dead AI
+bool  g_boxPlain[kMaxBoxes] = {};  // a plain search Container (bag, bin, payphone ...) - not a body (trace 20261122_1620)
+volatile LONG64 g_lootTarget = 0;  // the local player + 2288 (NearbyHook) - the search hold's lookup target (INV-765)
+volatile LONG g_nPlainSaid = 0, g_nTapSaid = 0;
 
 // Counters (5 s totals). The last gather's counts also ride the NO-ARM line (BETA compiles LOG_PERIODIC out).
 volatile LONG g_nHook = 0, g_nSub = 0, g_nPass = 0, g_nNoBody = 0, g_nFault = 0;
@@ -256,26 +350,30 @@ bool HandWorld(Hand h, float out[3], float trk[3], float rot[4])
 }
 
 // Nearest published body to p: index or -1; *dist = the nearer of its boxes, *da / *dc = each box's distance (-1 = no such box).
-int NearestBox(const float p[3], float* dist, void** objOut, float* da, float* dc)
+// *plainOut (optional) = that one is a plain search Container (trace 20261122_1620), read inside the same settled window.
+int NearestBox(const float p[3], float* dist, void** objOut, float* da, float* dc, bool* plainOut = nullptr)
 {
+    if (plainOut) { *plainOut = false; }
     for (int attempt = 0; attempt < 3; ++attempt) {
         const LONG s0 = g_boxSeq;
         if (s0 & 1) { continue; }
         int best = -1;
         float bd = 0.0f, ba = -1.0f, bc = -1.0f;
         void* bo = nullptr;
+        bool bp = false;
         const int n = g_boxCount;
         for (int i = 0; i < n && i < kMaxBoxes; ++i) {
             float a = -1.0f, c = -1.0f;
             const float d = looting::NearerBoxDist(g_boxA[i], g_haveA[i], g_boxC[i], g_haveC[i], p, &a, &c);
             if (d < 0.0f) { continue; }
-            if (best < 0 || d < bd) { best = i; bd = d; ba = a; bc = c; bo = g_boxObj[i]; }
+            if (best < 0 || d < bd) { best = i; bd = d; ba = a; bc = c; bo = g_boxObj[i]; bp = g_boxPlain[i]; }
         }
         if (g_boxSeq == s0) {
             *dist = bd;
             *da = ba;
             *dc = bc;
             if (objOut) { *objOut = bo; }
+            if (plainOut) { *plainOut = best >= 0 && bp; }
             return best;
         }
     }
@@ -325,7 +423,7 @@ int ContainerState(void* body)
     const uintptr_t bodyVt = g_gd + g_rBodyVt;
     uintptr_t vt = 0, c = 0, h = 0, cvt = 0, fn = 0;
     if (!ReadPtr(b, &vt)) { return -1; }
-    if (vt == bodyVt) {
+    if (vt == bodyVt || vt == g_gd + g_rContVt) {   // a standalone BodyContainer, or a plain Container (its +824 too - ctn1 slot 195)
         c = b;
     } else if (ReadPtr(vt + 8 * kTrigActSlot, &fn) && fn == g_gd + g_rAiTrigAct && ReadPtr(b + kAiBodyHandle, &h) && h &&
                ReadPtr(b + kAiBodyObj, &c) && c && ReadPtr(c, &cvt) && cvt == bodyVt) {
@@ -843,6 +941,133 @@ void GazeTotals()
 }
 }  // namespace why
 
+// ---- remembered bodies (trace 20261122_1850). SEH frames hold no C++ objects. ----
+bool MemCallId(uintptr_t obj, int* out)
+{
+    __try { *out = g_memGetId(reinterpret_cast<const char*>(obj) + kMemGsoOff); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// true = `obj` is still the live object with `id` (FindObjectByID through the player's IGSObject returns obj + 40)
+bool MemStillLive(void* player, uintptr_t obj, int id)
+{
+    void* found = nullptr;
+    __try { found = g_memFind(static_cast<char*>(player) + kMemGsoOff, id); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    return found == reinterpret_cast<void*>(obj + kMemGsoOff);
+}
+// A body's boxes as the gather loop takes them: a standalone BodyContainer its own box; a dead AI its own + its container's.
+bool MemBoxes(uintptr_t obj, float a[6], bool* haveA, float c[6], bool* haveC)
+{
+    uintptr_t vt = 0, cont = 0;
+    if (!ReadPtr(obj, &vt)) { return false; }
+    *haveA = ReadBox(reinterpret_cast<void*>(obj), a);
+    *haveC = false;
+    if (vt != g_gd + g_rBodyVt && ReadPtr(obj + kAiBodyObj, &cont) && cont) {
+        *haveC = ReadBox(reinterpret_cast<void*>(cont), c);
+    }
+    return *haveA || *haveC;
+}
+float MemBoxDist(const float b[6], const float p[3])
+{
+    float s = 0.0f;
+    for (int k = 0; k < 3; ++k) {
+        const float lo = b[k] < b[k + 3] ? b[k] : b[k + 3], hi = b[k] < b[k + 3] ? b[k + 3] : b[k];
+        const float d = p[k] < lo ? lo - p[k] : (p[k] > hi ? p[k] - hi : 0.0f);
+        s += d * d;
+    }
+    return std::sqrt(s);
+}
+
+// Remember this gather's bodies, then append every remembered body this gather lacks that is still proven, within kMemRangeM of
+// the player. COST: per HUD re-pick, <= 16 GetID + <= 16 FindObjectByID (no allocation) + their guarded reads; one lock.
+void MemRememberAndAppend(void* player, void** objs, const bool* plain, float (*boxA)[6], bool* haveA, float (*boxC)[6],
+                          bool* haveC, bool* outPlain, int* n)
+{
+    if (!g_memGetId || !g_memFind) {
+        if (InterlockedIncrement(&g_memSaidNoExport) == 1) {
+            // [PROBE: LOOTHAND] gate=loot_by_hand  site=FLAT  log-only=no
+            LOG("looting: [LOOTHAND] REMEMBERED BODIES OFF - the engine does not export IGSObject::GetID / FindObjectByID (%p / %p); "
+                "a searched body leaves the gather and body grab cannot take it", reinterpret_cast<void*>(g_memGetId),
+                reinterpret_cast<void*>(g_memFind));
+        }
+        return;
+    }
+    const ULONGLONG now = GetTickCount64();
+    const int gathered = *n;
+    AcquireSRWLockExclusive(&g_memLock);
+    // 1. remember (or refresh) every gathered body
+    for (int i = 0; i < gathered; ++i) {
+        if (plain[i]) { continue; }
+        const uintptr_t o = reinterpret_cast<uintptr_t>(objs[i]);
+        int id = 0;
+        if (!MemCallId(o, &id)) { continue; }
+        int slot = -1;
+        for (int j = 0; j < g_memN; ++j) { if (g_mem[j].obj == o && g_mem[j].id == id) { slot = j; break; } }
+        if (slot < 0) {
+            if (g_memN < kMemMax) { slot = g_memN++; }
+            else {
+                slot = 0;   // the oldest seen is replaced
+                for (int j = 1; j < g_memN; ++j) { if (g_mem[j].seenMs < g_mem[slot].seenMs) { slot = j; } }
+            }
+            g_mem[slot].id = id;
+            g_mem[slot].obj = o;
+        }
+        g_mem[slot].seenMs = now;
+    }
+    // 2. the player's box centre (the range reference)
+    float pb[6] = {}, pc[3] = {};
+    const bool havePlayer = ReadBox(player, pb);
+    if (havePlayer) { for (int k = 0; k < 3; ++k) { pc[k] = 0.5f * (pb[k] + pb[k + 3]); } }
+    else if (InterlockedIncrement(&g_memSaidNoPlayerBox) == 1) {
+        // [PROBE: LOOTHAND] gate=loot_by_hand  site=HEADSET  log-only=no
+        LOG("looting: [LOOTHAND] REMEMBERED BODIES: the player's box (player %p + 24) did not read - no range filter this re-pick "
+            "(the hand's own reach still applies) | thread %lu", player, GetCurrentThreadId());
+    }
+    // 3. re-prove and append the remembered bodies this gather lacks
+    for (int j = 0; j < g_memN;) {
+        const MemBody m = g_mem[j];
+        bool inGather = false;
+        for (int i = 0; i < gathered; ++i) { if (reinterpret_cast<uintptr_t>(objs[i]) == m.obj) { inGather = true; break; } }
+        if (inGather) { ++j; continue; }
+        const char* reason = nullptr;
+        float a[6] = {}, c[6] = {};
+        bool hA = false, hC = false;
+        if (!MemStillLive(player, m.obj, m.id)) { reason = "its id no longer finds it (gone / recycled)"; }
+        else if (!why::IsBody(m.obj)) { reason = "no longer a body"; }
+        else if (!MemBoxes(m.obj, a, &hA, c, &hC)) { reason = "no box read"; }
+        if (reason) {
+            const LONG k = InterlockedIncrement(&g_nMemForgot);
+            if (k <= 3) {
+                // [PROBE: LOOTHAND] gate=loot_by_hand  site=HEADSET  log-only=yes
+                LOG("looting: [LOOTHAND] REMEMBERED BODY FORGOTTEN #%ld - %p (id %d): %s | thread %lu", k,
+                    reinterpret_cast<void*>(m.obj), m.id, reason, GetCurrentThreadId());
+            }
+            g_mem[j] = g_mem[--g_memN];
+            continue;
+        }
+        ++j;
+        if (havePlayer) {
+            const float d = (std::fmin)(hA ? MemBoxDist(a, pc) : 1e9f, hC ? MemBoxDist(c, pc) : 1e9f);
+            if (d > kMemRangeM) { continue; }   // kept, not appended
+        }
+        if (*n >= kMaxBoxes) { continue; }
+        const int i = (*n)++;
+        for (int k = 0; k < 6; ++k) { boxA[i][k] = a[k]; boxC[i][k] = c[k]; }
+        haveA[i] = hA;
+        haveC[i] = hC;
+        outPlain[i] = false;
+        objs[i] = reinterpret_cast<void*>(m.obj);
+        const LONG k = InterlockedIncrement(&g_nMemAppended);
+        if (k == 1) {
+            // [PROBE: LOOTHAND] gate=loot_by_hand  site=HEADSET  log-only=no
+            LOG("looting: [LOOTHAND] FIRST REMEMBERED BODY - %p (id %d, %s) is not in the game's gather (searched: it offers no action) "
+                "and is added back to loot by hand's list (%d gathered, %d remembered) | thread %lu", reinterpret_cast<void*>(m.obj),
+                m.id, hC ? "a dead AI" : "a standalone container", gathered, g_memN, GetCurrentThreadId());
+        }
+    }
+    ReleaseSRWLockExclusive(&g_memLock);
+}
+
 // ---- the detour: GetNearbyTriggers (+B9BBB0). Every call (installed once the camouflage block or loot by hand needs it): the
 // original, then the camouflage-target test on the pick it just stored (a few guarded reads). COST while loot_by_hand=1: the original + one pass over its candidates (a vptr
 // compare each; for a non-BodyContainer one more vtable-slot read, and for an AI two pointer reads + one vptr read; up to two box
@@ -850,6 +1075,7 @@ void GazeTotals()
 void __fastcall NearbyHook(void* player, void* out)
 {
     g_origNearby(player, out);
+    t_hudLid = nullptr;   // the lid prompt's hand-off: only this call's null may set it (trace 20261123_1200)
     if (!player || !out) { return; }
     InterlockedIncrement(&g_nHook);
     if (DiagLootWhy) { why::Evaluate(player); }   // [LOOTWHY] - log-only; off: one bool test
@@ -865,8 +1091,13 @@ void __fastcall NearbyHook(void* player, void* out)
     //      bool test inside LidHandOnNearby.
     {
         const GameVec* lv = static_cast<const GameVec*>(out);
-        if (LidHandOnNearby(player, lv->data, lv->count, gz.data, gz.count) && !CallSetterNull(player)) {
-            InterlockedIncrement(&g_nFault);
+        void* promptLid = nullptr;
+        if (LidHandOnNearby(player, lv->data, lv->count, gz.data, gz.count, &promptLid)) {
+            if (!CallSetterNull(player)) {
+                InterlockedIncrement(&g_nFault);
+            } else {
+                t_hudLid = promptLid;   // an unlocked lid / purse: HudTrigger's getter call right after this is handed it
+            }
         }
     }
     BodyGrabPublishPlayer(player);   // severed limbs: bodygrab's level query takes the ILevel from the player
@@ -884,12 +1115,15 @@ void __fastcall NearbyHook(void* player, void* out)
         }
     }
     if (!LootByHand) { return; }
+    // the search hold's lookup target (INV-765): this HUD's player = the local player
+    InterlockedExchange64(&g_lootTarget, static_cast<LONG64>(reinterpret_cast<uintptr_t>(player) + kLookupTargetOff));
     const GameVec* v = static_cast<const GameVec*>(out);
     const uintptr_t bodyVt = g_gd + g_rBodyVt;
+    const uintptr_t contVt = g_gd + g_rContVt;
     const uintptr_t aiTrigAct = g_gd + g_rAiTrigAct;
-    int n = 0, nStandalone = 0, nAi = 0, nAiBody = 0;
+    int n = 0, nStandalone = 0, nAi = 0, nAiBody = 0, nPlain = 0;
     float boxA[kMaxBoxes][6] = {}, boxC[kMaxBoxes][6] = {};
-    bool haveA[kMaxBoxes] = {}, haveC[kMaxBoxes] = {};
+    bool haveA[kMaxBoxes] = {}, haveC[kMaxBoxes] = {}, plain[kMaxBoxes] = {};
     void* objs[kMaxBoxes];
     bool fault = false;
     // the game's gathered list, then the gaze gather's (a body near the feet is often only in the second - run 8)
@@ -908,11 +1142,12 @@ void __fastcall NearbyHook(void* player, void* out)
             if (dup) { continue; }
         }
         if (!ReadPtr(obj, &vt)) { fault = true; continue; }
-        if (vt == bodyVt) {   // a standalone container (loot_hand_run1's body)
+        if (vt == bodyVt || vt == contVt) {   // a standalone container (loot_hand_run1's body), or a plain search Container
             haveA[n] = ReadBox(reinterpret_cast<void*>(obj), boxA[n]);
             haveC[n] = false;
             if (!haveA[n]) { fault = true; continue; }
-            ++nStandalone;
+            plain[n] = vt == contVt;
+            if (plain[n]) { ++nPlain; } else { ++nStandalone; }
             objs[n++] = reinterpret_cast<void*>(obj);
             continue;
         }
@@ -928,9 +1163,13 @@ void __fastcall NearbyHook(void* player, void* out)
         haveA[n] = ReadBox(reinterpret_cast<void*>(obj), boxA[n]);
         haveC[n] = ReadBox(reinterpret_cast<void*>(c), boxC[n]);
         if (!haveA[n] && !haveC[n]) { fault = true; continue; }
+        plain[n] = false;
         ++nAiBody;
         objs[n++] = reinterpret_cast<void*>(obj);   // the setter gets the AI: X then runs the game's own path for that body
     }
+    // [LOADBEARING: remembered bodies] (loot_by_hand) a searched body the game's gather dropped (it offers no action) is added back,
+    //      re-proven by id, so body grab can take it (trace 20261122_1850).
+    MemRememberAndAppend(player, objs, plain, boxA, haveA, boxC, haveC, plain, &n);
     if (fault) { InterlockedIncrement(&g_nFault); }
     InterlockedExchange(&g_lastCand, static_cast<LONG>(count));
     InterlockedExchange(&g_lastStandalone, nStandalone);
@@ -945,9 +1184,16 @@ void __fastcall NearbyHook(void* player, void* out)
         g_haveA[i] = haveA[i];
         g_haveC[i] = haveC[i];
         g_boxObj[i] = objs[i];
+        g_boxPlain[i] = plain[i];
     }
     g_boxCount = n;
     InterlockedIncrement(&g_boxSeq);   // even: settled
+    if (nPlain > 0 && InterlockedIncrement(&g_nPlainSaid) == 1) {
+        // [PROBE: LOOTHAND] gate=loot_by_hand  site=HEADSET  log-only=yes
+        LOG("looting: [LOOTHAND] FIRST PLAIN CONTAINER gathered - %d plain search container(s) (bag / bin / payphone ..., Container "
+            "vftable +%llX as loaded) beside %d standalone body container(s) and %d dead AI with one | thread %lu",
+            nPlain, static_cast<unsigned long long>(g_rContVt), nStandalone, nAiBody, GetCurrentThreadId());
+    }
 
     if (g_lootHand < 0) {
         InterlockedIncrement(&g_nPass);
@@ -989,9 +1235,222 @@ void __fastcall NearbyHook(void* player, void* out)
         // [PROBE: LOOTHAND] gate=loot_by_hand  site=HEADSET  log-only=no
         LOG("looting: [LOOTHAND] PICK %s #%ld - the hand's body %p (%s; %.3f m from the hand - own box %.3f, container box %.3f, "
             "-1 = none) replaces the game's pick %p | %d bodies gathered | thread %lu",
-            ok ? "SET" : "*** SETTER FAULTED ***", k, objs[best], bdc >= 0.0f ? "a dead AI" : "a standalone container", bd, bda,
+            ok ? "SET" : "*** SETTER FAULTED ***", k, objs[best],
+            bdc >= 0.0f ? "a dead AI" : (plain[best] ? "a plain search container" : "a standalone container"), bd, bda,
             bdc, curOk && h ? reinterpret_cast<void*>(cur) : nullptr, n, GetCurrentThreadId());
     }
+}
+
+// ---- the grip glyph (trace 20261122_1740). ----
+// Is `trig` one loot by hand would search: a standalone BodyContainer or a dead AI holding one (IsBody), or a plain Container - in
+// container state 1 exactly. COST: one vptr read + IsBody's / ContainerState's guarded reads.
+bool HandSearchTarget(uintptr_t trig)
+{
+    uintptr_t vt = 0;
+    if (!g_gd || !ReadPtr(trig, &vt)) { return false; }
+    if (vt != g_gd + g_rContVt && !why::IsBody(trig)) { return false; }
+    return ContainerState(reinterpret_cast<void*>(trig)) == static_cast<int>(kStateSearchable);
+}
+bool CallSetTextW(uintptr_t el, WideStr* s)
+{
+    __try {
+        const uintptr_t vt = *reinterpret_cast<const uintptr_t*>(el);
+        using SetTextFn = void(__fastcall*)(void* self, WideStr* text);
+        reinterpret_cast<SetTextFn>(*reinterpret_cast<const uintptr_t*>(vt + kSetTextWOff))(reinterpret_cast<void*>(el), s);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// [LOADBEARING: grip glyph] (loot_by_hand) the X prompt of a body / plain container a hand can search shows Jay's grip (U+E075)
+//      instead of the X glyph - the game's slot update runs first and unchanged; only that slot's T_Key text is replaced afterwards.
+// COST: per slot update (4 per HUD update): the original + two dword reads; for the X slot with a trigger the identity reads above;
+// one vfunc call only when it qualifies.
+bool CallSetTextKey(uintptr_t el, NarrowStr* s)
+{
+    __try {
+        const uintptr_t vt = *reinterpret_cast<const uintptr_t*>(el);
+        using SetKeyFn = void(__fastcall*)(void* self, NarrowStr* key);
+        reinterpret_cast<SetKeyFn>(*reinterpret_cast<const uintptr_t*>(vt + kSetTextKeyOff))(reinterpret_cast<void*>(el), s);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// The X slot's T_Key -> the grip (U+E075). True = set. COST: two guarded reads + one vfunc call.
+bool SetGripGlyph(uintptr_t s, uint32_t* presetOut, uintptr_t* elOut)
+{
+    uintptr_t raw = 0;
+    if (!ReadPtr(s + kSlotPresetOff, &raw)) { return false; }
+    const uint32_t preset = static_cast<uint32_t>(raw);
+    if (preset > 1) { return false; }   // the slot carries two presets (the update's own loop over 2, ctn9 :678-688)
+    uintptr_t el = 0;
+    if (!ReadPtr(s + kSlotPresetStride * preset + kSlotKeyTextOff, &el) || !el) { return false; }
+    WideStr w{ g_gripText, 1, 1 };
+    *presetOut = preset;
+    *elOut = el;
+    return CallSetTextW(el, &w);
+}
+
+void __fastcall SlotUpdateHook(void* slot, void* trigger)
+{
+    ++t_inSlotUpdate;   // the camouflage hide applies only to the action queries made inside this call (CamoOfferHook)
+    g_origSlot(slot, trigger);
+    --t_inSlotUpdate;
+    if (!slot || !trigger || g_installState != 1) { return; }
+    // the in-world prompt (trace 20261123_1356): reads the X slot's visibility, the key the game just set and the object's box -
+    // BEFORE the lid branch below rewrites that key to &TriggerGrab&. inworld_prompts=0 -> one bool test inside.
+    PromptQuadOnSlot(slot, trigger);
+    const uintptr_t s = reinterpret_cast<uintptr_t>(slot);
+    uintptr_t raw = 0;
+    // [LOADBEARING: lid prompt] (lid_by_hand) the prompt HudTrigger was handed for a lid / purse (PickGetHook): grip glyph + "Grab"
+    //      (TriggerGrab, the game's own translations) - the game built "X Open" first; X itself still has no target (trace
+    //      20261123_1200). COST: one pointer compare per slot update; two vfunc calls only on the lid's X slot.
+    if (LidByHand && trigger == g_promptLid) {
+        if (!ReadPtr(s + kSlotTypeOff, &raw) || static_cast<uint32_t>(raw) != 0) { return; }   // not the X slot
+        uint32_t preset = 0;
+        uintptr_t el = 0;
+        const bool glyph = SetGripGlyph(s, &preset, &el);
+        uintptr_t txt = 0;
+        NarrowStr k{ g_grabKey, static_cast<uint32_t>(sizeof(g_grabKey) - 1), static_cast<uint32_t>(sizeof(g_grabKey) - 1) };
+        const bool text = ReadPtr(s + kSlotActionTextOff, &txt) && txt && CallSetTextKey(txt, &k);
+        const LONG n = (glyph && text) ? InterlockedIncrement(&g_nGrabText) : InterlockedIncrement(&g_nGrabTextFault);
+        if (n == 1) {
+            // [PROBE: LOOTHAND] gate=lid_by_hand  site=HEADSET  log-only=no
+            LOG("looting: [LOOTHAND] FIRST GRAB TEXT %s - X slot of lid / purse %p: T_Key %p (preset %u) -> U+E075 %s, action text "
+                "%p -> \"%s\" %s | thread %lu", (glyph && text) ? "SET" : "*** FAULTED ***", trigger, reinterpret_cast<void*>(el),
+                preset, glyph ? "ok" : "NOT SET", reinterpret_cast<void*>(txt), g_grabKey, text ? "ok" : "NOT SET",
+                GetCurrentThreadId());
+        }
+        return;
+    }
+    if (!LootByHand) { return; }
+    if (!ReadPtr(s + kSlotTypeOff, &raw) || static_cast<uint32_t>(raw) != 0) { return; }   // not the X slot
+    if (!HandSearchTarget(reinterpret_cast<uintptr_t>(trigger))) { return; }
+    if (!ReadPtr(s + kSlotPresetOff, &raw)) { return; }
+    const uint32_t preset = static_cast<uint32_t>(raw);
+    if (preset > 1) { return; }   // the slot carries two presets (the update's own loop over 2, ctn9 :678-688)
+    uintptr_t el = 0;
+    if (!ReadPtr(s + kSlotPresetStride * preset + kSlotKeyTextOff, &el) || !el) { return; }
+    WideStr w{ g_gripText, 1, 1 };
+    const bool ok = CallSetTextW(el, &w);
+    const LONG k = ok ? InterlockedIncrement(&g_nGlyph) : InterlockedIncrement(&g_nGlyphFault);
+    if (k == 1) {
+        // [PROBE: LOOTHAND] gate=loot_by_hand  site=HEADSET  log-only=no
+        LOG("looting: [LOOTHAND] FIRST GRIP GLYPH %s - X slot of trigger %p (a %s, searchable) preset %u, T_Key %p set to U+E075 | "
+            "thread %lu", ok ? "SET" : "*** SET FAULTED - the X glyph stays ***", trigger,
+            why::IsBody(reinterpret_cast<uintptr_t>(trigger)) ? "body" : "plain container", preset, reinterpret_cast<void*>(el),
+            GetCurrentThreadId());
+    }
+}
+
+void InstallGripGlyph()
+{
+    int attempts = 0;
+    // the trampoline goes straight into g_origSlot (as boltwheel's g_lookupTrue): the hook can never run with it unset
+    const bool ok = InstallSingleGameDetour(g_gd + kSlotUpdateRva, kSlotUpdateBytes, sizeof(kSlotUpdateBytes),
+                                            reinterpret_cast<void*>(&SlotUpdateHook), reinterpret_cast<void**>(&g_origSlot),
+                                            "loot grip glyph slot update", &attempts);
+    InterlockedExchange(&g_glyphState, ok ? 1 : -1);
+    // [PROBE: LOOTHAND] gate=loot_by_hand  site=FLAT  log-only=yes
+    LOG("looting: [LOOTHAND] GRIP GLYPH %s - HudTriggerSlot::Update (Steam +%llX, as loaded +%llX) %s (%zu bytes, %d attempt(s)); "
+        "the X prompt of a searchable body / plain container %s",
+        ok ? "READY" : "REFUSED", static_cast<unsigned long long>(kSlotUpdateRva), static_cast<unsigned long long>(g_rSlotUpdate),
+        ok ? "detoured" : "NOT detoured - its first bytes differ from the builds these were read from, or the write was refused",
+        sizeof(kSlotUpdateBytes), attempts, ok ? "shows the grip (U+E075)" : "keeps the game's X glyph");
+}
+
+// ---- the lid prompt (trace 20261123_1200). ----
+// [LOADBEARING: lid prompt] (lid_by_hand) the pick getter +B9BB40 hands HudTrigger (its call at +5B9CF6 only) the lid / purse that
+//      NearbyHook just nulled, so the game builds and places its own prompt for it; every other caller gets the game's value (the
+//      null pick - X has no target). No write to the player's pick (D-393).
+// COST: every getter call (16 sites, the input handlers per update): the original + one _ReturnAddress compare; at HudTrigger's
+// site (<= every 0.1 s) two pointer writes.
+void* __fastcall PickGetHook(void* player)
+{
+    void* r = g_origPickGet(player);
+    if (reinterpret_cast<uintptr_t>(_ReturnAddress()) != g_hudPickRet) { return r; }
+    void* const lid = t_hudLid;
+    t_hudLid = nullptr;   // one shot
+    if (!r && lid) {
+        r = lid;
+        if (InterlockedIncrement(&g_nLidPrompt) == 1) {
+            // [PROBE: LIDHAND] gate=lid_by_hand  site=HEADSET  log-only=no
+            LOG("looting: [LIDHAND] FIRST LID PROMPT - HudTrigger handed the lid / purse %p the null pick hid (the player's pick "
+                "stays null: X has no target) | thread %lu", lid, GetCurrentThreadId());
+        }
+    }
+    InterlockedExchangePointer(const_cast<void**>(&g_promptLid), (lid && r == lid) ? lid : nullptr);
+    return r;
+}
+
+void InstallLidPrompt()
+{
+    const uintptr_t ret = g_gd + DLVR_LOOT_GD_RVA(kHudPickRetRva);
+    const uintptr_t get = g_gd + DLVR_LOOT_GD_RVA(kPickGetRva);
+    unsigned char op = 0;
+    int32_t rel = 0;
+    bool siteOk = false;
+    __try {
+        op = *reinterpret_cast<const unsigned char*>(ret - 5);
+        rel = *reinterpret_cast<const int32_t*>(ret - 4);
+        siteOk = op == 0xE8 && ret + static_cast<intptr_t>(rel) == get;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { siteOk = false; }
+    int attempts = 0;
+    bool ok = false;
+    if (siteOk) {
+        g_hudPickRet = ret;
+        MemoryBarrier();
+        // the trampoline goes straight into g_origPickGet: the hook can never run with it unset
+        ok = InstallSingleGameDetour(g_gd + kPickGetRva, kPickGetBytes, sizeof(kPickGetBytes), reinterpret_cast<void*>(&PickGetHook),
+                                     reinterpret_cast<void**>(&g_origPickGet), "lid prompt pick getter", &attempts);
+        if (!ok) { g_hudPickRet = 0; }
+    }
+    InterlockedExchange(&g_pickGetState, ok ? 1 : -1);
+    // [PROBE: LOOTHAND] gate=always (no key)  site=FLAT  log-only=yes
+    LOG("looting: [LOOTHAND] LID PROMPT %s - HudTrigger's getter return (Steam +%llX, as loaded +%llX): byte at -5 = %02X, call target "
+        "%s (+%llX expected); pick getter (Steam +%llX) %s (%zu bytes, %d attempt(s)) - an unlocked lid / purse %s",
+        ok ? "READY" : "REFUSED", static_cast<unsigned long long>(kHudPickRetRva), static_cast<unsigned long long>(ret - g_gd),
+        op, siteOk ? "matches" : "*** DOES NOT MATCH - not this build's call site ***", static_cast<unsigned long long>(get - g_gd),
+        static_cast<unsigned long long>(kPickGetRva),
+        ok ? "detoured" : (siteOk ? "NOT detoured - its first bytes differ, or the write was refused" : "not attempted"),
+        sizeof(kPickGetBytes), attempts, ok ? "shows the game's prompt with the grip + Grab" : "shows no prompt (as before)");
+}
+
+// ---- the camouflage prompt hidden (trace 20261122_1800). ----
+// [LOADBEARING: camo prompt hidden] (no key, always on in VR - like the grip camouflage block) the infected module's R1 offer never
+//      returns action 53: the game's own no-camouflage answer instead, so no "RB Use Camouflage" prompt and no R1 camouflage; the wipe
+//      gesture (camogesture.cpp) starts camouflage on its own path.
+// COST: per R1-slot action query on an infected corpse: the original + one compare; the fallback call only where 53 would have been.
+long long __fastcall CamoOfferHook(void* module, void* ctx)
+{
+    const long long r = g_origCamoOffer(module, ctx);
+    if (static_cast<int>(r) != kCamoAction) { return r; }   // the callers read the action as a dword (lf6: `!(_DWORD)result`)
+    if (t_inSlotUpdate <= 0) { return r; }                    // not the prompt build: the gather / the press / the AI keep 53
+    const long long alt = reinterpret_cast<CamoOfferFn>(g_gd + g_rNoCamoAnswer)(module, ctx);
+    if (InterlockedIncrement(&g_nCamoHidden) == 1) {
+        // [PROBE: LOOTHAND] gate=always (no key)  site=HEADSET  log-only=no
+        LOG("looting: [LOOTHAND] FIRST CAMOUFLAGE OFFER HIDDEN - the infected module %p offered action 53 (the skill is learned); "
+            "returned %d instead (the game's own no-camouflage answer) | thread %lu", module, static_cast<int>(alt),
+            GetCurrentThreadId());
+    }
+    return alt;
+}
+
+void InstallCamoOfferHide()
+{
+    int attempts = 0;
+    const bool ok = InstallSingleGameDetour(g_gd + kInfectedSlot1Rva, kCamoOfferBytes, sizeof(kCamoOfferBytes),
+                                            reinterpret_cast<void*>(&CamoOfferHook), reinterpret_cast<void**>(&g_origCamoOffer),
+                                            "loot camouflage offer", &attempts);
+    InterlockedExchange(&g_camoOfferState, ok ? 1 : -1);
+    // [PROBE: LOOTHAND] gate=always (no key)  site=FLAT  log-only=yes
+    LOG("looting: [LOOTHAND] CAMOUFLAGE PROMPT %s - the infected module's R1 offer (Steam +%llX, as loaded +%llX) %s (%zu bytes, %d "
+        "attempt(s)); fallback +%llX as loaded",
+        ok ? "HIDDEN" : "NOT HIDDEN", static_cast<unsigned long long>(kInfectedSlot1Rva), static_cast<unsigned long long>(g_rInfectedSlot1),
+        ok ? (g_glyphState == 1 ? "detoured - action 53 is withheld from the 2D prompt only (inside HudTriggerSlot::Update); the "
+                                  "gather and the press keep it"
+                                : "detoured, but the slot-update detour is NOT live - nothing is hidden (the scope never opens)")
+           : "NOT detoured - its first bytes differ, or the write was refused; the game's prompt stays",
+        sizeof(kCamoOfferBytes), attempts, static_cast<unsigned long long>(g_rNoCamoAnswer));
 }
 
 void TryInstall()
@@ -1013,6 +1472,9 @@ void TryInstall()
     // the build's rvas first (Steam, or the Epic build's from buildrva_table.h), then the base the readers test
     g_rSetter = DLVR_LOOT_GD_RVA(kSetterRva);
     g_rBodyVt = DLVR_LOOT_GD_RVA(kBodyVtRva);
+    g_rContVt = DLVR_LOOT_GD_RVA(kContainerVtRva);
+    g_rSlotUpdate = DLVR_LOOT_GD_RVA(kSlotUpdateRva);
+    g_rNoCamoAnswer = DLVR_LOOT_GD_RVA(kNoCamoAnswerRva);
     g_rAiTrigAct = DLVR_LOOT_GD_RVA(kAiTrigActRva);
     g_rInfectedSlot1 = DLVR_LOOT_GD_RVA(kInfectedSlot1Rva);
     g_rGather = DLVR_LOOT_GD_RVA(kGatherRva2);
@@ -1024,6 +1486,8 @@ void TryInstall()
     MemoryBarrier();
     g_gd = reinterpret_cast<uintptr_t>(gd);
     g_extents = reinterpret_cast<ExtentsFn>(GetProcAddress(en, kExtentsExport));
+    g_memGetId = reinterpret_cast<MemGetIdFn>(GetProcAddress(en, "?GetID@IGSObject@@QEBAHXZ"));
+    g_memFind = reinterpret_cast<MemFindFn>(GetProcAddress(en, "?FindObjectByID@IGSObject@@UEBAPEAV1@H@Z"));
     g_setter = reinterpret_cast<SetterFn>(g_gd + g_rSetter);
     if (!g_extents) {
         InterlockedExchange(&g_installState, -1);
@@ -1048,13 +1512,21 @@ void TryInstall()
     InterlockedExchange(&g_installState, 1);
     // [PROBE: LOOTHAND] gate=loot_by_hand  site=FLAT  log-only=no
     LOG("looting: [LOOTHAND] READY - GetNearbyTriggers (Steam +%llX) detoured (%zu bytes verified, %d attempt(s)), setter +%llX, "
-        "body vftable +%llX, AI slot 179 +%llX, camouflage slot +%llX (as loaded; Steam %s), extents %p | reach %.2f m, still < "
-        "%.2f m/s, settle %.2f s",
+        "body vftable +%llX, plain Container vftable +%llX, AI slot 179 +%llX, camouflage slot +%llX (as loaded; Steam %s), extents "
+        "%p | reach %.2f m, still < %.2f m/s, settle %.2f s | remembered bodies: GetID %p FindObjectByID %p (%s)",
         static_cast<unsigned long long>(kNearbyRva), sizeof(kNearbyBytes), attempts,
         static_cast<unsigned long long>(g_rSetter), static_cast<unsigned long long>(g_rBodyVt),
+        static_cast<unsigned long long>(g_rContVt),
         static_cast<unsigned long long>(g_rAiTrigAct), static_cast<unsigned long long>(g_rInfectedSlot1),
         g_rSetter == kSetterRva ? "values" : "values translated - the Epic build",
-        reinterpret_cast<void*>(g_extents), LootReachM, LootStillSpeed, LootSettleS);
+        reinterpret_cast<void*>(g_extents), LootReachM, LootStillSpeed, LootSettleS, reinterpret_cast<void*>(g_memGetId),
+        reinterpret_cast<void*>(g_memFind),
+        g_memGetId && g_memFind ? "on - a searched body stays grabbable" : "OFF - an export is missing; a searched body leaves the list");
+    // the camouflage prompt is hidden always (the grip block that makes it name a dead input is always on). The slot-update detour
+    // installs FIRST and always: it is what scopes the hide to the prompt (t_inSlotUpdate); its grip-glyph part checks loot_by_hand.
+    InstallGripGlyph();
+    InstallLidPrompt();   // after the slot-update detour: its glyph / text half lives in SlotUpdateHook
+    InstallCamoOfferHide();
 }
 
 void LogTotals()
@@ -1065,12 +1537,14 @@ void LogTotals()
     last = now;
     LOG_PERIODIC("looting: [LOOTHAND] 5 s totals (session) | install %ld | hook calls %ld, picks set %ld, passed through %ld, "
                  "armed with no body in reach %ld, read faults %ld | ARM %ld, NO-ARM %ld, SEARCH %ld, END grip opened %ld / moved "
-                 "%ld / body gone %ld | DRAG %ld, drag END %ld | bodies gathered now %d",
+                 "%ld / body gone %ld | DRAG %ld, drag END %ld | bodies gathered now %d | lid prompt %ld: handed %ld, grab text %ld "
+                 "(faults %ld)",
                  static_cast<long>(g_installState), static_cast<long>(g_nHook), static_cast<long>(g_nSub),
                  static_cast<long>(g_nPass), static_cast<long>(g_nNoBody), static_cast<long>(g_nFault),
                  static_cast<long>(g_nArm), static_cast<long>(g_nNoArm), static_cast<long>(g_nSearch),
                  static_cast<long>(g_nEndOpen), static_cast<long>(g_nEndMoved), static_cast<long>(g_nEndGone),
-                 static_cast<long>(g_nDrag), static_cast<long>(g_nEndDrag), g_boxCount);
+                 static_cast<long>(g_nDrag), static_cast<long>(g_nEndDrag), g_boxCount, static_cast<long>(g_pickGetState),
+                 static_cast<long>(g_nLidPrompt), static_cast<long>(g_nGrabText), static_cast<long>(g_nGrabTextFault));
 }
 
 }  // namespace
@@ -1119,7 +1593,8 @@ void LootPoll(bool vrGrip, bool leftOwned, bool rightOwned, bool& withholdL1, bo
         const float speed = winSpeed < 0.0f ? 0.0f : winSpeed;
         float dist = -1.0f, distOwn = -1.0f, distCont = -1.0f;
         void* body = nullptr;
-        if (havePos && NearestBox(pos, &dist, &body, &distOwn, &distCont) < 0) { dist = -1.0f; }
+        bool isPlain = false;   // a plain search Container (trace 20261122_1620): no body-grab reading, never a drag
+        if (havePos && NearestBox(pos, &dist, &body, &distOwn, &distCont, &isPlain) < 0) { dist = -1.0f; }
         if (BodyGrab && havePos) { BodyGrabPublishHand(hi, pos, rot, now); }
         CamoGesturePadPoll(hi, trk, havePos, now);   // the camouflage wipe (camo_gesture off: one bool test)
         // Severed limbs (Jay: "Yes please"): bodygrab looks for them on the game thread while this grip is squeezed; one nearer than
@@ -1127,7 +1602,9 @@ void LootPoll(bool vrGrip, bool leftOwned, bool rightOwned, bool& withholdL1, bo
         if (BodyGrab) { BodyGrabPublishSqueeze(hi, sq); }
         const float outerReach = LootReachM > BodyGrabReachM ? LootReachM : BodyGrabReachM;
         // The gathered body stays the candidate while a limb is near, so its hitbox reading keeps coming (10-24 (2)).
-        if (BodyGrab) { BodyGrabPublishCandidate(hi, (havePos && body && dist >= 0.0f && dist <= outerReach) ? body : nullptr); }
+        if (BodyGrab) {
+            BodyGrabPublishCandidate(hi, (havePos && body && !isPlain && dist >= 0.0f && dist <= outerReach) ? body : nullptr);
+        }
         bool isRelict = false;
         float corpseHit = -1.0f;
         float limbD = -1.0f;   // the fresh severed-limb reading for this hand (-1 = none), logged with the press
@@ -1136,7 +1613,7 @@ void LootPoll(bool vrGrip, bool leftOwned, bool rightOwned, bool& withholdL1, bo
             // the corpse's box (a hand inside a lying corpse's box reads 0 there, and that box still spans a part cut off it:
             // hitbox_dump_run1) nor its skeleton (it keeps a cut part's bones). A corpse with no hitbox reading (ragdoll released)
             // never beats a limb within the margin. A tie goes to the limb.
-            corpseHit = body ? BodyGrabHitOf(hi, body) : -1.0f;
+            corpseHit = (body && !isPlain) ? BodyGrabHitOf(hi, body) : -1.0f;
             float rd = -1.0f;
             void* rel = BodyGrabRelictOf(hi, &rd);
             limbD = rel ? rd : -1.0f;
@@ -1150,6 +1627,7 @@ void LootPoll(bool vrGrip, bool leftOwned, bool rightOwned, bool& withholdL1, bo
                 distOwn = rd;
                 distCont = -1.0f;
                 isRelict = true;
+                isPlain = false;
             }
         }
         const bool inReach = havePos && body && dist >= 0.0f && dist <= outerReach;
@@ -1161,12 +1639,16 @@ void LootPoll(bool vrGrip, bool leftOwned, bool rightOwned, bool& withholdL1, bo
         // hand is the torso, any other bone is not; no reading = the box rule. And a body already searched is never the torso
         // (Jay: "a body can only be searched for loot a singular time"): its press grabs.
         const bool boxTorso = !isRelict && (distCont < 0.0f || distCont <= LootReachM);
-        const int skelTorso = (BodyGrab && inReach) ? BodyGrabTorsoOf(hi, body) : -1;
+        const int skelTorso = (BodyGrab && inReach && !isPlain) ? BodyGrabTorsoOf(hi, body) : -1;
         const int cstate = inReach ? ContainerState(body) : -1;
-        const bool searchable = cstate < 0 || cstate == static_cast<int>(kStateSearchable);
+        // a plain container (trace 20261122_1620) is searchable at state 1 EXACTLY - closed (2), locked (10), searched (5) or unread
+        // keep the game's own X; a body as before (unread = searchable)
+        const bool searchable = isPlain ? cstate == static_cast<int>(kStateSearchable)
+                                        : (cstate < 0 || cstate == static_cast<int>(kStateSearchable));
         const bool onTorso = (skelTorso >= 0 ? skelTorso == 1 : boxTorso) && searchable;
         looting::Params prm = prmBase;
-        if (BodyGrab && !onTorso) { prm.reachM = BodyGrabReachM; }
+        if (isPlain) { prm.dragEnabled = false; }   // a press on a bag / bin / payphone never becomes a body-grab drag
+        if (BodyGrab && !onTorso && !isPlain) { prm.reachM = BodyGrabReachM; }
         // a press that finds nothing while the severed-limb search is still due waits for it (looting_logic Params.lateArmS)
         if (BodyGrab) { prm.lateArmS = kLateArmS; }
         looting::Input in;
@@ -1174,8 +1656,8 @@ void LootPoll(bool vrGrip, bool leftOwned, bool rightOwned, bool& withholdL1, bo
         // A drag owns its body: BodyGrabTick re-validates it every player update and names an END there; the machine keeps the
         // grip withheld until it opens, whatever happened to the body (a body vanishing mid-squeeze must not send L1 / R1).
         in.bodyDist = before == looting::State::Dragging ? 0.0f : (havePos ? dist : -1.0f);
-        // without body_grab a searched body offers nothing: the press does not arm ("no body")
-        if (!BodyGrab && !searchable && before == looting::State::Idle) { in.bodyDist = -1.0f; }
+        // without body_grab a searched body offers nothing: the press does not arm ("no body"); a plain container likewise, always
+        if ((!BodyGrab || isPlain) && !searchable && before == looting::State::Idle) { in.bodyDist = -1.0f; }
         in.handSpeed = speed;
         in.nowS = now;
         in.gripOwnedElsewhere = hi == 0 ? leftOwned : rightOwned;
@@ -1204,7 +1686,8 @@ void LootPoll(bool vrGrip, bool leftOwned, bool rightOwned, bool& withholdL1, bo
                 "%.2f m/s over ~100 ms (-1 = under 50 ms of samples since the press) | grip %.2f | torso %d (body_grab %d) - box rule %d, "
                 "skeleton %d (-1 = no fresh reading), container state %d (%s) | gathered body's hitbox %.3f m (-1 = no fresh "
                 "reading) | nearest severed limb %.3f m (-1 = no fresh reading) | waited %.0f ms for the limb reading (-1 = no wait)",
-                ev, hi == 0 ? "left" : "right", body, isRelict ? "a severed limb" : "gathered", dist, distOwn, distCont, winSpeed, sq,
+                ev, hi == 0 ? "left" : "right", body, isRelict ? "a severed limb" : (isPlain ? "a plain search container" : "gathered"),
+                dist, distOwn, distCont, winSpeed, sq,
                 onTorso ? 1 : 0, BodyGrab ? 1 : 0,
                 boxTorso ? 1 : 0, skelTorso, cstate, cstate < 0 ? "unread - searchable as before" : searchable ? "searchable"
                                                                                                              : "already searched",
@@ -1275,9 +1758,12 @@ holster::Yield LootYieldAt(int hand, bool pressEdge, float* outDist, bool* outLi
     const float reach = (BodyGrab && BodyGrabReachM > LootReachM) ? BodyGrabReachM : LootReachM;
     float dist = -1.0f, distOwn = -1.0f, distCont = -1.0f;
     void* body = nullptr;
-    if (NearestBox(pos, &dist, &body, &distOwn, &distCont) >= 0 && body && dist >= 0.0f && dist <= reach) {
+    bool isPlain = false;
+    if (NearestBox(pos, &dist, &body, &distOwn, &distCont, &isPlain) >= 0 && body && dist >= 0.0f &&
+        dist <= (isPlain ? LootReachM : reach)) {
         const int cs = ContainerState(body);
-        if (BodyGrab || cs < 0 || cs == static_cast<int>(kStateSearchable)) {
+        // a plain search container (trace 20261122_1620) takes the hip press only while LootPoll would search it: state 1 exactly
+        if (isPlain ? cs == static_cast<int>(kStateSearchable) : (BodyGrab || cs < 0 || cs == static_cast<int>(kStateSearchable))) {
             if (outDist) { *outDist = dist; }
             return holster::Yield::Yes;
         }
@@ -1321,11 +1807,39 @@ void GripCamoPoll(bool vrGrip, bool& withholdR1)
     withholdR1 = w;
 }
 
+// 2026-11-22 (71) (Jay: Survivor Sense "can currently fire from a grip being held on a body"; INV-765, trace 20261122_1620): Square
+// only as the search's START tap (looting::kSearchTapS); the hold after it is the input lookup reading action 20 held for the local
+// player (boltwheel.cpp LookupHook), stamped here every poll. Survivor Sense (X held 0.5 s) and the other X holds never see a hold.
+// With the lookup detour not live: Square for the whole search, as before. COST: one QPC read, two state reads, three interlocked
+// stores per poll.
 void LootPadByte(unsigned char* p)
 {
     if (!LootByHand || !p) { return; }
-    if (g_machine[0].state() == looting::State::Searching || g_machine[1].state() == looting::State::Searching) {
+    static bool s_prevSearch[2] = {};
+    static double s_startS[2] = { -1.0, -1.0 };
+    const double now = NowS();
+    bool searching = false;
+    double since = -1.0;
+    for (int hi = 0; hi < 2; ++hi) {
+        const bool s = g_machine[hi].state() == looting::State::Searching;
+        if (s && !s_prevSearch[hi]) { s_startS[hi] = now; }
+        s_prevSearch[hi] = s;
+        if (s) {
+            searching = true;
+            since = now - s_startS[hi];
+        }
+    }
+    const unsigned long long target = static_cast<unsigned long long>(g_lootTarget);
+    const bool live = InputLookupTriggerHoldLive() && target != 0;
+    InputLookupSetTriggerHold(searching && live, target);
+    if (looting::SquareForSearch(searching, since, live)) {
         *reinterpret_cast<uint32_t*>(p) |= 0x8000u;   // Square = the game's X (_ACTION_EXECUTE_TRIGGER, inputs_pad.scr:56)
+    }
+    if (searching && InterlockedCompareExchange(&g_nTapSaid, 1, 0) == 0) {
+        // [PROBE: LOOTHAND] gate=loot_by_hand  site=HEADSET  log-only=yes
+        LOG("looting: [LOOTHAND] FIRST SEARCH X - %s (lookup hold %s, target %p)",
+            live ? "a start tap only, the search held by the input lookup" : "X held for the whole search (Survivor Sense can fire)",
+            live ? "LIVE" : (target == 0 ? "no target yet" : "NOT LIVE"), reinterpret_cast<void*>(target));
     }
 }
 

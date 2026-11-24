@@ -44,6 +44,15 @@ inline int ShowLookup(int actionId, int showAction, bool wantFresh, bool xBlocke
     return xBlocked ? 0 : -1;
 }
 
+// Loot by hand's search hold (2026-11-22 (71), Jay: Survivor Sense must not fire while a hand searches; INV-765, trace
+// 20261122_1620): TriggerController::Update holds a trigger while the lookup reads action 20 > 0 for the player's target (player +
+// 2288 - PlayerDI slot 324 +BA0F20). Forced held only for that id, a fresh want, and the want's own target (never a 0 target).
+constexpr int kTriggerHoldAction = 20;   // ida/ctn2: sub_1800A8FE0 table +139FB18 [20, 126, 127, 128], index 0
+inline bool TriggerHoldLookup(int actionId, bool wantFresh, unsigned long long target, unsigned long long wantTarget)
+{
+    return actionId == kTriggerHoldAction && wantFresh && wantTarget != 0 && target == wantTarget;
+}
+
 // The reload prompt (2026-11-11, Jay: "hide the 'PRESS X/SQUARE TO RELOAD' text" -> "Reload prompt only"). OUR gamedll 97046bba
 // (ida/rn1..rn6): HudReloadNotifyDI's Update +5A7FF0 shows the prompt type its picker +5A8CE0 returns (0 = hidden); the picker collects
 // candidates, sorts them by priority +5A7CB0 (ascending; reload 1 -> 3, an unknown type -> 100) and returns the first. The reload

@@ -43,6 +43,18 @@ inline float NearerBoxDist(const float a[6], bool haveA, const float c[6], bool 
     return *da < *dc ? *da : *dc;
 }
 
+// Square for a search (2026-11-22 (71), INV-765, trace 20261122_1620): the game's X is the START press only - kSearchTapS of it from
+// the moment the hand enters SEARCHING - and the hold after that comes from the input-lookup detour (action 20 read as held). Survivor
+// Sense is X held 0.5 s and the shortest other X hold is 0.3 s (binds_table.gen.h input 2), so the tap reaches none of them. With the
+// lookup hold NOT live, Square for the whole search, as before. sinceStartS < 0 = no search start seen.
+constexpr double kSearchTapS = 0.15;   // my call: under 0.3 s, and many game frames at any frame rate
+inline bool SquareForSearch(bool searching, double sinceStartS, bool lookupHoldLive)
+{
+    if (!searching) { return false; }
+    if (!lookupHoldLive) { return true; }
+    return sinceStartS >= 0.0 && sinceStartS < kSearchTapS;
+}
+
 // Right grip camouflage block (Jay 10-23 (3), option 1): whether a press is withheld is decided ONCE, at its down edge, and held until
 // the grip opens - a target that comes or goes mid-press never makes R1 start or stop half way through a hold. Step returns
 // "withhold now". The first sample only learns the grip state (a grip already held at start is not a press).
