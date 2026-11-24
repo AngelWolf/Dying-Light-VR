@@ -20,7 +20,13 @@ constexpr float kExitScale = 1.2f;
 // Yaw extraction is the same formula as ovr2xr.cpp's vr_decouple (atan2 about +Y).
 inline float HeadYaw(float qx, float qy, float qz, float qw)
 {
-    return std::atan2(2.0f * (qw * qy + qx * qz), 1.0f - 2.0f * (qy * qy + qx * qx));
+    // Project the head's forward vector (0, 0, -1) rotated by q onto the horizontal XZ plane so roll/pitch tilt never couples into yaw.
+    const float fwdX = -2.0f * (qx * qz + qw * qy);
+    const float fwdZ = -(1.0f - 2.0f * (qx * qx + qy * qy));
+    if (fwdX * fwdX + fwdZ * fwdZ < 1e-8f) {
+        return std::atan2(2.0f * (qw * qy + qx * qz), 1.0f - 2.0f * (qy * qy + qx * qx));
+    }
+    return std::atan2(-fwdX, -fwdZ);
 }
 
 // The same, with the yaw (radians, left positive) given - the body-lock's frame (2026-10-20).
@@ -312,8 +318,8 @@ constexpr float  kConfirmMinM   = 0.08f;                   // a hand nearer than
 constexpr double kStandHoldS = 1.5;
 
 inline FacingWhy FacingStepV2(Facing& f, const Vec3& neck, const Vec3& l, const Vec3& r, bool lOk, bool rOk, float headYaw,
-                              float headPitch, bool zoneFreeze, bool otherFreeze, bool squeezed, double nowS, float dtS,
-                              bool standing = false)
+    float headPitch, bool zoneFreeze, bool otherFreeze, bool squeezed, double nowS, float dtS,
+    bool standing = false, bool standingMode = false)
 {
     if (!f.have) {
         f.have = true;
@@ -325,9 +331,11 @@ inline FacingWhy FacingStepV2(Facing& f, const Vec3& neck, const Vec3& l, const 
     if (!lOk || !rOk) {
         f.prevAtS = -1.0;
         f.speedL = f.speedR = 1e9f;
-    } else if (f.prevAtS < 0.0) {
+    }
+    else if (f.prevAtS < 0.0) {
         f.prevL = l; f.prevR = r; f.prevAtS = nowS;
-    } else if (nowS - f.prevAtS >= kSpeedWindowS) {
+    }
+    else if (nowS - f.prevAtS >= kSpeedWindowS) {
         const float inv = static_cast<float>(1.0 / (nowS - f.prevAtS));
         const float lx = l.x - f.prevL.x, ly = l.y - f.prevL.y, lz = l.z - f.prevL.z;
         const float rx = r.x - f.prevR.x, ry = r.y - f.prevR.y, rz = r.z - f.prevR.z;
@@ -335,6 +343,16 @@ inline FacingWhy FacingStepV2(Facing& f, const Vec3& neck, const Vec3& l, const 
         f.speedR = std::sqrt(rx * rx + ry * ry + rz * rz) * inv;
         f.prevL = l; f.prevR = r; f.prevAtS = nowS;
     }
+
+    // Standing mode (CalibPosture == 0): tighter glance deadband (15 deg vs 30 deg) and fast, smooth follow so 360 body turns
+    // never lag or snap, while quick head glances still leave the holsters rock-steady.
+    const float  bandR = standingMode ? (15.0f * 0.0174532925f) : kBandR;
+    const double bandHoldS = standingMode ? 0.05 : kBandHoldS;
+    const double standHoldS = standingMode ? 0.35 : kStandHoldS;
+    const float  followTauS = standingMode ? 0.14f : kFollowTauS;
+    const double restHoldS = standingMode ? 0.05 : kRestHoldS;
+    const float  restTauS = standingMode ? 0.14f : kRestTauS;
+
     const float off = std::fabs(WrapPi(headYaw - f.yaw));
     float sl[3] = {}, sr[3] = {};
     bool handsOk = lOk && rOk;
@@ -343,61 +361,63 @@ inline FacingWhy FacingStepV2(Facing& f, const Vec3& neck, const Vec3& l, const 
         HandSnapOf(neck, r, sr);
         handsOk = sl[1] > kConfirmMinM && sr[1] > kConfirmMinM;
     }
-    if (off <= kBandR && handsOk) {
+    if (off <= bandR && handsOk) {
         f.snapOk = true;
         f.snapHead = headYaw;
         for (int i = 0; i < 3; ++i) { f.snapL[i] = sl[i]; f.snapR[i] = sr[i]; }
     }
     bool confirmed = false;
-    if (f.snapOk && handsOk && off > kBandR) {
+    if (f.snapOk && handsOk && off > bandR) {
         const float dh = WrapPi(headYaw - f.snapHead);
         if (std::fabs(dh) > 1e-3f) {
             const float dl = WrapPi(sl[0] - f.snapL[0]);
             const float dr = WrapPi(sr[0] - f.snapR[0]);
             confirmed = dl / dh >= kConfirmShare && dr / dh >= kConfirmShare;
-            if (confirmed) {
+            if (confirmed && !standingMode) {
                 confirmed = sl[1] <= kConfirmMaxM && sr[1] <= kConfirmMaxM && f.snapL[1] <= kConfirmMaxM && f.snapR[1] <= kConfirmMaxM;
             }
             if (confirmed) {
                 confirmed = std::fabs(sl[1] - f.snapL[1]) <= kConfirmRigidM && std::fabs(sr[1] - f.snapR[1]) <= kConfirmRigidM &&
-                            std::fabs(sl[2] - f.snapL[2]) <= kConfirmRigidM && std::fabs(sr[2] - f.snapR[2]) <= kConfirmRigidM &&
-                            std::fabs(WrapPi(dl - dr)) <= kConfirmAgreeR;
+                    std::fabs(sl[2] - f.snapL[2]) <= kConfirmRigidM && std::fabs(sr[2] - f.snapR[2]) <= kConfirmRigidM &&
+                    std::fabs(WrapPi(dl - dr)) <= kConfirmAgreeR;
             }
         }
     }
     f.lastConfirmed = confirmed;
-    if (off > kBandR) {
+    if (off > bandR) {
         if (f.farSince < 0.0) { f.farSince = nowS; }
-    } else {
+    }
+    else {
         f.farSince = -1.0;
     }
-    const bool longHeld = standing && f.farSince >= 0.0 && nowS - f.farSince >= kStandHoldS;
+    const bool longHeld = (standing || standingMode) && f.farSince >= 0.0 && nowS - f.farSince >= standHoldS;
     f.lastLongHeld = longHeld;
     const bool rest = lOk && rOk && !squeezed && f.speedL <= kRestMaxSpeed && f.speedR <= kRestMaxSpeed &&
-                      RestPose(neck, headYaw, l, r);
-    if (!rest) { f.restSince = -1.0; } else if (f.restSince < 0.0) { f.restSince = nowS; }
+        RestPose(neck, headYaw, l, r);
+    if (!rest) { f.restSince = -1.0; }
+    else if (f.restSince < 0.0) { f.restSince = nowS; }
 
-    // The look-down hold (a glance at the belt does not turn the holsters) holds only within kLookDownLimitR of the facing and never
-    // stops a follow already under way (RUN HP2 2026-11-20: a turn then a look down left the facing 100-173 deg behind; trace
-    // 20261120_1325_lookdown_limit). Past it no neck turns that far: the held-turn / hands rules below decide, as with the head up.
     const bool lookDownHold = headPitch < -kPitchFreezeR && off <= kLookDownLimitR && !f.following;
     const bool freeze = otherFreeze || lookDownHold || (zoneFreeze && !(confirmed || longHeld));
     FacingWhy why = FacingWhy::Frozen;
     if (!freeze) {
         const float dt = dtS > 0.0f ? dtS : 0.0f;
-        if (rest && nowS - f.restSince >= kRestHoldS) {
-            const float a = 1.0f - std::exp(-dt / kRestTauS);
+        if (rest && nowS - f.restSince >= restHoldS) {
+            const float a = 1.0f - std::exp(-dt / restTauS);
             f.yaw = WrapPi(f.yaw + a * WrapPi(HandLineYaw(l, r) - f.yaw));
             why = FacingWhy::Rest;
-        } else if (f.following) {
-            const float a = 1.0f - std::exp(-dt / kFollowTauS);
+        }
+        else if (f.following) {
+            const float a = 1.0f - std::exp(-dt / followTauS);
             f.yaw = WrapPi(f.yaw + a * WrapPi(headYaw - f.yaw));
             why = FacingWhy::Drift;
             if (off < kFollowDoneR) { f.following = false; f.outsideSince = -1.0; }
-        } else if (off > kBandR) {
+        }
+        else if (off > bandR) {
             if (f.outsideSince < 0.0) { f.outsideSince = nowS; }
-            if (nowS - f.outsideSince >= kBandHoldS && (confirmed || longHeld)) { f.following = true; }
-        } else {
+            if (nowS - f.outsideSince >= bandHoldS && (confirmed || longHeld)) { f.following = true; }
+        }
+        else {
             f.outsideSince = -1.0;
         }
     }

@@ -366,11 +366,14 @@ void SnapPublish(const BodyFrame& b, double now, bool valid)
 // (holster::AlignYawToHand with latch + centre), so the zone is a ring - height and distance from the axis only. frontExclude (the
 // right shoulder): a hand in front of the face (InFrontOfFace, +-60 deg of the head's yaw) is put 100 m away - never in the zone.
 holster::Vec3 ZoneLocalNoCount(const BodyFrame& b, int zone, const holster::Vec3& eye, float headYaw, const holster::Vec3& palm,
-                               const holster::Vec3& centre, bool frontExclude)
+    const holster::Vec3& centre, bool frontExclude)
 {
     if (b.anchorOk[zone] && b.latch[zone].have) {
+        const bool seatedRing = (CalibPosture == 1);
         const holster::Vec3& L = b.latch[zone].eyeFromAnchor;
-        const float y = holster::AlignYawToHand(b.anchor[zone], { L.x + centre.x, L.y + centre.y, L.z + centre.z }, palm, b.facing.yaw);
+        const float y = seatedRing
+            ? holster::AlignYawToHand(b.anchor[zone], { L.x + centre.x, L.y + centre.y, L.z + centre.z }, palm, b.facing.yaw)
+            : b.facing.yaw;
         holster::Vec3 local = holster::LocalOffsetYaw(holster::VirtualHead(b.anchor[zone], y, b.latch[zone]), y, palm);
         if (frontExclude && holster::InFrontOfFace(b.neckNow, headYaw, palm, holster::kShoulderFrontR)) { local.z += 100.0f; }
         return local;
@@ -750,7 +753,7 @@ void BodyFrameUpdate()
     }
     const bool wasFollowing = b.facing.following;
     b.lastWhy = holster::FacingStepV2(b.facing, neck, l, r, lOk, rOk, headYaw, headPitch, zoneFreeze, g_placing != 0, squeezed, now,
-                                      dt, b.posture.standing);
+        dt, b.posture.standing, CalibPosture == 0);
     if (b.facing.following && !wasFollowing) {
         const bool byHands = b.facing.lastConfirmed;
         if (!byHands) { ++b.heldFollows; }
@@ -1541,9 +1544,11 @@ bool HolsterZoneLocal(int zone, int caller, const float headPos[3], const float 
         // the right shoulder ignores a hand in front of the face (the swing refusal and the bow quiver stay free there).
         // mirrorX (final review I1, trace 20261120_1510): aligned to the mirrored centre, the one the caller measures against; the
         // front-of-face test is symmetric round the neck and applies to the mirrored shoulder too.
+        const bool seatedRing = (CalibPosture == 1);
         const holster::Vec3 c{ mirrorX ? -s.centre[zone].x : s.centre[zone].x, s.centre[zone].y, s.centre[zone].z };
-        const float y = holster::AlignYawToHand(an, { L.eyeFromAnchor.x + c.x, L.eyeFromAnchor.y + c.y, L.eyeFromAnchor.z + c.z }, palm,
-                                                s.yaw);
+        const float y = seatedRing
+            ? holster::AlignYawToHand(an, { L.eyeFromAnchor.x + c.x, L.eyeFromAnchor.y + c.y, L.eyeFromAnchor.z + c.z }, palm, s.yaw)
+            : s.yaw;
         local = holster::LocalOffsetYaw(holster::VirtualHead(an, y, L), y, palm);
         if (zone == kZoneShoulder &&
             holster::InFrontOfFace(neck, holster::HeadYaw(headQ[0], headQ[1], headQ[2], headQ[3]), palm, holster::kShoulderFrontR)) {
@@ -2580,12 +2585,14 @@ PlaceFrame PlaceFrameOf(int zone, const XrPosef& head)
         // left for the left hip / chest) - the sphere, the rings and a placement sit on that hand's side, where the grab measures.
         // No grip pose = the snapshot's yaw (the old frame).
         float y = s.yaw;
-        XrPosef gp{};
-        const Hand hand = (bz == kZoneShoulder || bz == kZoneRHip) ? kRightHand : kLeftHand;
-        if (GetControllerGripPose(hand, gp)) {
-            const holster::Vec3& c = s.centre[bz];
-            y = holster::AlignYawToHand(an, { L.eyeFromAnchor.x + c.x, L.eyeFromAnchor.y + c.y, L.eyeFromAnchor.z + c.z },
-                                        { gp.position.x, gp.position.y, gp.position.z }, s.yaw);
+        if (CalibPosture == 1) {
+            XrPosef gp{};
+            const Hand hand = (bz == kZoneShoulder || bz == kZoneRHip) ? kRightHand : kLeftHand;
+            if (GetControllerGripPose(hand, gp)) {
+                const holster::Vec3& c = s.centre[bz];
+                y = holster::AlignYawToHand(an, { L.eyeFromAnchor.x + c.x, L.eyeFromAnchor.y + c.y, L.eyeFromAnchor.z + c.z },
+                    { gp.position.x, gp.position.y, gp.position.z }, s.yaw);
+            }
         }
         f.origin = holster::VirtualHead(an, y, L);
         f.yaw = y;
