@@ -19,12 +19,14 @@ static void match_is_ours()
 }
 static void case_is_ignored()
 {
-    CHECK(Data3Verdict(true, "394248E75C65B83AD2F26151A9B3566A") == kData3Ours);
+    CHECK(Data3Verdict(true, "935318518B7A3D0624CA4FFB84DF18BE") == kData3Ours);
 }
 static void other_md5_is_not_ours()
 {
     CHECK(Data3Verdict(true, "00000000000000000000000000000000") == kData3NotOurs);
-    CHECK(Data3Verdict(true, "394248e75c65b83ad2f26151a9b3566") == kData3NotOurs);   // one hex digit short
+    CHECK(Data3Verdict(true, "935318518b7a3d0624ca4ffb84df18b") == kData3NotOurs);   // one hex digit short
+    CHECK(Data3Verdict(true, "60556476ae500fc3db9cd18a7f69b3b9") == kData3NotOurs);  // the previous pin (grip glyph, 11-22)
+    CHECK(Data3Verdict(true, "394248e75c65b83ad2f26151a9b3566a") == kData3NotOurs);  // before that (Melee_VRShove, 10-31; 1.0 - 1.065)
     CHECK(Data3Verdict(true, "9b5a4c7fffa7f8352b93b1f0819a9cf4") == kData3NotOurs);  // the previous pin (Controls tab, 10-28)
     CHECK(Data3Verdict(true, "489618771b780df6c5bfe374d2455972") == kData3NotOurs);  // the previous pin (physical crouch, 10-27)
     CHECK(Data3Verdict(true, "f9ae3efc36888623a4371f60a3b1fb8f") == kData3NotOurs);  // the previous pin (Survivor Sense X hold 1.25 s, 10-25)

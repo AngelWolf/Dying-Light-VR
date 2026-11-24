@@ -8,8 +8,9 @@
 // The name does NOT identify one lens: "Meta Quest 3" (VDXR) measured three different FOVs and "SteamVR/OpenXR :
 // oculus" two, and "lighthouse" is SteamVR's tracking system, not one headset. So each row is the LARGEST FOV measured
 // under that name - max over every set and both eyes (eye 1 mirrored), plus the 0.0005 print error, rounded UP to 0.01.
-// Too large is safe: the game renders the smallest symmetric frustum CONTAINING it and the compositor drops the excess
-// (cost: fewer pixels per degree, this one launch). Too small is the black-bar bug. An unknown name gets the wide row,
+// Too large is safe: the game renders a frustum CONTAINING the lens and the compositor drops the excess (cost: fewer pixels
+// per degree, this one launch). Too small is the black-bar bug - and since symmetric_fov 0 is the default (trace 20261124_2050)
+// EVERY side must fit on its own: the row's nose side is no longer widened to its outer one. An unknown name gets the wide row,
 // the max of all rows. fovtable_logic_test.cpp holds every measured set and checks each fits its row.
 //
 // Values are LibOVR tangents for eye 0 (LEFT): l = outer, r = inner. Eye 1 is the mirror.
@@ -28,7 +29,7 @@ constexpr Row kRows[] = {
     { "Meta Quest 3",                     { 1.38f, 1.01f, 1.12f, 1.43f } },
     { "SteamVR/OpenXR : oculus",          { 1.38f, 1.01f, 1.12f, 1.43f } },
     { "SteamVR/OpenXR : playstation_vr2", { 1.85f, 0.95f, 1.33f, 1.33f } },
-    { "SteamVR/OpenXR : lighthouse",      { 1.55f, 1.06f, 1.41f, 1.42f } },
+    { "SteamVR/OpenXR : lighthouse",      { 1.55f, 1.16f, 1.41f, 1.42f } },
     { "SteamVR/OpenXR : cv",              { 1.69f, 1.21f, 1.20f, 1.73f } },
 };
 

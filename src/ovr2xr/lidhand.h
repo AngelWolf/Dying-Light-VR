@@ -13,7 +13,10 @@ extern float LidOpenFrac;   // lid_open_frac - the open point as a fraction of t
 // gather's: collects the lid containers / container items, publishes them for LidHandTick, and returns true when the game's
 // current pick (player +5272 / +5280) is a lid container or an item a hand carries - the caller then writes the game's own NULL
 // pick (no prompt, X has no target). lid_by_hand=0 -> false at one bool test.
-bool LidHandOnNearby(void* player, void* const* gameData, unsigned gameCount, void* const* gazeData, unsigned gazeCount);
+// *promptOut (trace 20261123_1200): the nulled object when it is an UNLOCKED LID container or a PURSE - the HUD prompt is handed
+// that object (looting.cpp PickGetHook); nullptr for a carried item, for no null and on every early return.
+bool LidHandOnNearby(void* player, void* const* gameData, unsigned gameCount, void* const* gazeData, unsigned gazeCount,
+                     void** promptOut);
 
 // Game thread, once per player update (BowDrawTick's top). Grabs, follows, writes, opens, carries, stows. Off = one bool test.
 void LidHandTick();
@@ -31,6 +34,12 @@ bool LidHandHandInZone(int side);
 // forgotten). The VR swing's hit is withheld while the right hand carries (trace 20261120_1815, Jay: "a swing can't fire in the hand
 // it's being held till it's either dropped or put away"). lid_by_hand=0 -> false. COST: one bool test + one volatile load.
 bool LidHandCarrying(int side);
+
+// The carried item itself (trace 20261124_1925): hand `side` (0 RIGHT, 1 LEFT)'s item from the take to the release; nullptr when not
+// carrying, lid_by_hand=0 or a bad side. Read by boneblend's AFW foreground mask (MaskTick, pad poll) - a pointer only; every read through
+// it is fault-guarded there, and it can name a freed object for a poll (the game's take / a destroyed item before lidhand sees it).
+// COST: one bool test + one volatile load.
+void* LidHandCarriedItem(int side);
 
 // Jay's approved per-item grip (trace 20261120_2057): the carried mesh's row in lid_item_poses.inc for hand `side` (0 RIGHT, 1 LEFT),
 // from the take to the release; -1 = not carrying, or the mesh has no row (today's placement and the game's fingers), or lid_by_hand=0.

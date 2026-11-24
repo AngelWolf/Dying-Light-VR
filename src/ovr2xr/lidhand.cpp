@@ -33,6 +33,7 @@
 #include "lidhand_logic.h"
 #include "looting.h"        // LootReachM (the same reach as loot by hand)
 #include "looting_logic.h"  // looting::BoxDist
+#include "promptquad.h"     // PromptQuadTick - the in-world prompt, ticked first in LidHandTick (trace 20261123_1356)
 #include "rtti_vtable.h"    // RttiFindVtable
 #include "twohand.h"        // RigTwoHandHaptic - the buzz strength (trace 20261118_1905: reuse, no new key)
 
@@ -97,12 +98,23 @@ const float (*ClipFramesOf(int row))[12] { return &kLidClipFrames[ClipRow(row).f
 const char* RowUnit(int row) { return IsClipRow(row) ? "frame" : "deg"; }
 // Clip rows switched OFF (trace 20261121_2235, Jay RUN CF3: "still a little rough ... disable it just for the basket for now"): skipped
 // by LidIdentity, so the object is not a lid to lidhand and the game opens it its own way (prompt + X). The row and its code stay.
-constexpr const char* kClipRowsOff[] = { "basket_cover_removing" };
+// 2026-11-22 (78): the basket is back ON as a FREE LIFT (trace 20261122_1830) - the list is empty (nullptr = no entry).
+constexpr const char* kClipRowsOff[] = { nullptr };
 bool ClipRowOff(int row)
 {
     if (!IsClipRow(row)) { return false; }
-    for (const char* o : kClipRowsOff) { if (strcmp(ClipRow(row).object, o) == 0) { return true; } }
+    for (const char* o : kClipRowsOff) { if (o && strcmp(ClipRow(row).object, o) == 0) { return true; } }
     return false;
+}
+// THE FREE LIFT rows (trace 20261122_1830, Jay: basket B "1" -> "Yes"): a clip row with a rim circle (tools/lid_rim_fit.py) is NOT
+// clip-followed - the cover rides the hand's drawn holder freely; let go lifted > lh::kFreeLiftOpenM = the game's own open (its leaning
+// end pose), else back on closed. Grab zone = the ring. -1 = not a free row.
+#include "lid_rim_table.inc"     // kLidRims - tools/lid_rim_fit.py (OUR data, controls in the tool)
+int FreeRim(int row)
+{
+    if (!IsClipRow(row)) { return -1; }
+    for (int i = 0; i < kLidRimRows; ++i) { if (strcmp(kLidRims[i].object, ClipRow(row).object) == 0) { return i; } }
+    return -1;
 }
 // The SMOOTHED clip rows (trace 20261121_2225): the basket cover only - rim grab point, stickiness, eased frame. Resolved once by name.
 bool ClipSmoothed(int row)
@@ -314,6 +326,12 @@ struct HandState {
     // what is carried (trace 20261120_2210): a chest item (home = its hook), a placed spawner or a dropped item (home = a world matrix)
     lidhand::ItemKind kind = lidhand::ItemKind::Chest;
     bool  physOff = false;      // we switched a DroppedItem's physics off at the take (its OnDetached restarts it)
+    // THE FREE LIFT (trace 20261122_1830): the owned lid rides the drawn holder - the cover's world in the holder's frame at the grab,
+    // and the rim centre's world at the row's rest (frame 0) for the let-go rule
+    bool  free = false;
+    float freeRel[12] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0 };
+    float freeRestC[3] = {};
+    bool  freeSaidNoHolder = false;
 };
 HandState g_hand[2];            // 0 = right, 1 = left (RigGripWorldRead's sides)
 volatile LONG g_busy[2] = {};   // tick -> pad: this hand owns a lid / item, or is next to one
@@ -951,6 +969,87 @@ void WriteLid(LidState& L, float deg)
     if (SafeSetLocal(L.obj, L.bone, want)) { L.deg = deg; L.writing = deg > 0.05f || L.hold; }
 }
 
+// ---- THE FREE LIFT (trace 20261122_1830) ----
+// At the grab: the cover's world now, in the drawn holder's frame (freeRel), and the rim centre's world at the row's rest (frame 0).
+// False = no drawn hand pose / the local unread (the grab is refused and named by the caller).
+bool FreeGrab(int side, LidState& L, const float pw[12])
+{
+    HandState& H = g_hand[side];
+    const int ri = FreeRim(L.row);
+    float D[12], cur[12];
+    if (ri < 0 || !RigDrawnHolderRead(side, D) || !SafeLocal(L.obj, L.bone, cur)) { return false; }
+    float Wb[12], Di[12], L0[12], W0[12];
+    lh::Compose34(pw, cur, Wb);
+    lh::InvRigid34(D, Di);
+    lh::Compose34(Di, Wb, H.freeRel);
+    RowLocal(L.row, 0.0f, L0);
+    lh::Compose34(pw, L0, W0);
+    MulPoint(W0, kLidRims[ri].centre, H.freeRestC);
+    H.free = true;
+    H.freeSaidNoHolder = false;
+    return true;
+}
+
+// The let-go: CLOSED and lifted past lh::kFreeLiftOpenM -> the game's own execute + open jump, our write of the clip's LAST frame (the
+// game's leaning end pose) once, then the game's own pose; CLOSED and not lifted -> frame 0 (rest) written once; already OPENED -> its
+// last frame once. alive = the container still is one (else nothing is touched).
+void FreeRelease(int side, int lidIdx, const char* why, bool alive)
+{
+    HandState& H = g_hand[side];
+    LidState& L = g_lids[lidIdx];
+    const char* sn = side == 0 ? "right" : "left";   // (kSideName is defined further down)
+    H.lid = -1;
+    H.free = false;
+    if (!alive) {
+        // [PROBE: LIDHAND] gate=lid_by_hand  site=HEADSET  log-only=no
+        LOG("lidhand: [LIDHAND] FREE LIFT RELEASE %s hand: %s - the container is gone, nothing written", sn, RowObject(L.row));
+        L = LidState{};
+        return;
+    }
+    const int ri = FreeRim(L.row);
+    float cur[12], pw[12], Wb[12], nowC[3] = {};
+    const bool read = ri >= 0 && SafeLocal(L.obj, L.bone, cur) && SafeParentWorld(L.obj, L.bone, pw);
+    if (read) {
+        lh::Compose34(pw, cur, Wb);
+        MulPoint(Wb, kLidRims[ri].centre, nowC);
+    }
+    const float dx = nowC[0] - H.freeRestC[0], dy = nowC[1] - H.freeRestC[1], dz = nowC[2] - H.freeRestC[2];
+    const float moved = read ? std::sqrt(dx * dx + dy * dy + dz * dz) : -1.0f;
+    const int st0 = State(L.obj);
+    L.writing = false;   // our free pose is not a clip frame: no OVERWRITE comparison against it in WriteLid
+    L.easing = false;
+    if (st0 == kStateClosed && read && lh::FreeLiftOpens(H.freeRestC, nowC)) {
+        const bool ok = SafeExecute(g_player, L.obj);
+        const int st = State(L.obj);
+        InterlockedIncrement(&g_nOpen);
+        int key = -1;
+        const bool jumped = ok && st == kStateOpened && SafeOpenJump(L.obj, &key);
+        WriteLid(L, RowEnd(L.row));
+        L.writing = false;
+        L.gameClip = true;
+        L.checkHold = true;
+        // [PROBE: LIDHAND] gate=lid_by_hand  site=HEADSET  log-only=no
+        LOG("lidhand: [LIDHAND] FREE LIFT OPEN %s hand: %s %p (%s) - lifted %.3f m (> %.2f): the game's own execute %s -> state %d (want 1) "
+            "| open jump (stage key %d): %s | the clip's last frame (%.0f) written once, then the game's pose", sn,
+            RowObject(L.row), L.obj, why, moved, lh::kFreeLiftOpenM, ok ? "called" : "*** FAULTED ***", st, key,
+            jumped ? "JUMPED to the end pose" : "*** not jumped - the game's clip plays from its start ***", RowEnd(L.row));
+    } else if (st0 == kStateOpened) {
+        WriteLid(L, RowEnd(L.row));
+        L.writing = false;
+        L.gameClip = true;
+        // [PROBE: LIDHAND] gate=lid_by_hand  site=HEADSET  log-only=no
+        LOG("lidhand: [LIDHAND] FREE LIFT RELEASE %s hand: %s %p (%s) - already open, back to its leaning pose (moved %.3f m)",
+            sn, RowObject(L.row), L.obj, why, moved);
+    } else {
+        WriteLid(L, 0.0f);
+        L.writing = false;
+        L.gameClip = false;
+        // [PROBE: LIDHAND] gate=lid_by_hand  site=HEADSET  log-only=no
+        LOG("lidhand: [LIDHAND] FREE LIFT BACK ON %s hand: %s %p (%s) - moved %.3f m (open past %.2f; -1 = unread), state %d: the rest "
+            "pose written, still closed", sn, RowObject(L.row), L.obj, why, moved, lh::kFreeLiftOpenM, st0);
+    }
+}
+
 void Publish(void* const* lids, const int* rows, const int* bones, float (*lboxes)[6], int nl, void* const* items,
              float (*iboxes)[6], const int* ikinds, int ni, void* const* loots, float (*lootBoxes)[6], int nloot)
 {
@@ -1130,9 +1229,20 @@ void ReleaseItem(int side, bool lost)
         if (what == lh::ItemRelease::Stow && back) {
             const bool ok = SafeExecute(g_player, item);
             InterlockedIncrement(&g_nStow);
+            // THE STOW BUZZ (trace 20261124_1910, Jay: "Need haptic response for item stowing"): the take's pulse on the stowing hand,
+            // only once the game's take returned ok. rig_two_hand_haptic scales it with the other lidhand pulses (no new key).
+            const char* pulseText = "no pulse (the take faulted)";
+            if (ok) {
+                if (!(RigTwoHandHaptic > 0.0f)) {
+                    pulseText = "no pulse (rig_two_hand_haptic 0)";
+                } else {
+                    pulseText = PulseController(side == 0 ? kRightHand : kLeftHand, RigTwoHandHaptic, 40)
+                        ? "pulse queued" : "pulse REFUSED (PulseController false)";
+                }
+            }
             // [PROBE: LIDHAND] gate=lid_by_hand  site=HEADSET  log-only=no
-            LOG("lidhand: [LIDHAND] STOW %s hand's %s item %p over the shoulder - the game's own take (+B9B930, action %d) %s%s",
-                kSideName[side], KindName(H.kind), item, action, ok ? "called" : "*** FAULTED ***", catText);
+            LOG("lidhand: [LIDHAND] STOW %s hand's %s item %p over the shoulder - the game's own take (+B9B930, action %d) %s | %s%s",
+                kSideName[side], KindName(H.kind), item, action, ok ? "called" : "*** FAULTED ***", pulseText, catText);
         } else if (what == lh::ItemRelease::Drop && back && H.kind == lh::ItemKind::Dropped) {
             float was = -1.0f;
             const bool zeroed = SafeZeroDropSpeed(item, &was);
@@ -1171,8 +1281,10 @@ void ReleaseItem(int side, bool lost)
 
 }  // namespace
 
-bool LidHandOnNearby(void* player, void* const* gameData, unsigned gameCount, void* const* gazeData, unsigned gazeCount)
+bool LidHandOnNearby(void* player, void* const* gameData, unsigned gameCount, void* const* gazeData, unsigned gazeCount,
+                     void** promptOut)
 {
+    if (promptOut) { *promptOut = nullptr; }
     if (!LidByHand || !Ready() || !player) { return false; }
     g_player = player;
     void* lids[kMaxPub]; int rows[kMaxPub]; int bones[kMaxPub]; float lbox[kMaxPub][6];
@@ -1239,6 +1351,7 @@ bool LidHandOnNearby(void* player, void* const* gameData, unsigned gameCount, vo
     const uintptr_t pl = reinterpret_cast<uintptr_t>(player);
     if (!ReadPtr(pl + 5272, &h) || !h || !ReadPtr(pl + 5280, &pick) || !pick) { return false; }
     bool nullIt = pick == reinterpret_cast<uintptr_t>(g_carried[0]) || pick == reinterpret_cast<uintptr_t>(g_carried[1]);
+    const bool carried = nullIt;   // a carried item: nulled, but no prompt (trace 20261123_1200, Jay "Lids + purses")
     for (int k = 0; k < nl && !nullIt; ++k) {
         if (reinterpret_cast<uintptr_t>(lids[k]) != pick) { continue; }
         // A LOCKED lid container keeps the game's own prompt (trace 20261119_1135, Jay "Go ahead"): X runs the game's lockpick
@@ -1269,11 +1382,16 @@ bool LidHandOnNearby(void* player, void* const* gameData, unsigned gameCount, vo
         LOG("lidhand: [LIDHAND] FIRST NULL PICK - the game picked %p (a lid container / a carried item): its prompt and X are "
             "withheld, the game's interaction never starts for it", reinterpret_cast<void*>(pick));
     }
+    // the lid / purse the null hid goes to the HUD prompt only (looting.cpp PickGetHook); a carried item gets none
+    if (nullIt && !carried && promptOut) { *promptOut = reinterpret_cast<void*>(pick); }
     return nullIt;
 }
 
 void LidHandTick()
 {
+    // the in-world prompt's game-thread half (trace 20261123_1356) - FIRST, before this feature's own gate (it has its own:
+    // inworld_prompts=0 -> hide once, then one bool test).
+    PromptQuadTick();
     if (!LidByHand || g_ready != 1 || !g_player) {
         g_busy[0] = g_busy[1] = 0;
         g_zone[0] = g_zone[1] = 0;
@@ -1305,13 +1423,30 @@ void LidHandTick()
     // each published lid's far edge in world, ONCE per tick (both hands read it): parent world . the bone's CURRENT local . edge
     float edgeA[kMaxPub][3], edgeB[kMaxPub][3];
     bool haveEdge[kMaxPub] = {};
+    // a FREE LIFT row (trace 20261122_1830): its rim RING in world (centre, normal, radius) - the grab zone is the ring, not the edge
+    float ringC[kMaxPub][3] = {}, ringN[kMaxPub][3] = {}, ringR[kMaxPub] = {};
+    bool haveRing[kMaxPub] = {};
     for (int i = 0; haveSnap && i < s.nl; ++i) {
         float cur[12], pw[12];
         if (SafeLocal(s.lid[i], s.bone[i], cur) && SafeParentWorld(s.lid[i], s.bone[i], pw)) {
             lh::EdgeWorld(pw, cur, RowEdge(s.row[i]), edgeA[i], edgeB[i]);
             haveEdge[i] = true;
+            const int ri = FreeRim(s.row[i]);
+            if (ri >= 0) {
+                float Wb[12];
+                lh::Compose34(pw, cur, Wb);
+                MulPoint(Wb, kLidRims[ri].centre, ringC[i]);
+                MulRot(Wb, kLidRims[ri].normal, ringN[i]);
+                ringR[i] = kLidRims[ri].radius;
+                haveRing[i] = true;
+            }
         }
     }
+    // the hand's distance to published lid i's grab zone: the ring for a free row, else the far edge (-1 = not read)
+    auto zoneDist = [&](int i, const float q[3]) -> float {
+        if (haveRing[i]) { return lh::RingDist(ringC[i], ringN[i], ringR[i], q); }
+        return haveEdge[i] ? lh::SegDist(edgeA[i], edgeB[i], q) : -1.0f;
+    };
     for (int side = 0; side < 2; ++side) {
         HandState& H = g_hand[side];
         float sq = 0.0f;
@@ -1357,6 +1492,30 @@ void LidHandTick()
                 }
             }
         }
+        // ---- an owned FREE LIFT lid (trace 20261122_1830): the cover rides the drawn holder; the let-go decides open / back on ----
+        if (H.lid >= 0 && H.free) {
+            LidState& L = g_lids[H.lid];
+            const bool alive = IsVt(L.obj, g_vtContainer);
+            if (!down || !alive || !haveHand) {
+                FreeRelease(side, H.lid, !down ? "grip opened" : !haveHand ? "no hand pose" : "the container is gone", alive);
+            } else {
+                float D[12], pw[12];
+                if (RigDrawnHolderRead(side, D) && SafeParentWorld(L.obj, L.bone, pw)) {
+                    float W[12], pwi[12], loc[12];
+                    lh::Compose34(D, H.freeRel, W);
+                    lh::InvRigid34(pw, pwi);
+                    lh::Compose34(pwi, W, loc);
+                    SafeSetLocal(L.obj, L.bone, loc);
+                } else if (!H.freeSaidNoHolder) {
+                    H.freeSaidNoHolder = true;
+                    // [PROBE: LIDHAND] gate=lid_by_hand  site=HEADSET  log-only=no
+                    LOG("lidhand: [LIDHAND] FREE LIFT %s hand: no drawn hand pose / parent world this tick - the cover holds where it is "
+                        "(logged once per carry)", kSideName[side]);
+                }
+                isNear = true;
+                inZone = true;
+            }
+        } else
         // ---- an owned lid ----
         if (H.lid >= 0) {
             LidState& L = g_lids[H.lid];
@@ -1459,6 +1618,9 @@ void LidHandTick()
             float dl[kMaxPub], di[kMaxPub];
             for (int i = 0; i < s.ni; ++i) {
                 di[i] = -1.0f;
+                // NOT the item either hand carries (trace 20261124_1950, Jay: "Block it"): a carried chest item stays its container's
+                // item and in reach, so the free hand took it again with its home read off the other hand's holder (RUN LA2's machete)
+                if (s.item[i] == g_carried[0] || s.item[i] == g_carried[1]) { continue; }
                 // a world item (trace 20261120_2210): in reach is enough; a DroppedItem flying to a target (an arrow / a thrown item in
                 // flight - its own CanExecute +6E2430 refuses it then) is not grabbed
                 if (s.ikind[i] != static_cast<int>(lh::ItemKind::Chest)) {
@@ -1494,7 +1656,7 @@ void LidHandTick()
                 if (st == kStateLocked) {
                     // the grab stays refused on a locked lid - and now says so (trace 20261119_1135; it was silent in RUN LH3)
                     static LONG s_lockedGrab = 0;
-                    if (edge && haveEdge[i] && lh::SegDist(edgeA[i], edgeB[i], hw) <= kLidEdgeReachM &&
+                    if (edge && haveEdge[i] && zoneDist(i, hw) <= kLidEdgeReachM &&
                         InterlockedIncrement(&s_lockedGrab) <= 8) {
                         // [PROBE: LIDHAND] gate=lid_by_hand  site=HEADSET  log-only=no
                         LOG("lidhand: [LIDHAND] GRAB REFUSED - LOCKED: %s hand on %s %p (state 10) - pick the lock first (the game's "
@@ -1505,7 +1667,7 @@ void LidHandTick()
                 if (st != kStateClosed && st != kStateOpened) { continue; }
                 // THE LID ZONE (trace 20261118_2010): within kLidEdgeReachM of the lid's far edge, wherever the lid is now
                 if (!haveEdge[i]) { continue; }
-                dl[i] = lh::SegDist(edgeA[i], edgeB[i], hw);
+                dl[i] = zoneDist(i, hw);   // a free row: the rim ring (trace 20261122_1830)
             }
             const int bi = lh::NearestWithin(di, s.ni, LootReachM);
             int bl = bi < 0 ? lh::NearestWithin(dl, s.nl, kLidEdgeReachM) : -1;
@@ -1657,8 +1819,10 @@ void LidHandTick()
                 const int k = NewLidSlot(s.lid[bl], s.row[bl], s.bone[bl]);
                 float pivotW[3], axisW[3], now = 0.0f;
                 float pwg[12];
+                const bool freeRow = k >= 0 && FreeRim(g_lids[k].row) >= 0;
                 if (k >= 0 && HingeWorld(g_lids[k], pivotW, axisW) && LidNowDeg(g_lids[k], &now) &&
-                    (!IsClipRow(g_lids[k].row) || SafeParentWorld(g_lids[k].obj, g_lids[k].bone, pwg))) {
+                    (!IsClipRow(g_lids[k].row) || SafeParentWorld(g_lids[k].obj, g_lids[k].bone, pwg)) &&
+                    (!freeRow || FreeGrab(side, g_lids[k], pwg))) {   // a FREE LIFT row (trace 20261122_1830): rides the drawn holder
                     LidState& L = g_lids[k];
                     H.lid = k;
                     H.lidAtGrab = lh::ClampLid(now, RowEnd(L.row));
@@ -1692,13 +1856,16 @@ void LidHandTick()
                                           (edgeA[bl][2] + edgeB[bl][2]) / 2 };
                     // [PROBE: LIDHAND] gate=lid_by_hand  site=HEADSET  log-only=no
                     LOG("lidhand: [LIDHAND] GRAB %s hand: %s %p (state %d) at %.1f %s, hand %.3f m from the lid's edge (zone %.2f) | "
-                        "hand %.3f m from the hinge line, the edge %.3f m (equal = on the edge; larger = more hand travel per degree)",
+                        "hand %.3f m from the hinge line, the edge %.3f m (equal = on the edge; larger = more hand travel per degree)%s",
                         kSideName[side], RowObject(L.row), L.obj, State(L.obj), H.lidAtGrab, RowUnit(L.row), dl[bl], kLidEdgeReachM,
-                        lh::LineDist(pivotW, axisW, hw), lh::LineDist(pivotW, axisW, em));
+                        lh::LineDist(pivotW, axisW, hw), lh::LineDist(pivotW, axisW, em),
+                        H.free ? " | FREE LIFT - the hand's distance is to the RIM RING; the cover rides the hand, let go lifted > 0.20 m = "
+                                 "the game's open" : "");
                 } else {
                     // [PROBE: LIDHAND] gate=lid_by_hand  site=HEADSET  log-only=no
                     LOG("lidhand: [LIDHAND] REFUSED grab of %p (%s hand): %s", s.lid[bl], kSideName[side],
-                        k < 0 ? "no free lid slot" : "the hinge / lid local did not read");
+                        k < 0 ? "no free lid slot" : freeRow ? "a FREE LIFT cover, but no drawn hand pose / the lid's local or parent "
+                        "world did not read" : "the hinge / lid local did not read");
                 }
             } else if (edge && !g_padOwned[side] && bo >= 0) {
                 // GRIP LOOT (trace 20261121_2145, Jay: "just holding grip on the item to loot it should be enough"): the game's own
@@ -1735,7 +1902,7 @@ void LidHandTick()
                 int li = -1;
                 for (int i = 0; i < s.nl; ++i) {
                     if (!haveEdge[i]) { continue; }
-                    const float d = lh::SegDist(edgeA[i], edgeB[i], hw);
+                    const float d = zoneDist(i, hw);
                     if (ml < 0.0f || d < ml) { ml = d; li = i; }
                 }
                 for (int i = 0; i < s.ni; ++i) {
@@ -1826,6 +1993,12 @@ bool LidHandCarrying(int side)
 {
     if (!LidByHand || side < 0 || side > 1) { return false; }
     return g_carried[side] != nullptr;   // set at the take, cleared in ReleaseItem (trace 20261120_1815)
+}
+
+void* LidHandCarriedItem(int side)
+{
+    if (!LidByHand || side < 0 || side > 1) { return nullptr; }
+    return g_carried[side];   // the AFW mask's carried loot (trace 20261124_1925)
 }
 
 int LidHandPoseRow(int side)

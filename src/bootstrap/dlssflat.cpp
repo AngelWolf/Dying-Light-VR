@@ -6,6 +6,7 @@
 #include "../common/shaderbin.h"
 #include "vpstore_logic.h"   // fix A's slot-2 buffer table (evicts least recently bound - 2026-10-20)
 #include "fmtbytes_logic.h"  // bytes per pixel - the panel capture refuses an 8-byte (RIFT float) layer, 2026-10-21
+#include "afwtarget_logic.h" // the AFW rebuild's held-eye target on an off-centre frustum (trace 20261124_1700)
 #include "../common/lenscrop_logic.h"   // the DLSS / FSR lens crop's row band (2026-11-11, docs/superpowers/plans/2026-11-11-dlss-lens-crop.md)
 #include "../common/foveation_logic.h"  // fixed foveated DLSS / FSR geometry + adoption rules (2026-11-11, docs/superpowers/plans/2026-11-11-foveated-dlss.md)
 #include "../common/wristleaf.h"        // wrist HUD stage 1: the leaves the layer publishes (dlvr_WristLeaves)
@@ -665,6 +666,13 @@ void NoteUnmap(ID3D11Resource* res, UINT sub);
 void OnPassOpen(ID3D11DeviceContext* ctx, int slot);
 void OnPassClose(ID3D11DeviceContext* ctx, int slot, int buf);
 void Init(const char* gameDir);
+// THE IN-WORLD PROMPT (trace 20261123_1535): the live texture the CreateTexture2D hook made writable; the per-submit copy of the routed
+// prompt widget into it (render thread, outside the HUD bracket - DlvrHudLayerSubmit's top); the hook itself (installed by Init).
+int  PromptCopy(float fade, float plate);
+bool PromptLiveReady();
+// trace 20261123_2200: at THE tonemap bind (HookedPSSetShaderResources, after the call-through), the exposure texel into our 1x1
+void CaptureExposure(ID3D11DeviceContext* c, UINT start, UINT n, ID3D11ShaderResourceView* const* views);
+void InstallPromptTextureHook(ID3D11Device* dev);
 // RUN WS1e count (trace docs/traces/20261112_1640_wrist_unredirected_count.md): log-only
 void NoteRefused(int reason);                    // hudlayer::Open refused a pass: 0 count mode, 1 not learned, 2 unknown, 3 handshake, 4 layers
 void NoteBind(ID3D11RenderTargetView* r0);       // every OMSetRenderTargets: the first target, for the outside-bracket count
@@ -2834,6 +2842,41 @@ double    g_kErr[kEyes][3] = {};   // mean |told - table[(c - k) & mask]| px, k 
 long      g_kN[kEyes] = {};
 bool      g_saidFirst = false;
 ULONGLONG g_nextLog = 0;
+// OFF-CENTRE (trace docs/traces/20261124_1340_jitter_offcentre.md; RUNS SY1-SY3 2026-11-24): on an off-centre frustum (symmetric_fov
+// 0 / 1, Meta's runtime) the matrix's off-centre term is the frustum's asymmetry PLUS the jitter - SY1 told +248 / +210 px and the
+// world doubled. Tell takes the frustum's own part out, from the layer's dlvr_GameEyeTan (the frustum the GAME rendered each eye with,
+// ungated). Symmetric frustum: 0 exactly - the told value is unchanged.
+typedef int (*EyeTanFn)(int eye, float* out);
+EyeTanFn  g_tanFn = nullptr;
+bool      g_tanTried = false;
+long      g_offRefused[kEyes] = {};
+bool      g_saidOff = false, g_saidOffRefused = false;
+
+// The frustum's own off-centre for LAYER eye `e`, in render px, as the matrix read carries it (signs from RUN SY1: eye 0 tangents
+// l 1.3997 r 0.8533 d 1.4281 u 0.9657 -> +248.3 / +210.2 against a read of +248.08 / +210.44). False = not known (no export, or no
+// submit has described that eye yet). Render thread; the layer writes the tangents on its submit thread (aligned floats, constant
+// while the FOV is - the same unlocked read dlvr_LensGeom and the wrist router use).
+bool EyeOffCentre(int e, double* cx, double* cy)
+{
+    if (!g_tanTried) {
+        g_tanTried = true;
+        HMODULE m = GetModuleHandleA("LibOVRRT64_1.dll");
+        g_tanFn = m ? reinterpret_cast<EyeTanFn>(GetProcAddress(m, "dlvr_GameEyeTan")) : nullptr;
+        // [PROBE: JITTRUE] gate=marker dlvr\jitter_engine.txt  site=HEADSET  log-only=no
+        LOG("[JITTRUE] OFF-CENTRE source (logged unconditionally): dlvr_GameEyeTan %s - %s", g_tanFn ? "FOUND" : "NOT FOUND",
+            g_tanFn ? "the frustum's own off-centre is taken out of the told jitter"
+                    : (m ? "LibOVRRT64_1 has no such export (older layer): no off-centre is taken out; the guard still refuses a "
+                           "told offset beyond the jitter's own range"
+                         : "LibOVRRT64_1 is not loaded: as above"));
+    }
+    float t[4] = {};
+    if (!g_tanFn || !g_tanFn(e, t)) { return false; }
+    const double l = t[0], r = t[1], u = t[2], d = t[3];
+    if (!(l + r > 0.0) || !(u + d > 0.0)) { return false; }
+    *cx = (l - r) / (l + r) * 0.5 * static_cast<double>(g_renderW);
+    *cy = (d - u) / (u + d) * 0.5 * static_cast<double>(g_renderH);
+    return true;
+}
 
 bool Offsets(const float* vp, double* ox, double* oy)
 {
@@ -2856,6 +2899,56 @@ void Strip(const float* vp, float* out)
         out[4 + i] = static_cast<float>(vp[4 + i] - oy * vp[12 + i]);
     }
     ++g_strips;
+}
+
+// JITTER ONLY (trace docs/traces/20261124_1420_strip_jitter_only.md; RUN SY4 2026-11-24): Offsets() minus the nearer layer eye's
+// frustum off-centre (EyeOffCentre, in NDC), picked by the smaller residual as Tell picks (label-free). Symmetric frustum: off-centre 0
+// -> exactly Offsets(). Frustum not known: Offsets() as it is. False = degenerate (as Offsets).
+bool JitterOffsets(const float* vp, double* jx, double* jy)
+{
+    if (!Offsets(vp, jx, jy)) { return false; }
+    if (g_renderW == 0 || g_renderH == 0) { return true; }
+    const double hw = 0.5 * static_cast<double>(g_renderW), hh = 0.5 * static_cast<double>(g_renderH);
+    const double rawX = *jx * hw, rawY = *jy * hh;
+    double best = 1e300, offX = 0.0, offY = 0.0;
+    bool known = false;
+    for (int le = 0; le < kEyes; ++le) {
+        double cx = 0.0, cy = 0.0;
+        if (!EyeOffCentre(le, &cx, &cy)) { continue; }
+        const double m = fmax(fabs(rawX - cx), fabs(rawY - cy));
+        if (m < best) { best = m; offX = cx; offY = cy; known = true; }
+    }
+    if (known) {
+        *jx -= offX / hw;
+        *jy -= offY / hh;
+    }
+    return true;
+}
+
+// (2b) a copy of vp with ONLY its jitter removed - the frustum's own off-centre stays, as it does in the image the camera term's pixels
+// come from (kMvFixShader takes each pixel's ndc from the RENDERED image). Strip removed the off-centre too, so at symmetric_fov 0
+// inverse(Mcur) unprojected every pixel along a ~13 deg wrong ray and the camera vectors were wrong on turns (RUN SY4's ghost).
+// Symmetric frustum: identical to Strip. The camera-term call sites use this; AFW keeps Strip (its own open item).
+bool g_saidStripJit = false;
+void StripJitter(const float* vp, float* out)
+{
+    memcpy(out, vp, sizeof(float) * 16);
+    double ox = 0.0, oy = 0.0;
+    if (!g_on || !JitterOffsets(vp, &ox, &oy)) { return; }
+    for (int i = 0; i < 4; ++i) {
+        out[i]     = static_cast<float>(vp[i]     - ox * vp[12 + i]);
+        out[4 + i] = static_cast<float>(vp[4 + i] - oy * vp[12 + i]);
+    }
+    ++g_strips;
+    if (!g_saidStripJit) {
+        g_saidStripJit = true;
+        double rx = 0.0, ry = 0.0;
+        Offsets(vp, &rx, &ry);
+        // [PROBE: JITTRUE] gate=marker dlvr\jitter_engine.txt  site=HEADSET  log-only=no
+        LOG("[JITTRUE] STRIP-JITTER FIRST (logged unconditionally): camera-term matrix off-centre read %+.6f %+.6f NDC, the frustum's own "
+            "%+.6f %+.6f NDC kept, the jitter %+.6f %+.6f NDC removed (render %ux%u; a symmetric frustum keeps 0)",
+            rx, ry, rx - ox, ry - oy, ox, oy, g_renderW, g_renderH);
+    }
 }
 
 bool SetMask(uintptr_t addr, unsigned char want)
@@ -3016,7 +3109,10 @@ bool TaaTexelShift(const float* vp, bool fresh, float* sx, float* sy)
 {
     *sx = 0.0f; *sy = 0.0f;
     double ox = 0.0, oy = 0.0;
-    if (!g_on || !fresh || !vp || !Offsets(vp, &ox, &oy)) { return false; }
+    // OFF-CENTRE (trace docs/traces/20261124_1612_wheel_taa_fsr_offcentre.md): JitterOffsets, not Offsets - at symmetric_fov 0 the matrix's
+    // off-centre is the frustum's asymmetry (~250 px) plus the jitter, so every eval was refused below and TAA ran without its un-jitter.
+    // Symmetric frustum: JitterOffsets == Offsets exactly.
+    if (!g_on || !fresh || !vp || !JitterOffsets(vp, &ox, &oy)) { return false; }
     *sx = static_cast<float>(ox * 0.5 * g_renderW);
     *sy = static_cast<float>(-oy * 0.5 * g_renderH);
     return fabsf(*sx) < 1.0f && fabsf(*sy) < 1.0f;   // a whole-texel or larger "jitter" is not jitter: refuse, counted by RunTaa
@@ -3029,8 +3125,43 @@ void Tell(int eye, const float* vp, bool fresh, float* jx, float* jy)
     if (!fresh || !vp || !Offsets(vp, &ox, &oy)) {
         ++g_fallback[eye];
     } else {
-        const double s = g_jitterFlip ? -1.0 : 1.0;
-        const double px = ox * 0.5 * g_renderW, py = oy * 0.5 * g_renderH;
+    const double s = g_jitterFlip ? -1.0 : 1.0;
+    const double rawX = ox * 0.5 * g_renderW, rawY = oy * 0.5 * g_renderH;
+    // OFF-CENTRE: take out the frustum's own part. The candidate eye is picked by the residual it leaves, NOT by `eye` - on the upscale
+    // path `eye` is the draw order ("CONSISTENT, not identified"); the Meta tester's label-1 eval carried layer eye 0's +159 px.
+    double offX = 0.0, offY = 0.0, best = 1e300;
+    int pick = -1;
+    for (int le = 0; le < kEyes; ++le) {
+        double cx = 0.0, cy = 0.0;
+        if (!EyeOffCentre(le, &cx, &cy)) { continue; }
+        const double m = fmax(fabs(rawX - cx), fabs(rawY - cy));
+        if (m < best) { best = m; pick = le; offX = cx; offY = cy; }
+    }
+    const double px = rawX - offX, py = rawY - offY;
+    // GUARD (fail closed): the jitter itself is (radical - 0.5) x g_haltonScale (Phase) - anything beyond that plus a tangent margin is
+    // not jitter. Then the upscaler keeps the TABLE value Tell was entered with (soft at worst, never a 100-px shift).
+    const double limit = 0.5 * fabs(static_cast<double>(g_haltonScale)) + 0.25;
+    const bool within = fabs(px) <= limit && fabs(py) <= limit;
+    if (!g_saidOff) {
+        g_saidOff = true;
+        // [PROBE: JITTRUE] gate=marker dlvr\jitter_engine.txt  site=HEADSET  log-only=no
+        LOG("[JITTRUE] OFF-CENTRE FIRST (logged unconditionally): eval label %d, matrix read %+.4f %+.4f render px (render %ux%u) | "
+            "frustum off-centre %s %+.4f %+.4f -> residual %+.4f %+.4f, limit %.4f (0.5 x halton scale %.2f + 0.25) -> %s",
+            eye, rawX, rawY, g_renderW, g_renderH, pick >= 0 ? (pick == 0 ? "(layer eye 0)" : "(layer eye 1)") : "(NOT KNOWN - 0)",
+            offX, offY, px, py, limit, static_cast<double>(g_haltonScale),
+            within ? "TOLD the residual" : "*** REFUSED - the table value is told ***");
+    }
+    if (!within) {
+        ++g_offRefused[eye];
+        ++g_fallback[eye];
+        if (!g_saidOffRefused) {
+            g_saidOffRefused = true;
+            // [PROBE: JITTRUE] gate=marker dlvr\jitter_engine.txt  site=HEADSET  log-only=no
+            LOG("[JITTRUE] OFF-CENTRE REFUSED FIRST (logged unconditionally): eval label %d, %s: residual %+.4f %+.4f px beyond the "
+                "jitter's range %.4f - the upscaler is told the table value %+.4f %+.4f instead (counted per 5 s as FALLBACK)",
+                eye, pick >= 0 ? "frustum known" : "frustum NOT known (no dlvr_GameEyeTan / no submit yet)", px, py, limit, *jx, *jy);
+        }
+    } else {
         const float tableX = *jx, tableY = *jy;
         *jx = static_cast<float>(px * s);
         *jy = static_cast<float>(py * s);
@@ -3051,10 +3182,11 @@ void Tell(int eye, const float* vp, bool fresh, float* jx, float* jy)
             g_saidFirst = true;
             // [PROBE: JITTRUE] gate=marker dlvr\jitter_engine.txt  site=HEADSET  log-only=no
             LOG("[JITTRUE] FIRST TOLD-FROM-MATRIX (logged unconditionally): eye %d, matrix offset x %+.4f y %+.4f render px "
-                "(render %ux%u) -> told %+.4f %+.4f (flip file %d); the table at the counter said %+.4f %+.4f (counter %lld, "
-                "phases %d)", eye, px, py, g_renderW, g_renderH, *jx, *jy, g_jitterFlip ? 1 : 0, tableX, tableY, g_jpFrame,
-                g_phases);
+                "(render %ux%u; the read %+.4f %+.4f less the frustum's own off-centre %+.4f %+.4f) -> told %+.4f %+.4f (flip file "
+                "%d); the table at the counter said %+.4f %+.4f (counter %lld, phases %d)", eye, px, py, g_renderW, g_renderH, rawX,
+                rawY, offX, offY, *jx, *jy, g_jitterFlip ? 1 : 0, tableX, tableY, g_jpFrame, g_phases);
         }
+    }
     }
     const ULONGLONG now = GetTickCount64();
     if (g_nextLog == 0) { g_nextLog = now + 5000; }
@@ -3069,8 +3201,10 @@ void Tell(int eye, const float* vp, bool fresh, float* jx, float* jy)
         // [PROBE: JITTRUE] gate=marker dlvr\jitter_engine.txt  site=HEADSET  log-only=no
         LOG_WINDOW(false, "[JITTRUE] 5 s eye %d: told from the matrix %ld, FALLBACK to the table %ld | told mean x %+.4f y %+.4f px, spread "
             "x %.4f y %.4f (0 = the matrix carries NO jitter - check [PAKGEN] engine jitter) | mean |told - table(counter - k)| "
-            "px: k0 %.4f k1 %.4f k2 %.4f | phases %d", e, g_told[e], g_fallback[e], mx, my, sx, sy, g_kErr[e][0] / kn,
-            g_kErr[e][1] / kn, g_kErr[e][2] / kn, g_phases);
+            "px: k0 %.4f k1 %.4f k2 %.4f | phases %d | of the fallbacks, off-centre guard refusals %ld (trace 20261124_1340)", e,
+            g_told[e], g_fallback[e], mx, my, sx, sy, g_kErr[e][0] / kn, g_kErr[e][1] / kn, g_kErr[e][2] / kn, g_phases,
+            g_offRefused[e]);
+        g_offRefused[e] = 0;
         g_told[e] = 0; g_fallback[e] = 0; g_sumX[e] = g_sumY[e] = g_sumX2[e] = g_sumY2[e] = 0.0;
         g_kErr[e][0] = g_kErr[e][1] = g_kErr[e][2] = 0.0; g_kN[e] = 0;
     }
@@ -3223,8 +3357,8 @@ void EvaluateVisibleFrame(ID3D11DeviceContext* ctx, int eye)
         if (g_mvTex) { g_mvTex->GetDesc(&md); }
         // [LOADBEARING: JITTRUE-MVSTRIP] with jitter_engine.txt each matrix loses its own jitter before the camera term.
         float jtCur[16], jtPrev[16];
-        realjit::Strip(g_vpCur[eye], jtCur);
-        realjit::Strip(g_vpPrev[eye], jtPrev);
+        realjit::StripJitter(g_vpCur[eye], jtCur);    // jitter only - the off-centre stays (trace 20261124_1420)
+        realjit::StripJitter(g_vpPrev[eye], jtPrev);
         ID3D11Texture2D* fixed =
             RunMvFix(ctx, g_depthTex, g_mvTex, md.Width, md.Height, jtCur, jtPrev);
         if (fixed) {
@@ -3652,6 +3786,7 @@ void STDMETHODCALLTYPE HookedPSSetShaderResources(
             ReentryGuard guard;
             if (!guard.engaged) { return; }   // belt and braces with the test above
             PollToggleKey();
+            wristroute::CaptureExposure(self, StartSlot, NumViews, ppSRVs);   // trace 20261123_2200: the prompt's exposure (t1)
 
             // Which history? In VR, the index of this tonemap draw within the
             // frame - CONSISTENT rather than identified. In flat there is only
@@ -6701,7 +6836,9 @@ int FramePhaseOf(const float* m)
 {
     if (!realjit::g_on || g_renderW == 0 || g_renderH == 0) { return -1; }
     double ox = 0.0, oy = 0.0;
-    if (!realjit::Offsets(m, &ox, &oy)) { return -1; }
+    // the jitter part only (trace 20261124_1420): on an off-centre frustum the raw read carries the frustum's own +248 px and matched
+    // no phase, so VPSTORE served nothing (RUN SY4); symmetric frustum: identical to Offsets()
+    if (!realjit::JitterOffsets(m, &ox, &oy)) { return -1; }
     const float* table = g_jitTable;
     if (!table) {
         static uintptr_t s_eng = 0;
@@ -8617,8 +8754,11 @@ bool g_capOn = false;   // dlvr\wrist_capture.txt: the 4 debug captures (STAGE 3
 namespace {
 using ::dlvr::wristleaf::Leaf;
 using ::dlvr::wristleaf::Header;
-constexpr int kP = ::dlvr::wristleaf::kPieces;
-const char* const kPieceTag[kP] = { "minimap", "health", "quests", "weapon", "quick item" };
+// THE IN-WORLD PROMPT (trace docs/traces/20261123_1535_inworld_prompt_routed.md): the router keeps SIX pieces - the wrist's five + the
+// game's prompt widget (wristleaf::kPrompt). DrawPieces keeps wristleaf::kPieces (the wrist's own records).
+constexpr int kP = ::dlvr::wristleaf::kRouted;
+const char* const kPieceTag[kP] = { "minimap", "health", "quests", "weapon", "quick item", "prompt" };
+bool g_promptOn = false;   // inworld_prompts=1 in ovr2xr.txt at launch (Init) - the router also runs for the prompt
 char g_dir[MAX_PATH] = {};
 ::dlvr::wristleaf::LeavesFn g_leavesFn = nullptr;
 bool g_saidNoFn = false;
@@ -8636,12 +8776,29 @@ Vb g_vb[32] = {};
 long g_evict = 0, g_pendFull = 0;
 // ---- this pass
 Header g_hdr = {};
+// [LOADBEARING: inworld_prompts] a piece claims draws only when it is SHOWN and the layer asks for it to be routed (routeMask: 0x1F
+// with the wrist HUD on - the old shownMask-only rule unchanged; bit 5 while the prompt quad shows) - trace 20261123_1535
+// THE PROMPT ALWAYS ROUTED (trace 20261124_0230, Jay: "B"): inworld_prompts on at launch AND the live texture created writable -> the
+// prompt is the in-world panel's whenever its leaves are published, never the flat HUD's (the copy itself still waits for the route bit)
+bool g_promptAlways = false;
+inline bool Routable(int p)
+{
+    // bit 6 (= kRouted, past the piece bits): the layer's "prompt feature live now" - off when switched off mid-session
+    return p >= 0 && p < kP && (g_hdr.shownMask & (1 << p)) &&
+           ((g_hdr.routeMask & (1 << p)) ||
+            (p == ::dlvr::wristleaf::kPrompt && g_promptAlways && (g_hdr.routeMask & (1 << ::dlvr::wristleaf::kRouted))));
+}
 Leaf   g_leaf[::dlvr::wristleaf::kMaxLeaves] = {};
 int    g_nLeaves = 0;
 bool   g_leavesOk = false;
 int    g_slot = -1, g_cursor = 0, g_owner = -1;
 bool   g_ownOpen = false;
 ::dlvr::uipanel::Rect g_crop = {};
+// The UI plane of EACH eye's pass on an OFF-CENTRE frustum, unrounded (trace docs/traces/20261124_1500_hud_router_offcentre.md; eye 1's is
+// mirrored). ok = false: symmetric or not known - Route's own expression on g_crop, unchanged.
+struct SlotPlane { bool ok; float W, H, x, y, w, h; };
+SlotPlane g_plane[2] = {};
+bool g_saidPlane[2] = {};
 float  g_scrW = 0.0f, g_scrH = 0.0f;
 // ---- the pieces target (eye 0's piece draws)
 // STAGE 2b (trace docs/traces/20261112_1955_wrist_stage2b_piece_targets.md): ONE TARGET PER PIECE - RUN WS2's one shared target let the
@@ -8688,7 +8845,12 @@ bool g_sdPrevDropped = false, g_sdWas = false;
 struct SdRec { int draw, kind, matched, owner; bool havePt, open; float x, y; };
 SdRec g_sdRing[64] = {};
 int g_sdRingN = 0;
-long g_prevPiece[kP] = { -1, -1, -1, -1, -1 };
+long g_prevPiece[kP] = { -1, -1, -1, -1, -1, -1 };
+// THE PROMPT's FLICKER COUNTERS (trace 20261123_1700, log-only): per eye-0 pass with the prompt shown - A bit off, B routed 0, C partial,
+// D routed; c_pMiss = a draw in the prompt's box not routed to it while routable, by its distance to the prompt's nearest leaf.
+long c_pA = 0, c_pB = 0, c_pC = 0, c_pD = 0;
+long c_pMiss[4] = {};
+long c_pBoxChange = 0, c_pBCsplit[2] = {};   // trace 20261123_2200: box size changes; B + C within 3 passes after one [0] / steady [1]
 long w_min[kP] = {}, w_max[kP] = {}, w_zero[kP] = {}, w_drop[kP] = {}, w_passes = 0;
 bool w_minSet[kP] = {};
 // BLINK-PASS DETAIL (trace docs/traces/20261112_1700_wrist_blinkpass_detail.md): this eye-0 pass's own counts, printed for a pass that
@@ -8782,6 +8944,19 @@ void Window()
             "armed at that moment %ld (routed now - a vtable-only router lost these) | sites %s", c_siteDraws, c_siteLost,
             afwmask::SitesState());
         c_siteDraws = c_siteLost = 0;
+        if (g_promptOn) {
+            // [PROBE: WRISTROUTE] gate=inworld_prompts (ovr2xr.txt, read at launch)  site=HEADSET  log-only=yes
+            LOG("[WRISTROUTE] 5 s PROMPT (flicker counters, trace 20261123_1700): eye-0 passes with the prompt SHOWN - A not asked to route "
+                "(the layer's bit off) %ld, B asked but routed 0 %ld, C asked and routed below 3/4 of the pass before %ld, D asked and "
+                "routed %ld | draws inside the prompt's box NOT routed to it while routable, by distance to its nearest leaf: <2 %ld, <8 "
+                "%ld, <32 %ld, farther %ld UI px | SWAPS (trace 20261123_2200): prompt box size changes %ld; B + C within 3 passes after a "
+                "change %ld, steady %ld", c_pA, c_pB, c_pC, c_pD, c_pMiss[0], c_pMiss[1], c_pMiss[2], c_pMiss[3], c_pBoxChange,
+                c_pBCsplit[0], c_pBCsplit[1]);
+            c_pA = c_pB = c_pC = c_pD = 0;
+            memset(c_pMiss, 0, sizeof(c_pMiss));
+            c_pBoxChange = 0;
+            memset(c_pBCsplit, 0, sizeof(c_pBCsplit));
+        }
         if (c_sdPasses) {
             // [PROBE: WRISTROUTE] gate=ui_wrist_hud (ovr2xr.txt, read at launch)  site=HEADSET  log-only=yes
             LOG("[WRISTROUTE] 5 s STAND-DOWN (menu / wheel open): eye-0 passes %ld | piece draws DROPPED (drawn nowhere) by a strict rule / "
@@ -8946,7 +9121,7 @@ int NearPiece(float x, float y, bool text)
     }
     if (best < 0 || bd > ::dlvr::uipanel::UiPxTol(kWidePx, g_scrH)) { return -1; }   // tuned on a 2880-high UI screen (sweep 20261113_2125)
     const int p = g_leaf[best].piece;
-    return (p >= 0 && p < kP && (g_hdr.shownMask & (1 << p))) ? best : -1;
+    return Routable(p) ? best : -1;
 }
 // FLOATING GUARD (trace docs/traces/20261118_1822_wrist_floating_guard.md; Jay 2026-11-18: "It's the elements that are still left
 // floating infront of the player specifically"): the nearest leaf of this kind by NearPiece's own metric is NO piece's (piece < 0 - a
@@ -8970,7 +9145,10 @@ bool NearFloating(float x, float y, bool text)
         }
         if (d < bd) { bd = d; best = i; }
     }
-    return best >= 0 && bd <= ::dlvr::uipanel::UiPxTol(kWidePx, g_scrH) && g_leaf[best].piece < 0;
+    // a prompt leaf (piece 5) is FLOATING while the prompt is not routed - as every prompt leaf was before trace 20261123_1535
+    const int fp = best >= 0 ? g_leaf[best].piece : -1;
+    return best >= 0 && bd <= ::dlvr::uipanel::UiPxTol(kWidePx, g_scrH) &&
+           (fp < 0 || (fp == ::dlvr::wristleaf::kPrompt && !Routable(fp)));
 }
 // ROW-RULE PIECE BOX (trace docs/traces/20261118_1842_wrist_row_rule_piece_box.md; RUN WF2: quests' routed count jumping 17 <-> 23..29
 // between passes): a row / row-band match to a SHOWN piece's text leaf counts only when the glyph lies inside that piece's box grown by
@@ -8979,7 +9157,7 @@ bool NearFloating(float x, float y, bool text)
 bool GlyphInPieceBox(int leaf, float x, float y)
 {
     const int p = g_leaf[leaf].piece;
-    if (p < 0 || p >= kP || !(g_hdr.shownMask & (1 << p))) { return true; }
+    if (!Routable(p)) { return true; }
     const float* b = g_hdr.pieceBox[p];
     const float t = ::dlvr::uipanel::UiPxTol(kWidePx, g_scrH);
     return x >= b[0] - t && x <= b[2] + t && y >= b[1] - t && y <= b[3] + t;
@@ -8994,20 +9172,25 @@ void Init(const char* gameDir)
     // pattern). Key or file absent = off (the compiled default). The layer latches the same line at its own start.
     char cfg[MAX_PATH] = {};
     _snprintf_s(cfg, sizeof(cfg), _TRUNCATE, "%s\\dlvr\\ovr2xr.txt", gameDir);
-    int value = -1;
+    int value = -1, prompts = -1;
     FILE* f = nullptr;
     const bool fileOk = fopen_s(&f, cfg, "r") == 0 && f;
     if (fileOk) {
         char line[512];
         while (fgets(line, sizeof(line), f)) {
-            if (_strnicmp(line, "ui_wrist_hud=", 13) != 0) { continue; }
             int v = -1;
-            if (sscanf_s(line + 13, "%d", &v) == 1) { value = v; }
-            break;
+            if (_strnicmp(line, "ui_wrist_hud=", 13) == 0) { if (sscanf_s(line + 13, "%d", &v) == 1) { value = v; } continue; }
+            // the in-world prompt (trace 20261123_1535): the same line the layer latches (PromptQuadOnThisLaunch)
+            if (_strnicmp(line, "inworld_prompts=", 16) == 0) { if (sscanf_s(line + 16, "%d", &v) == 1) { prompts = v; } continue; }
         }
         fclose(f);
     }
-    g_on = value > 0;
+    // inworld_prompts: key or file absent (prompts stays -1) = ON, the layer's compiled default (promptquad.cpp InworldPrompts = true,
+    // trace 20261124_1035); 0 = off; >0 = on.
+    g_promptOn = prompts < 0 || prompts > 0;
+    // [LOADBEARING: inworld_prompts] the router runs for the wrist HUD OR the prompt (pieces 0..4 route only with ui_wrist_hud on - the
+    //      layer leaves them unassigned and unmasked otherwise)
+    g_on = value > 0 || g_promptOn;
     // The stage-1 debug captures (4 x wristcap_*.bin a session) are a test tool, not part of the player's switch: own marker.
     char cap[MAX_PATH] = {}, old[MAX_PATH] = {};
     _snprintf_s(cap, sizeof(cap), _TRUNCATE, "%s\\dlvr\\wrist_capture.txt", gameDir);
@@ -9015,8 +9198,11 @@ void Init(const char* gameDir)
     _snprintf_s(old, sizeof(old), _TRUNCATE, "%s\\dlvr\\wrist_route.txt", gameDir);
     const bool oldMarker = GetFileAttributesA(old) != INVALID_FILE_ATTRIBUTES;
     // [PROBE: WRISTROUTE] gate=ui_wrist_hud (ovr2xr.txt, read at launch)  site=HEADSET  log-only=no
+    // [PROBE: WRISTROUTE] gate=ui_wrist_hud,inworld_prompts (ovr2xr.txt, read at launch)  site=FLAT  log-only=yes
+    LOG("[WRISTROUTE] prompt: inworld_prompts in ovr2xr.txt = %d -> %s | Header %zu bytes (the layer prints its own - they must match)",
+        prompts, g_promptOn ? "the router also runs for the game's prompt widget (piece 5)" : "off", sizeof(Header));
     LOG("[WRISTROUTE] %s (logged unconditionally) - ui_wrist_hud in ovr2xr.txt = %d (%s) | captures %s (dlvr\\wrist_capture.txt)%s. %s",
-        g_on ? "ON - the wrist HUD's routing (the five HUD pieces leave the eyes)" : "off", value,
+        g_on ? "ON - the router (the wrist HUD's pieces when ui_wrist_hud, the prompt when inworld_prompts)" : "off", value,
         value >= 0 ? "read" : (fileOk ? "no ui_wrist_hud line - off" : "no ovr2xr.txt - off"), g_capOn ? "ON" : "off",
         oldMarker ? " | the old marker dlvr\\wrist_route.txt is on disk - NOT read any more" : "",
         g_on ? "NEEDS: hud_layer (the bracket + redirect - only redirected passes are routed), the Map / Unmap hooks "
@@ -9235,6 +9421,27 @@ void OnPassOpen(ID3D11DeviceContext* ctx, int slot)
             }
         }
     }
+    g_plane[slot].ok = false;
+    if (g_crop.w && g_eyeTanFn && hudlayer::g_lay[0][0]) {   // both slots: each eye's own plane (off-centre only)
+        D3D11_TEXTURE2D_DESC d = {};
+        hudlayer::g_lay[0][0]->GetDesc(&d);
+        float tn[4] = {};
+        SlotPlane sp = {};
+        if (g_eyeTanFn(slot, tn) && ::dlvr::uipanel::UiPlaneExact(static_cast<int>(d.Width), static_cast<int>(d.Height),
+                ::dlvr::uipanel::EyeTan{ tn[0], tn[1], tn[2], tn[3] }, &sp.x, &sp.y, &sp.w, &sp.h)) {
+            sp.ok = true;
+            sp.W = static_cast<float>(d.Width);
+            sp.H = static_cast<float>(d.Height);
+            g_plane[slot] = sp;
+            if (!g_saidPlane[slot]) {
+                g_saidPlane[slot] = true;
+                // [PROBE: WRISTROUTE] gate=ui_wrist_hud (ovr2xr.txt, read at launch)  site=HEADSET  log-only=no
+                LOG("[WRISTROUTE] OFF-CENTRE UI PLANE eye %d (logged once per eye): game frustum L %.4f R %.4f U %.4f D %.4f, image %ux%u -> "
+                    "(%.2f,%.2f %.2fx%.2f) - this eye's draws are mapped through it", slot, tn[0], tn[1], tn[2], tn[3], d.Width,
+                    d.Height, sp.x, sp.y, sp.w, sp.h);
+            }
+        }
+    }
     if (slot == 0 && g_on) {
         // DRAW SITES: patch rd3d11's four draw sites once (render thread, inside the bind hook - never inside a draw case)
         afwmask::InstallSites("the wrist HUD router");
@@ -9313,6 +9520,11 @@ int Route(ID3D11DeviceContext* ctx, bool indexed, UINT start, INT base)
             const float W = static_cast<float>(g_crop.x * 2 + g_crop.w), Hh = static_cast<float>(g_crop.y * 2 + g_crop.h);
             ux = (fx * W - static_cast<float>(g_crop.x)) / static_cast<float>(g_crop.w) * g_scrW;
             uy = (fy * Hh - static_cast<float>(g_crop.y)) / static_cast<float>(g_crop.h) * g_scrH;
+            const SlotPlane& sp = g_plane[g_slot];   // off-centre: the crop is NOT centred in the image, and eye 1's is mirrored
+            if (sp.ok) {
+                ux = (fx * sp.W - sp.x) / sp.w * g_scrW;
+                uy = (fy * sp.H - sp.y) / sp.h * g_scrH;
+            }
             kind = (fabsf(ux) < 2.0f && fabsf(uy) < 2.0f) ? 2 : 1;
         }
     }
@@ -9409,7 +9621,7 @@ int Route(ID3D11DeviceContext* ctx, bool indexed, UINT start, INT base)
             else if (!floatKept) {   // text_owner: the piece box (not the minimap's) holding the glyph - NOT during a menu / wheel stand-down (it took
                      // menu text in the quests box); the wide match below runs either way (trace 20261112_2215)
                 for (int p = 0; p < kP && matched < 0 && !g_hdr.standDown; ++p) {
-                    if (p == ::dlvr::wristleaf::kMinimap || !(g_hdr.shownMask & (1 << p))) { continue; }
+                    if (p == ::dlvr::wristleaf::kMinimap || !Routable(p)) { continue; }
                     const float* b = g_hdr.pieceBox[p];
                     if (g[0] >= b[0] && g[0] <= b[2] && g[1] >= b[1] && g[1] <= b[3]) { g_owner = p; g_ownOpen = true; ++c_txtBox; matched = -2; }
                 }
@@ -9437,17 +9649,45 @@ int Route(ID3D11DeviceContext* ctx, bool indexed, UINT start, INT base)
         ++c_unk;
         if (e0) { ++g_ps.unk; }
     }
+    // (THE PROMPT CLAIM of trace 20261123_1830 was here - REMOVED by trace 20261123_2000: it could not follow the moving prompt and took
+    // quests draws in RUN IP6; the prompt is now pinned still by the layer while routed, so these stock rules match it.)
     if (matched >= 0) { g_owner = g_leaf[matched].piece; g_ownOpen = !g_leaf[matched].last; }
     else if (matched == -1 && !g_ownOpen) { g_owner = -1; }
     const int p = floatKept ? -1 : g_owner;   // FLOATING GUARD: this draw only - g_owner / g_ownOpen carry on unchanged for the next draws
     if (e0) {   // STAND-DOWN DUMP (log-only): a draw left as made (during a stand-down, after one, or into the ring), then remember
                 // whether it went to a piece (dropped during a stand-down, routed otherwise)
         ++g_sdDraw;
-        const bool toPiece = p >= 0 && p < kP && (g_hdr.shownMask & (1 << p));
+        const bool toPiece = Routable(p);
         if (!toPiece) { SdLog(ctx, g_hdr.standDown ? 0 : (g_sdAfter > 0 ? 1 : 2), kind, sdPt, sdx, sdy, matched, mt); }
         g_sdPrevDropped = toPiece;
+        // THE PROMPT's MISS DISTANCES (trace 20261123_1700, log-only): a placed draw inside the prompt's box (grown kWidePx) that did NOT go
+        // to the prompt while it was routable - its distance to the prompt's nearest leaf of the same kind (corner: at; text: the row metric)
+        constexpr int kPr = ::dlvr::wristleaf::kPrompt;
+        if (sdPt && p != kPr && Routable(kPr)) {
+            const float* b = g_hdr.pieceBox[kPr];
+            const float t = ::dlvr::uipanel::UiPxTol(kWidePx, g_scrH);
+            if (sdx >= b[0] - t && sdx <= b[2] + t && sdy >= b[1] - t && sdy <= b[3] + t) {
+                float bd = 1e30f;
+                const bool txt = kind == 2;
+                for (int i = 0; i < g_nLeaves; ++i) {
+                    const Leaf& l = g_leaf[i];
+                    if (l.piece != kPr || (l.text != 0) != txt) { continue; }
+                    float d;
+                    if (txt) {
+                        const float dx = sdx < l.rect[0] ? l.rect[0] - sdx : (sdx > l.rect[2] ? sdx - l.rect[2] : 0.0f);
+                        const float dy = fabsf(l.rect[1] - sdy);
+                        d = dx > dy ? dx : dy;
+                    } else {
+                        const float dx = fabsf(l.at[0] - sdx), dy = fabsf(l.at[1] - sdy);
+                        d = dx > dy ? dx : dy;
+                    }
+                    if (d < bd) { bd = d; }
+                }
+                ++c_pMiss[bd < 2.0f ? 0 : bd < 8.0f ? 1 : bd < 32.0f ? 2 : 3];
+            }
+        }
     }
-    if (p < 0 || p >= kP || !(g_hdr.shownMask & (1 << p))) { return kAsMade; }
+    if (!Routable(p)) { return kAsMade; }   // [LOADBEARING: inworld_prompts] the routeMask gate (trace 20261123_1535)
     if (g_hdr.standDown) {   // MENU / WHEEL STAND-DOWN (trace docs/traces/20261112_2150_wrist_standdown_drop.md): a piece's draw found by the
                              // strict rules (or carried after one) is drawn NOWHERE - the game's HUD in a menu / wheel's first / last frames
         if (e0) { if (matched >= 0) { ++c_sdStrict[p]; } else { ++c_sdCarry[p]; } }
@@ -9530,6 +9770,24 @@ cbuffer W : register(b0) { float4 k; };
 float4 PSWristPiece(float4 p : SV_Position) : SV_Target {
   int2 q = int2(floor(p.xy) * k.w + k.xy);
   return tP.Load(int3(q, 0)) * k.z;
+}
+// THE PROMPT's PLATE (trace 20261123_1830; a SOLID BOX since trace 20261123_2100, Jay: "Go with A"): every pixel of the copied widget
+// box gets rgb = k.z (= plate / 12), clamped to 1/12 so the plate material's dest x (1 - rgb x 12 x fog) never leaves [0, 1]; alpha 0
+// (the lamp PS reads rgb only). The rest of the texture is cleared to 0 = no change to the scene.
+float4 PSPromptPlate(float4 p : SV_Position) : SV_Target {
+  float v = min(k.z, 1.0 / 12.0);
+  return float4(v, v, v, 0.0);
+}
+// THE PROMPT's TEXT, EXPOSURE-COMPENSATED (trace 20261123_2200): the game's tonemap multiplies the scene by E (tonemapping.mat t1 at
+// (0,0)); our 1x1 copy of it is tE. The text x clamp(1/E, e.y, e.z) keeps it the same on screen in a dark room and in daylight. e.w = 0:
+// no exposure captured -> x 1 (the old copy).
+Texture2D<float> tE : register(t1);
+cbuffer X : register(b1) { float4 e; };
+float4 PSPromptText(float4 p : SV_Position) : SV_Target {
+  int2 q = int2(floor(p.xy) * k.w + k.xy);
+  float r = 1.0;
+  if (e.w > 0.5) { r = clamp(e.x / max(tE.Load(int3(0, 0, 0)), 1e-4), e.y, e.z); }
+  return tP.Load(int3(q, 0)) * (k.z * r);
 }
 )";
 DLVR_HLSL_USE(kWristHlsl)
@@ -9673,6 +9931,481 @@ int CopyPiece(ID3D11Texture2D* dst, int p, int dx, int dy, int w, int h, float f
     return rc;
 }
 
+// ===== THE IN-WORLD PROMPT's LIVE TEXTURE (trace docs/traces/20261123_1535_inworld_prompt_routed.md) =====
+// OUR rd3d11 RCreateTexture2D (+470F0, ida/rt2_out.txt) creates every pack texture WITH initial data as IMMUTABLE - nothing can write it.
+// The one texture of OUR prompt pack (dlvr_prompt_live: pack format 2 = DXGI 27 R8G8B8A8_TYPELESS, 768 x 192, its first 16 bytes the
+// marker) is created DEFAULT + RENDER_TARGET instead by a hook on the device's CreateTexture2D (vtable slot 5), installed only with
+// inworld_prompts on at launch; every other call goes to the original unchanged. Each submit (DlvrHudLayerSubmit's top, render thread,
+// outside the HUD bracket - the wrist's own CopyPiece moment) the routed prompt widget is scaled into it.
+namespace {
+constexpr UINT kLiveW = 768, kLiveH = 192;
+const char kLiveMarker[16] = { 'D', 'L', 'V', 'R', 'P', 'R', 'O', 'M', 'P', 'T', 'L', 'I', 'V', 'E', '0', '1' };
+using CreateTex2DFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, const D3D11_TEXTURE2D_DESC*, const D3D11_SUBRESOURCE_DATA*,
+                                                  ID3D11Texture2D**);
+CreateTex2DFn g_origCreateTex2D = nullptr;
+ID3D11Texture2D* volatile g_liveTex = nullptr;   // AddRef'd (kept for the session; a re-created one replaces it)
+volatile LONG g_liveSeen = 0, g_liveCopyOk = 0;
+LONG g_liveCopyFault[8] = {};
+bool g_liveHookTried = false;
+// THE PLATE (trace 20261123_1830): the second marked texture of our rpack, made writable the same way; written through its OWN view by
+// PSPromptPlate - _SRGB since trace 20261123_1930 (the game's read is the sRGB view; IP6 excluded the plain one).
+const char kPlateMarker[16] = { 'D', 'L', 'V', 'R', 'P', 'R', 'O', 'M', 'P', 'T', 'P', 'L', 'A', 'T', 'E', '1' };
+ID3D11Texture2D* volatile g_plateTex = nullptr;  // AddRef'd, as g_liveTex
+ID3D11RenderTargetView* g_plateRtv = nullptr;
+ID3D11Texture2D* g_plateRtvTex = nullptr;          // the texture g_plateRtv was made for (a re-created texture gets a new view)
+ID3D11PixelShader* g_psPlate = nullptr;
+bool g_plateFailed = false;
+volatile LONG g_plateCopyOk = 0;
+LONG g_plateCopyFault[8] = {};
+bool g_floatLive = false;   // trace 20261124_0030: both device hooks installed -> the live texture is made float
+
+int MarkerAt(const void* p)   // 1 = the live (text) marker, 2 = the plate marker, 0 = neither
+{
+    __try {
+        if (memcmp(p, kLiveMarker, sizeof(kLiveMarker)) == 0) { return 1; }
+        if (memcmp(p, kPlateMarker, sizeof(kPlateMarker)) == 0) { return 2; }
+        return 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+int IsLive(const D3D11_TEXTURE2D_DESC* d, const D3D11_SUBRESOURCE_DATA* s)
+{
+    if (!d || !s || !s->pSysMem) { return 0; }
+    if (d->Width != kLiveW || d->Height != kLiveH || d->Format != DXGI_FORMAT_R8G8B8A8_TYPELESS || d->MipLevels != 1 ||
+        d->ArraySize != 1) {
+        return 0;
+    }
+    return MarkerAt(s->pSysMem);
+}
+
+HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(ID3D11Device* dev, const D3D11_TEXTURE2D_DESC* d, const D3D11_SUBRESOURCE_DATA* s,
+                                                ID3D11Texture2D** out)
+{
+    const int which = IsLive(d, s);
+    if (!which) { return g_origCreateTex2D(dev, d, s, out); }   // everything that is not one of our marked textures: unchanged
+    D3D11_TEXTURE2D_DESC m = *d;
+    const UINT usage0 = static_cast<UINT>(d->Usage), bind0 = d->BindFlags, cpu0 = d->CPUAccessFlags;
+    m.Usage = D3D11_USAGE_DEFAULT;
+    m.BindFlags |= D3D11_BIND_RENDER_TARGET;
+    m.CPUAccessFlags = 0;
+    // trace 20261124_0030: the LIVE (text) texture as R16G16B16A16_FLOAT (holds > 1.0) with NO initial data (the pack's RGBA8 pitch does
+    // not fit; it is cleared before every copy). The engine's own views of it are made float by HookedCreateSRV. The plate stays 8-bit.
+    const bool toFloat = which == 1 && g_floatLive;   // only when the view hook is in place (else 8-bit, as before)
+    if (toFloat) { m.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; }
+    const HRESULT hr = g_origCreateTex2D(dev, &m, toFloat ? nullptr : s, out);
+    ID3D11Texture2D* t = (SUCCEEDED(hr) && out) ? *out : nullptr;
+    if (t) {
+        t->AddRef();
+        ID3D11Texture2D* volatile* slot = which == 2 ? &g_plateTex : &g_liveTex;
+        ID3D11Texture2D* old = reinterpret_cast<ID3D11Texture2D*>(
+            InterlockedExchangePointer(reinterpret_cast<void* volatile*>(slot), t));
+        if (old) { old->Release(); }
+        if (which == 1 && g_promptOn && !g_promptAlways) {
+            g_promptAlways = true;   // trace 20261124_0230: from now on the prompt never draws on the flat HUD
+            // [PROBE: PROMPTQ] gate=inworld_prompts (ovr2xr.txt, read at launch)  site=FLAT  log-only=yes
+            LOG("[PROMPTQ] PROMPT ALWAYS ROUTED (logged unconditionally) - the live texture exists: the game's X prompt is taken off the flat "
+                "HUD from its first published frame (trace 20261124_0230)");
+        }
+    }
+    if (InterlockedIncrement(&g_liveSeen) <= 6) {
+        // [PROBE: PROMPTQ] gate=inworld_prompts (ovr2xr.txt, read at launch)  site=FLAT  log-only=no
+        LOG("[PROMPTQ] %s TEXTURE %s (first 6 logged) - %ux%u format %d -> %d, desc Usage %u -> %u, BindFlags 0x%X -> 0x%X, CPU 0x%X -> 0 "
+            "| hr 0x%08lX texture %p | thread %lu", which == 2 ? "PLATE" : "LIVE", t ? "CREATED WRITABLE" : "*** CREATE FAILED ***", d->Width,
+            d->Height, static_cast<int>(d->Format), static_cast<int>(m.Format), usage0, static_cast<UINT>(m.Usage), bind0, m.BindFlags, cpu0,
+            static_cast<unsigned long>(hr), static_cast<void*>(t), GetCurrentThreadId());
+    }
+    return hr;
+}
+
+// trace 20261124_0030: the engine makes its own views of the live texture right after creating it (rd3d11 +470F0, desc formats 28 / 29
+// for pack format 2) - for our float texture those would fail; this rewrites ONLY that texture's view format to R16G16B16A16_FLOAT.
+using CreateSrvFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, ID3D11Resource*, const D3D11_SHADER_RESOURCE_VIEW_DESC*,
+                                                ID3D11ShaderResourceView**);
+CreateSrvFn g_origCreateSrv = nullptr;
+LONG g_srvRewrites = 0;
+HRESULT STDMETHODCALLTYPE HookedCreateSRV(ID3D11Device* dev, ID3D11Resource* res, const D3D11_SHADER_RESOURCE_VIEW_DESC* d,
+                                          ID3D11ShaderResourceView** out)
+{
+    if (!res || !d || res != static_cast<ID3D11Resource*>(g_liveTex)) { return g_origCreateSrv(dev, res, d, out); }   // unchanged
+    D3D11_SHADER_RESOURCE_VIEW_DESC m = *d;
+    const int fmt0 = static_cast<int>(m.Format);
+    m.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    const HRESULT hr = g_origCreateSrv(dev, res, &m, out);
+    if (++g_srvRewrites <= 4) {
+        // [PROBE: PROMPTQ] gate=inworld_prompts (ovr2xr.txt, read at launch)  site=FLAT  log-only=no
+        LOG("[PROMPTQ] LIVE TEXTURE VIEW (first 4) - the engine's view format %d -> %d (R16G16B16A16_FLOAT) | hr 0x%08lX %s", fmt0,
+            static_cast<int>(m.Format), static_cast<unsigned long>(hr), SUCCEEDED(hr) ? "created" : "*** REFUSED - the prompt draws black ***");
+    }
+    return hr;
+}
+}  // namespace
+
+void InstallPromptTextureHook(ID3D11Device* dev)
+{
+    if (!g_promptOn || !dev || g_liveHookTried) { return; }
+    g_liveHookTried = true;
+    void** vt = *reinterpret_cast<void***>(dev);
+    // [LOADBEARING: inworld_prompts] the device CreateTexture2D hook - without it our pack's texture is IMMUTABLE and the prompt cannot be
+    //      copied (the layer then never asks for the prompt to be routed: it stays on the flat HUD)
+    const bool ok = PatchVtableSlot(vt, 5, reinterpret_cast<void*>(&HookedCreateTexture2D),
+                                    reinterpret_cast<void**>(&g_origCreateTex2D), "CreateTexture2D");
+    // [PROBE: PROMPTQ] gate=inworld_prompts (ovr2xr.txt, read at launch)  site=FLAT  log-only=no
+    LOG("[PROMPTQ] CreateTexture2D hook %s (logged unconditionally) - device %p vtable %p slot 5 (original %p); it changes only the %ux%u "
+        "R8G8B8A8_TYPELESS textures whose data starts \"DLVRPROMPTLIVE01\" / \"DLVRPROMPTPLATE1\"", ok ? "INSTALLED" : "*** NOT INSTALLED - no in-world prompt ***",
+        static_cast<void*>(dev), static_cast<void*>(vt), reinterpret_cast<void*>(g_origCreateTex2D), kLiveW, kLiveH);
+    // [LOADBEARING: inworld_prompts] the CreateShaderResourceView hook (trace 20261124_0030) - without it the float live texture has no
+    //      engine view and the prompt panel draws black
+    const bool okSrv = ok && PatchVtableSlot(vt, 7, reinterpret_cast<void*>(&HookedCreateSRV), reinterpret_cast<void**>(&g_origCreateSrv),
+                                             "CreateShaderResourceView");
+    g_floatLive = okSrv;
+    // [PROBE: PROMPTQ] gate=inworld_prompts (ovr2xr.txt, read at launch)  site=FLAT  log-only=no
+    LOG("[PROMPTQ] CreateShaderResourceView hook %s (logged unconditionally) - slot 7 (original %p); it changes only the live texture's "
+        "view format", okSrv ? "INSTALLED" : "*** NOT INSTALLED ***", reinterpret_cast<void*>(g_origCreateSrv));
+}
+
+bool PromptLiveReady()
+{
+    return g_promptOn && g_liveTex != nullptr;
+}
+
+// THE PLATE's COPY (trace 20261123_1830): the same box / step / position as the text copy, into the plate texture through its own UNORM
+// view, by PSPromptPlate (rgb = alpha x plate / 12, clamped 1/12). The texture is cleared to 0 first (= no change to the scene).
+// CopyPiece's plumbing (the HUD layer's FullScreen + the wrist constant buffer + the piece's view), its own shader and view.
+// 0 drawn, -2 no plate texture, 3 bad destination, 4 busy, 5 a D3D object refused.
+int PlateCopy(int dx, int dy, int w, int h, int step, const int box[4], float plate)
+{
+    ID3D11Texture2D* tex = g_plateTex;
+    if (!tex) { return -2; }
+    if (g_plateFailed) { return 5; }
+    D3D11_TEXTURE2D_DESC dd = {};
+    tex->GetDesc(&dd);
+    if (static_cast<int>(dd.Width) < dx + w || static_cast<int>(dd.Height) < dy + h || !(dd.BindFlags & D3D11_BIND_RENDER_TARGET)) { return 3; }
+    if (hudlayer::t_busy) { return 4; }
+    if (!hudlayer::g_vs || !hudlayer::g_rs || !hudlayer::g_dsOff || !hudlayer::g_blendOff || !EnsureWristCopy()) { return 5; }
+    HRESULT hr = S_OK;
+    if (!g_psPlate) {
+        ID3DBlob* blob = nullptr;
+        ID3DBlob* err = nullptr;
+        hr = ::dlvr::shaderbin::Compile(kWristHlsl, strlen(kWristHlsl), "promptplate", nullptr, nullptr, "PSPromptPlate", "ps_5_0", 0, 0,
+                                        &blob, &err);
+        if (SUCCEEDED(hr) && blob) { hr = g_device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &g_psPlate); }
+        // [PROBE: PROMPTQ] gate=inworld_prompts (ovr2xr.txt, read at launch)  site=HEADSET  log-only=no
+        LOG("[PROMPTQ] plate shader PSPromptPlate %s (logged unconditionally) | hr 0x%08lX %s", SUCCEEDED(hr) && g_psPlate ? "READY" :
+            "*** FAILED - no plate this session ***", static_cast<unsigned long>(hr), err ? static_cast<const char*>(err->GetBufferPointer()) : "");
+        if (blob) { blob->Release(); }
+        if (err) { err->Release(); }
+        if (FAILED(hr) || !g_psPlate) { g_plateFailed = true; return 5; }
+    }
+    if (g_plateRtvTex != tex) {   // a (re)created plate texture: its own UNORM view
+        if (g_plateRtv) { g_plateRtv->Release(); g_plateRtv = nullptr; }
+        D3D11_RENDER_TARGET_VIEW_DESC rd = {};
+        // trace 20261123_1930: _SRGB (was UNORM) - the game reads it through its sRGB view (IP6 excludes the plain one), so the linear
+        // value the shader writes arrives exactly
+        rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB; rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+        hr = g_device->CreateRenderTargetView(tex, &rd, &g_plateRtv);
+        // [PROBE: PROMPTQ] gate=inworld_prompts (ovr2xr.txt, read at launch)  site=HEADSET  log-only=no
+        LOG("[PROMPTQ] plate view (R8G8B8A8_UNORM_SRGB) %s - texture %p %ux%u | hr 0x%08lX", SUCCEEDED(hr) && g_plateRtv ? "CREATED" : "*** REFUSED ***",
+            static_cast<void*>(tex), dd.Width, dd.Height, static_cast<unsigned long>(hr));
+        if (FAILED(hr) || !g_plateRtv) { g_plateFailed = true; return 5; }
+        g_plateRtvTex = tex;
+    }
+    const float z[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    g_context->ClearRenderTargetView(g_plateRtv, z);
+    float pv = plate < 0.0f || !(plate == plate) ? 0.0f : plate > 1.0f ? 1.0f : plate;
+    hudlayer::t_busy = true;   // as CopyPiece: our bind must not reach the bracket detector
+    const float k[4] = { static_cast<float>(box[0] - dx * step), static_cast<float>(box[1] - dy * step), pv / 12.0f,
+                         static_cast<float>(step) };
+    g_context->UpdateSubresource(g_wristCb, 0, nullptr, k, 0, 0);
+    ID3D11Buffer* saved = nullptr;
+    g_context->PSGetConstantBuffers(0, 1, &saved);
+    g_context->PSSetConstantBuffers(0, 1, &g_wristCb);
+    ID3D11ShaderResourceView* sv[1] = { g_pieceSrv[::dlvr::wristleaf::kPrompt] };
+    ID3D11RenderTargetView* rtv = g_plateRtv;
+    hudlayer::FullScreen(g_context, &rtv, 1, static_cast<FLOAT>(dx), static_cast<FLOAT>(dy), static_cast<FLOAT>(w), static_cast<FLOAT>(h),
+                         g_psPlate, hudlayer::g_blendOff, sv, 1);
+    g_context->PSSetConstantBuffers(0, 1, &saved);
+    if (saved) { saved->Release(); }
+    hudlayer::t_busy = false;
+    return 0;
+}
+
+// ===== THE EXPOSURE (trace 20261123_2200). The game's tonemap (tonemapping.mat PS 7d2be851) multiplies the scene by E = its t1 at
+// (0,0) (LUM_16x16_A, INV-372 addendum). At THE tonemap draw (render thread, before it) its texel (0,0) is copied into OUR 1x1 R32F;
+// the prompt text copy scales by 1/E. A 1 s staging readback feeds a 5 s log line (log-only).
+ID3D11Texture2D* g_expTex = nullptr;
+ID3D11ShaderResourceView* g_expSrv = nullptr;
+ID3D11Texture2D* g_expStage = nullptr;
+bool g_expFailed = false, g_expHave = false, g_expStagePending = false;
+LONG g_expCaptures = 0, g_expRefused[4] = {};
+ULONGLONG g_expStageMs = 0, g_expLogMs = 0;
+float g_expMin = 1e30f, g_expMax = -1e30f, g_expLast = 0.0f;
+long g_expReads = 0;
+ID3D11Buffer* g_textCb = nullptr;
+ID3D11PixelShader* g_psText = nullptr;
+constexpr float kExpRef = 0.045f;   // trace 20261123_2330: the brightest exposure measured (RUN IP10) - the daylight reference
+
+void CaptureExposure(ID3D11DeviceContext* c, UINT start, UINT n, ID3D11ShaderResourceView* const* views)
+{
+    if (!g_promptOn || g_expFailed || !c || !g_device) { return; }
+    // slot 1 from THIS bind when its range covers it (AddRef'd to match the Get path), else the slot's current binding
+    ID3D11ShaderResourceView* srv = nullptr;
+    const bool fromCall = views && start <= 1 && 1 < start + n;
+    if (fromCall) { srv = views[1 - start]; if (srv) { srv->AddRef(); } }
+    else { c->PSGetShaderResources(1, 1, &srv); }
+    int why = -1;   // 0 no SRV, 1 not a 2D texture, 2 wrong format / size
+    ID3D11Resource* res = nullptr;
+    ID3D11Texture2D* tex = nullptr;
+    D3D11_TEXTURE2D_DESC d = {};
+    if (!srv) { why = 0; }
+    else {
+        srv->GetResource(&res);
+        if (!res || FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&tex))) || !tex) { why = 1; }
+        else {
+            tex->GetDesc(&d);
+            if ((d.Format != DXGI_FORMAT_R32_FLOAT && d.Format != DXGI_FORMAT_R32_TYPELESS) || d.Width > 64 || d.Height > 64 ||
+                d.SampleDesc.Count != 1) { why = 2; }
+        }
+    }
+    if (why < 0 && !g_expTex) {
+        D3D11_TEXTURE2D_DESC m = {};
+        m.Width = 1; m.Height = 1; m.MipLevels = 1; m.ArraySize = 1; m.Format = DXGI_FORMAT_R32_FLOAT; m.SampleDesc.Count = 1;
+        m.Usage = D3D11_USAGE_DEFAULT; m.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        HRESULT hr = g_device->CreateTexture2D(&m, nullptr, &g_expTex);
+        if (SUCCEEDED(hr)) { hr = g_device->CreateShaderResourceView(g_expTex, nullptr, &g_expSrv); }
+        if (SUCCEEDED(hr)) {
+            m.Usage = D3D11_USAGE_STAGING; m.BindFlags = 0; m.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            hr = g_device->CreateTexture2D(&m, nullptr, &g_expStage);
+        }
+        if (FAILED(hr)) {
+            g_expFailed = true;
+            // [PROBE: PROMPTQ] gate=inworld_prompts (ovr2xr.txt, read at launch)  site=HEADSET  log-only=no
+            LOG("[PROMPTQ] *** EXPOSURE TEXTURE NOT CREATED (hr 0x%08lX) - the prompt text is not exposure-compensated this session ***",
+                static_cast<unsigned long>(hr));
+        }
+    }
+    if (why < 0 && g_expTex) {
+        const D3D11_BOX box = { 0, 0, 0, 1, 1, 1 };
+        c->CopySubresourceRegion(g_expTex, 0, 0, 0, 0, tex, 0, &box);
+        g_expHave = true;
+        if (++g_expCaptures == 1) {
+            // [PROBE: PROMPTQ] gate=inworld_prompts (ovr2xr.txt, read at launch)  site=HEADSET  log-only=no
+            LOG("[PROMPTQ] FIRST EXPOSURE CAPTURE (logged unconditionally) - the tonemap's t1 (%s; this bind: start %u, %u views) = texture "
+                "%p %ux%u format %d -> texel (0,0) into our 1x1 %p", fromCall ? "from THIS bind" : "the slot's CURRENT binding - not in this "
+                "bind's range", start, n, static_cast<void*>(tex), d.Width, d.Height, static_cast<int>(d.Format), static_cast<void*>(g_expTex));
+        }
+    } else if (why >= 0 && ++g_expRefused[why] == 1) {
+        // [PROBE: PROMPTQ] gate=inworld_prompts (ovr2xr.txt, read at launch)  site=HEADSET  log-only=no
+        LOG("[PROMPTQ] EXPOSURE NOT CAPTURED (first of each reason) - %s (texture %ux%u format %d)", why == 0 ? "no SRV at PS slot 1" :
+            why == 1 ? "slot 1 is not a 2D texture" : "slot 1 is not a small R32F texture", d.Width, d.Height, static_cast<int>(d.Format));
+    }
+    if (tex) { tex->Release(); }
+    if (res) { res->Release(); }
+    if (srv) { srv->Release(); }
+}
+
+// log-only: our 1x1 read back once a second (DO_NOT_WAIT), min / max / last over 5 s
+void ExposureLogTick()
+{
+    if (!g_expStage || !g_expTex) { return; }
+    const ULONGLONG now = GetTickCount64();
+    if (g_expStagePending) {
+        D3D11_MAPPED_SUBRESOURCE ms = {};
+        if (SUCCEEDED(g_context->Map(g_expStage, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &ms))) {
+            const float v = *static_cast<const float*>(ms.pData);
+            g_context->Unmap(g_expStage, 0);
+            g_expStagePending = false;
+            if (std::isfinite(v)) { g_expLast = v; if (v < g_expMin) { g_expMin = v; } if (v > g_expMax) { g_expMax = v; } ++g_expReads; }
+        }
+    } else if (g_expHave && now - g_expStageMs >= 1000) {
+        g_context->CopyResource(g_expStage, g_expTex);
+        g_expStagePending = true;
+        g_expStageMs = now;
+    }
+    if (now - g_expLogMs >= 5000) {
+        g_expLogMs = now;
+        // [PROBE: PROMPTQ] gate=inworld_prompts (ovr2xr.txt, read at launch)  site=HEADSET  log-only=yes
+        LOG("[PROMPTQ] EXPOSURE 5 s - E (the tonemap's scene multiplier) min %.4f max %.4f last %.4f over %ld reads; text factor %.3f/E "
+            "clamped [0, 1] -> last %.3f | captures so far %ld", g_expReads ? g_expMin : 0.0, g_expReads ? g_expMax : 0.0,
+            static_cast<double>(g_expLast), g_expReads, static_cast<double>(kExpRef),
+            g_expLast > 0.0f ? (kExpRef / g_expLast > 1.0 ? 1.0 : static_cast<double>(kExpRef / g_expLast)) : 1.0, g_expCaptures);
+        g_expMin = 1e30f; g_expMax = -1e30f; g_expReads = 0;
+    }
+}
+
+// THE TEXT COPY (trace 20261123_2200): CopyPiece's job for the prompt, with PSPromptText (x clamp(1/E, 1/8, 8) when captured) - the
+// same box / step / destination / the live texture's WristRtv (_SRGB) view. 0 drawn; 3 bad destination; 4 busy; 5 refused.
+int TextCopy(ID3D11Texture2D* dst, int dx, int dy, int w, int h, int step, const int box[4], float fade)
+{
+    D3D11_TEXTURE2D_DESC dd = {};
+    dst->GetDesc(&dd);
+    if (static_cast<int>(dd.Width) < dx + w || static_cast<int>(dd.Height) < dy + h || !(dd.BindFlags & D3D11_BIND_RENDER_TARGET)) { return 3; }
+    if (hudlayer::t_busy) { return 4; }
+    if (!hudlayer::g_vs || !hudlayer::g_rs || !hudlayer::g_dsOff || !hudlayer::g_blendOff || !EnsureWristCopy()) { return 5; }
+    HRESULT hr = S_OK;
+    if (!g_psText) {
+        ID3DBlob* blob = nullptr;
+        ID3DBlob* err = nullptr;
+        hr = ::dlvr::shaderbin::Compile(kWristHlsl, strlen(kWristHlsl), "prompttext", nullptr, nullptr, "PSPromptText", "ps_5_0", 0, 0,
+                                        &blob, &err);
+        if (SUCCEEDED(hr) && blob) { hr = g_device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &g_psText); }
+        // [PROBE: PROMPTQ] gate=inworld_prompts (ovr2xr.txt, read at launch)  site=HEADSET  log-only=no
+        LOG("[PROMPTQ] text shader PSPromptText %s (logged unconditionally) | hr 0x%08lX %s", SUCCEEDED(hr) && g_psText ? "READY" :
+            "*** FAILED - the prompt falls back to the plain copy ***", static_cast<unsigned long>(hr),
+            err ? static_cast<const char*>(err->GetBufferPointer()) : "");
+        if (blob) { blob->Release(); }
+        if (err) { err->Release(); }
+        if (FAILED(hr) || !g_psText) { return 5; }
+    }
+    if (!g_textCb) {
+        D3D11_BUFFER_DESC bd = {};
+        bd.ByteWidth = 16; bd.Usage = D3D11_USAGE_DEFAULT; bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        if (FAILED(g_device->CreateBuffer(&bd, nullptr, &g_textCb))) { return 5; }
+    }
+    ID3D11RenderTargetView* rtv = WristRtv(dst, dd);
+    if (!rtv) { return 5; }
+    hudlayer::t_busy = true;   // as CopyPiece: our bind must not reach the bracket detector
+    // trace 20261124_0030: up to 4 on the float live texture (1.0 = the 8-bit look); 8-bit (the view hook missing) keeps 0..1
+    const float fmax = dd.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 4.0f : 1.0f;
+    const float f = fade < 0.0f ? 0.0f : fade > fmax ? fmax : fade;
+    const float k[4] = { static_cast<float>(box[0] - dx * step), static_cast<float>(box[1] - dy * step), f, static_cast<float>(step) };
+    // trace 20261123_2330: scaled DOWN from daylight - factor = clamp(kExpRef / E, 0, 1), kExpRef = the brightest E measured (IP10):
+    // the live texture never exceeds the slider's value (no 8-bit clip), and the whole measured range (0.045 .. 0.63) is covered
+    const float e[4] = { kExpRef, 0.0f, 1.0f, (g_expHave && g_expSrv) ? 1.0f : 0.0f };
+    g_context->UpdateSubresource(g_wristCb, 0, nullptr, k, 0, 0);
+    g_context->UpdateSubresource(g_textCb, 0, nullptr, e, 0, 0);
+    ID3D11Buffer* saved[2] = {};
+    g_context->PSGetConstantBuffers(0, 2, saved);
+    ID3D11Buffer* mine[2] = { g_wristCb, g_textCb };
+    g_context->PSSetConstantBuffers(0, 2, mine);
+    ID3D11ShaderResourceView* sv[2] = { g_pieceSrv[::dlvr::wristleaf::kPrompt], g_expSrv };
+    hudlayer::FullScreen(g_context, &rtv, 1, static_cast<FLOAT>(dx), static_cast<FLOAT>(dy), static_cast<FLOAT>(w), static_cast<FLOAT>(h),
+                         g_psText, hudlayer::g_blendOff, sv, g_expSrv ? 2u : 1u);
+    g_context->PSSetConstantBuffers(0, 2, saved);
+    for (ID3D11Buffer* b : saved) { if (b) { b->Release(); } }
+    hudlayer::t_busy = false;
+    return 0;
+}
+
+// Each submit (render thread, outside the bracket): the routed prompt widget's box, scaled by an integer step and centred, into the live
+// texture (cleared first). < 0 = not asked / no texture; else CopyPiece's rc (0 drawn). Then the plate (trace 20261123_1830).
+// trace 20261124_0130: both prompt textures to 0 (the text adds nothing, the plate darkens nothing)
+void ClearPromptTextures(ID3D11Texture2D* live)
+{
+    const float z[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    if (live) {
+        D3D11_TEXTURE2D_DESC dd = {};
+        live->GetDesc(&dd);
+        if (ID3D11RenderTargetView* rtv = WristRtv(live, dd)) { g_context->ClearRenderTargetView(rtv, z); }
+    }
+    if (g_plateRtv && g_plateRtvTex == g_plateTex) { g_context->ClearRenderTargetView(g_plateRtv, z); }
+}
+
+int PromptCopy(float fade, float plate)
+{
+    if (!g_on || !g_promptOn) { return -1; }
+    ExposureLogTick();   // trace 20261123_2200, log-only
+    if (!(fade >= 0.0f)) { fade = 0.0f; }   // ui_prompt_brightness (trace 20261123_1700); NaN / garbage -> 0, > 1 clamped by CopyPiece
+    ID3D11Texture2D* live = g_liveTex;
+    if (!live) { return -2; }
+    // CLEAR ON HIDE (A) + HOLD (B), trace 20261124_0130 (Jay: "trace and build A + B"): render thread only
+    static bool s_wasOn = false, s_dirty = false;
+    static int s_hold = 0, s_prevW = 0, s_prevH = 0;
+    static LONG s_holdLines = 0;
+    static long s_holds = 0, s_clears = 0, s_starts = 0, s_resizes = 0;
+    static ULONGLONG s_holdLogMs = 0;
+    {
+        const ULONGLONG t = GetTickCount64();
+        if (t - s_holdLogMs >= 5000) {
+            if (s_holdLogMs && (s_holds || s_clears)) {
+                // [PROBE: PROMPTQ] gate=inworld_prompts (ovr2xr.txt, read at launch)  site=HEADSET  log-only=yes
+                LOG("[PROMPTQ] PROMPT HOLD 5 s - submits held blank %ld (starts %ld, size changes %ld), clears on hide %ld", s_holds,
+                    s_starts, s_resizes, s_clears);
+            }
+            s_holdLogMs = t;
+            s_holds = s_clears = s_starts = s_resizes = 0;
+        }
+    }
+    if (!(g_hdr.routeMask & (1 << ::dlvr::wristleaf::kPrompt))) {   // the layer is not showing the quad: nothing routed
+        if (s_dirty) { ClearPromptTextures(live); s_dirty = false; ++s_clears; }   // (A) the next prompt starts empty
+        s_wasOn = false;
+        return -3;
+    }
+    if (!s_wasOn) {
+        s_wasOn = true; s_hold = 2; ++s_starts;
+        if (++s_holdLines <= 10) {
+            // [PROBE: PROMPTQ] gate=inworld_prompts (ovr2xr.txt, read at launch)  site=HEADSET  log-only=yes
+            LOG("[PROMPTQ] HOLD %ld (first 10) - a prompt START: 2 submits blank before the first copy", s_holdLines);
+        }
+    }
+    int box[4] = {};
+    float ui[2] = {};
+    int rc = PieceInfo(::dlvr::wristleaf::kPrompt, box, ui);
+    if (rc == 0 && s_prevW > 0 && (abs(box[2] - s_prevW) > 1 || abs(box[3] - s_prevH) > 1)) {   // (B) the box reflowed
+        if (++s_holdLines <= 10) {
+            // [PROBE: PROMPTQ] gate=inworld_prompts (ovr2xr.txt, read at launch)  site=HEADSET  log-only=yes
+            LOG("[PROMPTQ] HOLD %ld (first 10) - the copied box changed %d x %d -> %d x %d layer px: 2 submits blank", s_holdLines, s_prevW,
+                s_prevH, box[2], box[3]);
+        }
+        s_hold = 2; ++s_resizes;
+        s_prevW = box[2]; s_prevH = box[3];
+    }
+    if (s_hold > 0) {
+        --s_hold; ++s_holds;
+        if (s_dirty) { ClearPromptTextures(live); s_dirty = false; }
+        return -4;
+    }
+    if (rc == 0) {
+        s_dirty = true;   // a copy is about to be made (A clears it at the next hide / hold)
+        s_prevW = box[2]; s_prevH = box[3];
+        const int W = static_cast<int>(kLiveW), H = static_cast<int>(kLiveH);
+        int step = (box[2] + W - 1) / W;
+        const int sh = (box[3] + H - 1) / H;
+        if (sh > step) { step = sh; }
+        if (step < 1) { step = 1; }
+        int w = box[2] / step, h = box[3] / step;
+        if (w > W) { w = W; }
+        if (h > H) { h = H; }
+        if (w < 1 || h < 1) { rc = 3; }
+        else {
+            D3D11_TEXTURE2D_DESC dd = {};
+            live->GetDesc(&dd);
+            ID3D11RenderTargetView* rtv = WristRtv(live, dd);
+            if (rtv) { const float z[4] = { 0.0f, 0.0f, 0.0f, 0.0f }; g_context->ClearRenderTargetView(rtv, z); }
+            // trace 20261123_2200: the exposure-compensated text copy; a refused shader / object falls back to the plain copy
+            rc = TextCopy(live, (W - w) / 2, (H - h) / 2, w, h, step, box, fade);
+            if (rc == 5) { rc = CopyPiece(live, ::dlvr::wristleaf::kPrompt, (W - w) / 2, (H - h) / 2, w, h, fade, step); }
+            if (rc == 0 && InterlockedIncrement(&g_liveCopyOk) == 1) {
+                // [PROBE: PROMPTQ] gate=inworld_prompts (ovr2xr.txt, read at launch)  site=HEADSET  log-only=no
+                LOG("[PROMPTQ] FIRST PROMPT COPY (logged unconditionally) - the routed widget's box (%d,%d) %dx%d layer px (%.0f x %.0f UI "
+                    "px), step %d -> %dx%d at (%d,%d) in the %ux%u live texture %p", box[0], box[1], box[2], box[3],
+                    static_cast<double>(ui[0]), static_cast<double>(ui[1]), step, w, h, (W - w) / 2, (H - h) / 2, kLiveW, kLiveH,
+                    static_cast<void*>(live));
+            }
+            if (rc == 0) {   // THE PLATE (trace 20261123_1830): only after the text copy drew, from the same box / step / position
+                const int prc = PlateCopy((W - w) / 2, (H - h) / 2, w, h, step, box, plate);
+                if (prc == 0 && InterlockedIncrement(&g_plateCopyOk) == 1) {
+                    // [PROBE: PROMPTQ] gate=inworld_prompts (ovr2xr.txt, read at launch)  site=HEADSET  log-only=no
+                    LOG("[PROMPTQ] FIRST PLATE COPY (logged unconditionally) - %dx%d at (%d,%d) step %d into the plate texture %p, plate %.3f "
+                        "-> texel = alpha x %.5f (cap 1/12 = %.5f)", w, h, (W - w) / 2, (H - h) / 2, step, static_cast<void*>(g_plateTex),
+                        static_cast<double>(plate), static_cast<double>(plate) / 12.0, 1.0 / 12.0);
+                }
+                if (prc != 0 && prc > -8 && prc < 8 && ++g_plateCopyFault[prc < 0 ? -prc : prc] == 1) {
+                    // [PROBE: PROMPTQ] gate=inworld_prompts (ovr2xr.txt, read at launch)  site=HEADSET  log-only=no
+                    LOG("[PROMPTQ] PLATE COPY rc %d (first of each rc) - -2 no plate texture (the rpack's plate not created), 3 bad "
+                        "destination, 4 busy, 5 a D3D object / the shader refused - the text shows without its plate", prc);
+                }
+            }
+        }
+    }
+    if (rc > 0 && rc < 8 && ++g_liveCopyFault[rc] == 1) {
+        // [PROBE: PROMPTQ] gate=inworld_prompts (ovr2xr.txt, read at launch)  site=HEADSET  log-only=no
+        LOG("[PROMPTQ] PROMPT COPY rc %d (first of each rc) - 1 not shown this pass / stale, 2 router off, 3 bad box / destination, 4 busy, "
+            "5 a D3D object refused", rc);
+    }
+    return rc;
+}
+
 void OnPassClose(ID3D11DeviceContext* ctx, int slot, int buf)
 {
     g_slot = -1;
@@ -9680,6 +10413,24 @@ void OnPassClose(ID3D11DeviceContext* ctx, int slot, int buf)
     // BLINK COUNT: fold this eye-0 pass's per-piece routed draws into the window (before the capture's early returns)
     if (slot == 0 && g_leavesOk) {
         ++w_passes;
+        // THE PROMPT's FLICKER COUNTERS (trace 20261123_1700, log-only): this eye-0 pass, the prompt shown by the game - classed before
+        // the blink fold below overwrites the pass before's count.
+        constexpr int kPr = ::dlvr::wristleaf::kPrompt;
+        if (g_promptOn && (g_hdr.shownMask & (1 << kPr))) {
+            const long r = g_passPiece[kPr], before = g_prevPiece[kPr];
+            // SWAP COUNTERS (trace 20261123_2200, log-only): the prompt's box changed size (> 2 UI px) since the last shown pass; B / C
+            // split by whether they fall within 3 passes after such a change ("after a change") or not ("steady")
+            static float s_bw = 0.0f, s_bh = 0.0f;
+            static int s_since = 1000;
+            const float bw = g_hdr.pieceBox[kPr][2] - g_hdr.pieceBox[kPr][0], bh = g_hdr.pieceBox[kPr][3] - g_hdr.pieceBox[kPr][1];
+            if (fabsf(bw - s_bw) > 2.0f || fabsf(bh - s_bh) > 2.0f) { ++c_pBoxChange; s_since = 0; } else if (s_since < 1000) { ++s_since; }
+            s_bw = bw; s_bh = bh;
+            const bool afterChange = s_since <= 3;
+            if (!(g_hdr.routeMask & (1 << kPr))) { ++c_pA; }
+            else if (r == 0) { ++c_pB; ++c_pBCsplit[afterChange ? 0 : 1]; }
+            else if (before > 0 && r * 4 < before * 3) { ++c_pC; ++c_pBCsplit[afterChange ? 0 : 1]; }
+            else { ++c_pD; }
+        }
         for (int p = 0; p < kP; ++p) {
             if (!(g_hdr.shownMask & (1 << p))) { g_prevPiece[p] = -1; continue; }
             const long r = g_passPiece[p];
@@ -10148,7 +10899,8 @@ void Latch(ID3D11DeviceContext* ctx, int eye)
     // shared guard, as AfwPushVpToLayer / AfwDepthCopy: no write since the previous latch = this pass wrote none = not its camera.
     static vpstorelogic::ConsumerSeen s_seen;
     g_eyeVpOk[s] = g_cbSnap && InterlockedCompareExchange(&g_cbSnapValid, 1, 1) == 1 && vpstorelogic::ConsumerFresh(g_snapGuard, s_seen);
-    if (g_eyeVpOk[s]) { realjit::Strip(g_cbSnapData, g_eyeVp[s]); } else { ++c_latchNoCam[eye]; }
+    // jitter ONLY: the picture and RoomToWorld's declared FOV both carry the frustum's off-centre (trace 20261124_1500)
+    if (g_eyeVpOk[s]) { realjit::StripJitter(g_cbSnapData, g_eyeVp[s]); } else { ++c_latchNoCam[eye]; }
     if (!m) { ++c_latchNoRows[eye]; g_eyeMask[s] = 0; return; }
     for (int r = 0; r < 3; ++r) { ctx->CopySubresourceRegion(g_eyeRows[s], 0, 0, static_cast<UINT>(r), 0, g_rowTex[r], 0, nullptr); }
     g_eyeMask[s] = m;
@@ -10173,19 +10925,27 @@ int NewestCamera(float* vp16, int* eye)
     return 1;
 }
 
-// The camera the eye is SHOWN with, under AFW after a rebuild: the fresh matrix moved sep along view-right (AfwRebuildRun's own
-// target, dlssflat.cpp AfwRebuildRun: row 0's w changes by -s*d*a).
-bool MovedCamera(const float* mF, int heldIsRight, float sep, float* out)
+// The camera the eye is SHOWN with, under AFW after a rebuild: AfwRebuildRun's own target (afwtarget_logic.h HeldTarget, trace
+// 20261124_1700) - the fresh camera moved sep along view-right with the HELD eye's own frustum, read off mH (its own latch). mH null or
+// the same centred frustum: the old matrix exactly (the fresh one, row 0's w by -s*d*a).
+bool MovedCamera(const float* mF, const float* mH, int heldIsRight, float sep, float* out)
 {
     memcpy(out, mF, sizeof(float) * 16);
-    const double RT[9] = { mF[0], mF[1], mF[2], mF[4], mF[5], mF[6], mF[12], mF[13], mF[14] };
-    const double wl = sqrt(RT[6] * RT[6] + RT[7] * RT[7] + RT[8] * RT[8]);
-    if (!(wl > 1e-9)) { return false; }
-    const double cx = (RT[0] * RT[6] + RT[1] * RT[7] + RT[2] * RT[8]) / wl;
-    const double ax[3] = { RT[0] - cx * RT[6] / wl, RT[1] - cx * RT[7] / wl, RT[2] - cx * RT[8] / wl };
-    const double a = sqrt(ax[0] * ax[0] + ax[1] * ax[1] + ax[2] * ax[2]);
-    const double sgn = heldIsRight ? 1.0 : -1.0;
-    out[3] = static_cast<float>(mF[3] - sgn * static_cast<double>(sep) * a);
+    double RT[9], tT[3];
+    bool general = false;
+    if (!::dlvr::afwtarget::HeldTarget(mF, mH, heldIsRight, static_cast<double>(sep), RT, tT, &general)) { return false; }
+    if (!general) {
+        out[3] = static_cast<float>(tT[0]);
+        return true;
+    }
+    for (int i = 0; i < 3; ++i) {
+        out[i] = static_cast<float>(RT[i]);
+        out[4 + i] = static_cast<float>(RT[3 + i]);
+        out[12 + i] = static_cast<float>(RT[6 + i]);
+    }
+    out[3] = static_cast<float>(tT[0]);
+    out[7] = static_cast<float>(tT[1]);
+    out[15] = static_cast<float>(tT[2]);
     return true;
 }
 
@@ -10264,7 +11024,11 @@ int DrawPieces(ID3D11Texture2D* tex, const int* va, const int* vb, int flags, fl
         float vpm[16];
         bool camOk = g_eyeVpOk[src];
         if (camOk) {
-            if (afw && rebuilt && e == held) { camOk = MovedCamera(g_eyeVp[src], held == 1 ? 1 : 0, sep, vpm); }
+            if (afw && rebuilt && e == held) {
+                // the held eye's own frustum: its previous render's latch (by ORDER, as `prev` above); not usable = the fresh one
+                const float* own = (g_latchN >= 2 && g_eyeVpOk[prev]) ? g_eyeVp[prev] : nullptr;
+                camOk = MovedCamera(g_eyeVp[src], own, held == 1 ? 1 : 0, sep, vpm);
+            }
             else { memcpy(vpm, g_eyeVp[src], sizeof(vpm)); }
         }
         const D3D11_VIEWPORT vp = { static_cast<FLOAT>(v[e][0]), static_cast<FLOAT>(v[e][1]), static_cast<FLOAT>(v[e][2]),
@@ -10471,15 +11235,19 @@ inline int Match(UINT count, UINT start, INT base)
 DLVR_HLSL_DECL(kHmHlsl) R"(
 cbuffer E2 : register(b2) { float4 vp[7]; };
 cbuffer E4 : register(b4) { float4 pal[1536]; };
-cbuffer H6 : register(b6) { float4 hv[4]; float4 js; };   // js.x 1 = real engine jitter is on
-// The surface point NOW, in the fresh camera WITHOUT its jitter (realjit::Strip's math). vp is the engine's bound matrix and carries
+cbuffer H6 : register(b6) { float4 hv[4]; float4 js; float4 jo; };   // js.x 1 = real engine jitter is on; jo = eyes' off-centre (NDC)
+// The surface point NOW, in the fresh camera WITHOUT its jitter (realjit::StripJitter's math). vp is the engine's bound matrix and carries
 // the fresh image's jitter; the held colour is a DLSS output with none, so a raw point shakes everything the map moves (run BG11).
+// OFF-CENTRE (trace 20261124_1700): only the jitter goes - the frustum's own off-centre (jo.xy eye 0, jo.zw eye 1, the nearer one) stays,
+// as hv keeps the held image's. Symmetric frustum: jo = 0, the old arithmetic.
 float3 freshA(float4 A) {
   float3 r = float3(dot(A, vp[0]), dot(A, vp[1]), dot(A, vp[3]));
   float ww = dot(vp[3].xyz, vp[3].xyz);
   if (js.x > 0.5 && ww >= 1e-12) {
-    r.x -= dot(vp[0].xyz, vp[3].xyz) / ww * r.z;
-    r.y -= dot(vp[1].xyz, vp[3].xyz) / ww * r.z;
+    float ox = dot(vp[0].xyz, vp[3].xyz) / ww, oy = dot(vp[1].xyz, vp[3].xyz) / ww;
+    float2 k = abs(ox - jo.x) + abs(oy - jo.y) <= abs(ox - jo.z) + abs(oy - jo.w) ? jo.xy : jo.zw;
+    r.x -= (ox - k.x) * r.z;
+    r.y -= (oy - k.y) * r.z;
   }
   return r;
 }
@@ -10572,15 +11340,17 @@ constexpr int kRwInst = 4, kRwW = kMax * kRwInst;              // every mask ran
 static_assert(kMax == kRwWords * 64, "g_rwMask is kRwWords 64-bit words, one bit per mask range");
 DLVR_HLSL_DECL(kRwHlsl) R"(
 cbuffer E2 : register(b2) { float4 vp[7]; };
-cbuffer H6 : register(b6) { float4 hv[4]; float4 js; };   // js.x 1 = real engine jitter is on
+cbuffer H6 : register(b6) { float4 hv[4]; float4 js; float4 jo; };   // js.x 1 = real engine jitter is on; jo = eyes' off-centre (NDC)
 cbuffer H7 : register(b7) { float4 cl; };   // x = this draw's first column (range x 4), y = 1 / row width, z 1 = a vehicle range
-// The surface point NOW, in the fresh camera WITHOUT its jitter: kHmHlsl's freshA, same math.
+// The surface point NOW, in the fresh camera WITHOUT its jitter: kHmHlsl's freshA, same math (the off-centre kept, trace 20261124_1700).
 float3 freshA(float4 A) {
   float3 r = float3(dot(A, vp[0]), dot(A, vp[1]), dot(A, vp[3]));
   float ww = dot(vp[3].xyz, vp[3].xyz);
   if (js.x > 0.5 && ww >= 1e-12) {
-    r.x -= dot(vp[0].xyz, vp[3].xyz) / ww * r.z;
-    r.y -= dot(vp[1].xyz, vp[3].xyz) / ww * r.z;
+    float ox = dot(vp[0].xyz, vp[3].xyz) / ww, oy = dot(vp[1].xyz, vp[3].xyz) / ww;
+    float2 k = abs(ox - jo.x) + abs(oy - jo.y) <= abs(ox - jo.z) + abs(oy - jo.w) ? jo.xy : jo.zw;
+    r.x -= (ox - k.x) * r.z;
+    r.y -= (oy - k.y) * r.z;
   }
   return r;
 }
@@ -11024,7 +11794,7 @@ bool HmEnsure()
         }
         if (SUCCEEDED(hr)) {
             D3D11_BUFFER_DESC bd = {};
-            bd.ByteWidth = 80; bd.Usage = D3D11_USAGE_DYNAMIC; bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;   // hv[4] + js
+            bd.ByteWidth = 96; bd.Usage = D3D11_USAGE_DYNAMIC; bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;   // hv[4] + js + jo
             bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
             hr = g_device->CreateBuffer(&bd, nullptr, &g_hmCb);
         }
@@ -11212,6 +11982,16 @@ void HmDraw(ID3D11DeviceContext* ctx, int slot, int idx, UINT count, UINT start,
             memcpy(m.pData, afwdepth::g_vp[hs], 64);
             const float js[4] = { realjit::g_on ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f };   // freshA strips only when Strip does
             memcpy(static_cast<char*>(m.pData) + 64, js, sizeof(js));
+            // jo: each eye's frustum off-centre in NDC, kept by freshA (trace 20261124_1700). Not known yet / symmetric: 0 = the old strip.
+            float jo[4] = {};
+            for (int e = 0; e < 2; ++e) {
+                double ocx = 0.0, ocy = 0.0;
+                if (g_renderW && g_renderH && realjit::EyeOffCentre(e, &ocx, &ocy)) {   // px as the matrix read carries them
+                    jo[2 * e] = static_cast<float>(ocx / (0.5 * static_cast<double>(g_renderW)));
+                    jo[2 * e + 1] = static_cast<float>(ocy / (0.5 * static_cast<double>(g_renderH)));
+                }
+            }
+            memcpy(static_cast<char*>(m.pData) + 80, jo, sizeof(jo));
             ctx->Unmap(g_hmCb, 0);
             g_hmCbSerial = afwdepth::g_serial[hs];
         }
@@ -11851,7 +12631,9 @@ void AfwDepthCopy(ID3D11DeviceContext* ctx, int eye)
     }
     // [LOADBEARING: JITTRUE-AFWSTRIP] with jitter_engine.txt the slot's matrix is stored WITHOUT the engine's jitter: the AFW
     //      rebuild and the held-pose map carry DLSS OUTPUTS, which have none (INV-440 addendum). A plain copy otherwise.
-    if (g_vpOk[slot]) { realjit::Strip(g_cbSnapData, g_vp[slot]); }
+    //      JITTER ONLY since 2026-11-24 (trace 20261124_1700): the depth image was rendered with the frustum's off-centre, so the matrix
+    //      that unprojects it keeps it (Strip removed it too = every point on a wrong ray at symmetric_fov 0). Symmetric: == Strip exactly.
+    if (g_vpOk[slot]) { realjit::StripJitter(g_cbSnapData, g_vp[slot]); }
     g_serial[slot] = g_afwTonemapN;
     // [AFWMOT]: this image's motion buffer, beside its depth. Switched off -> the copy is released (no stale serial).
     if (want & 4) {
@@ -11931,6 +12713,7 @@ cbuffer C : register(b0) {
                           // move carried more than z target texels is not drawn as held world (it is the hand's old edge colour);
                           // y 1 = the fill takes the NEAREST covered seed per side and extends the farther side, never one whose
                           // nearest seed is the body / weapon (afw_rb_fill_near); z the ring's "moved" threshold in target texels
+  float4 gFi0, gFi1, gFi2; // target -> fresh view (the inverse of gF; staleAt). Same frustum: identity rows, w = -gF.w (trace 20261124_1700)
 };
 Texture2D<float>  depH  : register(t0);
 Texture2D<float>  depF  : register(t1);
@@ -12099,12 +12882,14 @@ float4 nearSeed(Texture2D<float4> sd, int2 sp) {
   }
   return best;
 }
-// THE STALE TEST: the held point at target t, target depth zt, carried as static into the FRESH view. The fresh carry
-// is the identity plus an offset (the target is the fresh camera shifted along view-right), so undoing the offset is
-// the whole projection. true = the fresh eye sees PAST the point over a 5x3 depth-texel neighbourhood (reversed-Z: the
+// THE STALE TEST: the held point at target t, target depth zt, carried as static into the FRESH view by gFi (the inverse of the
+// fresh carry). With one frustum for both eyes that is the identity minus an offset (the target is the fresh camera shifted along
+// view-right) and gFi holds exactly that; off-centre the target is the HELD eye's frustum and gFi is the full inverse (trace
+// 20261124_1700). true = the fresh eye sees PAST the point over a 5x3 depth-texel neighbourhood (reversed-Z: the
 // nearest depth is the LARGEST raw value), i.e. the point is no longer there.
 bool staleAt(float2 t, float zt, bool heldFg) {
-  float3 c = float3((t.x * 2.0 - 1.0) * zt, (1.0 - t.y * 2.0) * zt, zt) - float3(gF0.w, gF1.w, gF2.w);
+  float3 tc = float3((t.x * 2.0 - 1.0) * zt, (1.0 - t.y * 2.0) * zt, zt);
+  float3 c = float3(dot(gFi0.xyz, tc) + gFi0.w, dot(gFi1.xyz, tc) + gFi1.w, dot(gFi2.xyz, tc) + gFi2.w);
   if (c.z <= 1e-4) { return false; }
   float2 uf = uvOf(c);
   if (uf.x < 0.0 || uf.y < 0.0 || uf.x > 1.0 || uf.y > 1.0) { return false; }
@@ -12455,8 +13240,11 @@ VOut PSVerify(FOut i) {
 DLVR_HLSL_USE(kHlsl)
 
 struct Cb { float gH[3][4]; float gF[3][4]; float prm[4]; float dsz[4]; float tsz[4]; float rcH[4]; float rcF[4]; float misc[4];
-            float rul[4]; float sw[4]; float gX[3][4]; float mot[4]; float rul2[4]; float rul3[4]; };
-static_assert(sizeof(Cb) == 320, "afwrb::Cb must match the HLSL cbuffer (20 float4)");
+            float rul[4]; float sw[4]; float gX[3][4]; float mot[4]; float rul2[4]; float rul3[4];
+            float gFi[3][4]; };   // trace 20261124_1700: target -> fresh (staleAt), set by uploadCb from gF
+static_assert(sizeof(Cb) == 368, "afwrb::Cb must match the HLSL cbuffer (23 float4)");
+long g_targetGeneral = 0;     // rebuilds whose held and fresh frustums differ (afwtarget HeldTarget general) - trace 20261124_1700
+bool g_saidGeneral = false;
 // The moving-object rules' numbers. kFarLimit: at 250 m the 64 mm eye separation (INV-386) is under a quarter of a pixel
 // at our projection, so no depth difference beyond it can matter to either comparison. kStaleAbs: the guide's 0.01 unit
 // margin, NOT measured on ours - see [AFWRB] RULES.
@@ -13316,16 +14104,23 @@ int AfwRebuildRun(ID3D11Texture2D* T, const int hv[4], const int fv[4], int held
     const float* mH = afwdepth::g_vp[nh];
     const double nrF = mF[11], nrH = mH[11];
     if (!(nrF > 1e-6) || !(nrH > 1e-6)) { return 6; }
-    // the target: the fresh matrix with the camera moved s*d along view-right -> row 0's w changes by -s*d*a.
-    double RT[9] = { mF[0], mF[1], mF[2], mF[4], mF[5], mF[6], mF[12], mF[13], mF[14] };
-    double tT[3] = { mF[3], mF[7], mF[15] };
-    const double wl = sqrt(RT[6] * RT[6] + RT[7] * RT[7] + RT[8] * RT[8]);
-    if (!(wl > 1e-9)) { return 6; }
-    const double cx = (RT[0] * RT[6] + RT[1] * RT[7] + RT[2] * RT[8]) / wl;
-    const double ax[3] = { RT[0] - cx * RT[6] / wl, RT[1] - cx * RT[7] / wl, RT[2] - cx * RT[8] / wl };
-    const double a = sqrt(ax[0] * ax[0] + ax[1] * ax[1] + ax[2] * ax[2]);
-    const double sgn = heldIsRight ? 1.0 : -1.0;
-    tT[0] -= sgn * static_cast<double>(eyeSep) * a;
+    // the target: the fresh camera moved s*d along view-right, with the HELD eye's own frustum (afwtarget_logic.h HeldTarget; trace
+    // 20261124_1700). Both frustums centred and equal (symmetric_fov 2): the old target exactly - the fresh matrix, row 0's w by -s*d*a.
+    double RT[9], tT[3];
+    bool general = false;
+    if (!::dlvr::afwtarget::HeldTarget(mF, mH, heldIsRight, static_cast<double>(eyeSep), RT, tT, &general)) { return 6; }
+    // the fresh matrix's |row 3| and horizontal scale, for the check's angle test and the FIRST REBUILD line (as before)
+    ::dlvr::afwtarget::Split sF{};
+    const bool sFok = ::dlvr::afwtarget::SplitRows(mF, &sF);
+    const double wl = sF.wl, a = sFok ? sF.a : 0.0;
+    if (general) { ++g_targetGeneral; }
+    if (general && !g_saidGeneral) {
+        g_saidGeneral = true;
+        // [PROBE: AFWRB] gate=afw_rebuild + afw_alt_eye (the first rebuild whose two frustums differ, once per session)  site=HEADSET  log-only=no
+        LOG("[AFWRB] OFF-CENTRE TARGET FIRST (logged once): the held and fresh eyes' frustums differ - the held eye is drawn with its OWN "
+            "frustum at the fresh camera (held is %s; target row 0 xyz %.5f %.5f %.5f w %.5f, row 1 w %.5f; fresh row 0 w %.5f)",
+            heldIsRight ? "right" : "left", RT[0], RT[1], RT[2], tT[0], tT[1], static_cast<double>(mF[3]));
+    }
     Cb cb = {};
     if (!Carry(mH, RT, tT, cb.gH) || !Carry(mF, RT, tT, cb.gF)) { return 6; }
     if (!EnsureOnce() || !EnsureTargets(T, td, static_cast<UINT>(hv[2]), static_cast<UINT>(hv[3])) || !EnsureDepthViews()) {
@@ -13399,6 +14194,8 @@ int AfwRebuildRun(ID3D11Texture2D* T, const int hv[4], const int fv[4], int held
     cb.mot[3] = hmMain ? 1.0f : 0.0f;
     auto uploadCb = [&](Cb& c, float isFresh) -> bool {
         c.misc[2] = isFresh;
+        // staleAt's target -> fresh carry (trace 20261124_1700): one frustum = the old identity-minus-offset; else the full inverse
+        if (!general || !::dlvr::afwtarget::InvertCarry(c.gF, c.gFi)) { ::dlvr::afwtarget::IdentityMinusOffset(c.gF, c.gFi); }
         D3D11_MAPPED_SUBRESOURCE m = {};
         if (FAILED(ctx->Map(g_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) { return false; }
         memcpy(m.pData, &c, sizeof(c));
@@ -15618,8 +16415,8 @@ bool TryUpscaleSubstitute(ID3D11DeviceContext* ctx, UINT StartSlot, UINT NumView
         if (gt) { GpuTimerBegin(ctx, kPassMv, eye); }
         // [LOADBEARING: JITTRUE-MVSTRIP] with jitter_engine.txt each matrix loses its own jitter before the camera term.
         float jtCur[16], jtPrev[16];
-        realjit::Strip(g_vpCur[eye], jtCur);
-        realjit::Strip(g_vpPrev[eye], jtPrev);
+        realjit::StripJitter(g_vpCur[eye], jtCur);    // jitter only - the off-centre stays (trace 20261124_1420)
+        realjit::StripJitter(g_vpPrev[eye], jtPrev);
         ID3D11Texture2D* fixed = RunMvFix(ctx, g_depthTex, g_mvTex, md.Width, md.Height, jtCur, jtPrev);
         if (gt) { GpuTimerEnd(ctx, kPassMv, eye); }
         if (fixed) {
@@ -18021,6 +18818,9 @@ void InstallOnAcquiredDevice()
     if (uimtx::g_on && !g_uiProbe) { InstallDrawHooks(); }
     // WRIST HUD (ui_wrist_hud at launch; was dlvr\wrist_route.txt): routes the HUD pass's draws. InstallDrawHooks is once-guarded (g_origDraw).
     if (wristroute::g_on && !g_uiProbe) { InstallDrawHooks(); }
+    // THE IN-WORLD PROMPT (trace 20261123_1535): our live texture created writable - only with inworld_prompts on at launch (one bool
+    // test otherwise), before the layer's LoadPack can run.
+    wristroute::InstallPromptTextureHook(g_device);
     if (g_mvFix) {
         void** vt = *reinterpret_cast<void***>(g_context);
         PatchVtableSlot(vt, kVSSetConstantBuffersSlot, &HookedVSSetConstantBuffers,
@@ -18254,6 +19054,14 @@ extern "C" __declspec(dllexport) int DlvrAfwRebuild(void* eyeTex, const int* hel
     return AfwRebuildRun(reinterpret_cast<ID3D11Texture2D*>(eyeTex), heldVp, freshVp, heldIsRight, eyeSep, flags);
 }
 
+// 1 = this bootstrap rebuilds an OFF-CENTRE eye (the held eye's own frustum target, the depth matrix with its off-centre, the stale test's
+// inverse carry, the held-pose map's jitter-only strip - trace 20261124_1700). The layer's [AFWNET] holds AFW off on an off-centre frustum
+// unless this export exists (an older bootstrap cannot).
+extern "C" __declspec(dllexport) int DlvrAfwOffCentreOk()
+{
+    return 1;
+}
+
 // AFW HUD LAYER v4: called by the layer at every submit under afw_alt_eye, after DlvrAfwRebuild - lays each eye's last HUD
 // pass on its viewport (hudlayer::Submit) and is the handshake that lets the HUD passes redirect. 6 = bootstrap off / bad args.
 extern "C" __declspec(dllexport) int DlvrHudLayerSubmit(void* eyeTex, const int* vpA, const int* vpB)
@@ -18261,6 +19069,23 @@ extern "C" __declspec(dllexport) int DlvrHudLayerSubmit(void* eyeTex, const int*
     if (!::dlvr::dlssflat::Enabled || !eyeTex || !vpA || !vpB) { return 6; }
     CheckGbufferSlotOnce();   // the eye-texture route's one-time slot check; two loads per call otherwise
     return hudlayer::Submit(reinterpret_cast<ID3D11Texture2D*>(eyeTex), vpA, vpB);
+}
+// THE IN-WORLD PROMPT (trace 20261123_1535): the routed prompt widget into our quad's live texture. Called by the layer once per submit
+// (render thread, outside the HUD bracket - the wrist / HUD panel copies' moment), whatever owns the HUD pass (NOT through
+// DlvrHudLayerSubmit: the layer skips that while the HUD panel is active, ovr2xr.cpp AfwAltEye && !uipanel::Active()). Returns
+// PromptCopy's rc; -6 = the bootstrap is off.
+extern "C" __declspec(dllexport) int DlvrPromptCopy(float fade, float plate)
+{
+    if (!::dlvr::dlssflat::Enabled) { return -6; }
+    // [LOADBEARING: inworld_prompts] the prompt's per-submit copy (fade = the layer's ui_prompt_brightness, trace 20261123_1700; plate =
+    //      ui_prompt_plate, trace 20261123_1830)
+    return wristroute::PromptCopy(fade, plate);
+}
+// THE IN-WORLD PROMPT (trace 20261123_1535): 1 = our pack's live texture was created writable (the layer asks for the prompt to be routed
+// only then). Any thread.
+extern "C" __declspec(dllexport) int DlvrPromptLiveReady()
+{
+    return (::dlvr::dlssflat::Enabled && wristroute::PromptLiveReady()) ? 1 : 0;
 }
 
 // MENU PANEL (the layer's ui_panel_menus, SPEC-UI-MENU-PANEL-2026-10-11): see hudlayer::PanelInfo / PanelCopy / PanelEnd.

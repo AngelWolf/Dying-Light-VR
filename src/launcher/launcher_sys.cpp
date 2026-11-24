@@ -159,9 +159,7 @@ setup::DetectedState Detect(const fs::path& game, int* unreadable)
         const fs::path rel = fs::relative(it->path(), game, e2);
         if (e2) { ++*unreadable; continue; }
         std::string r = setup::detail::Lower(W2U(rel.generic_wstring()));
-        const bool want = r.find('/') == std::string::npos || r.compare(0, 5, "dlvr/") == 0 ||
-                          (r.compare(0, 3, "dw/") == 0 && r.find('/', 3) == std::string::npos) ||
-                          (r.compare(0, 9, "dw_dlc24/") == 0 && r.find('/', 9) == std::string::npos);
+        const bool want = detail::ScanWants(r);   // launcher_plan.h
         if (it->is_directory(e2)) {
             if (!want && it.depth() > 0) { it.disable_recursion_pending(); }
             continue;

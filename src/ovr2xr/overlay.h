@@ -44,9 +44,10 @@ extern bool g_showReticle;
 
 // Builds and renders one frame of UI, then fills `out` with a quad layer to
 // append to the frame's layer list. Returns false if there is nothing to
-// submit. `viewSpace` makes the panel head-locked. `appSpace` is used instead,
-// world-locked, for the aim reticle (see its own comment) when the panel
-// itself is closed.
+// submit. The panel is held in the room (`appSpace`, placed at open in front of
+// the head's level facing - trace 20261124_1855); `viewSpace` only until that
+// anchor latches. `appSpace` is also used, world-locked, for the aim reticle
+// (see its own comment) when the panel itself is closed.
 bool OverlayRender(XrSpace viewSpace, XrSpace appSpace, XrTime displayTime,
                    XrCompositionLayerQuad* out);
 
@@ -95,10 +96,11 @@ bool OverlayRenderHolsterSphere(XrSpace appSpace, XrCompositionLayerQuad* out);
 // ring (never with the panel open). Returns the quads written. Render / submit thread.
 int OverlayRenderHolsterRings(XrSpace appSpace, XrCompositionLayerQuad* out, int maxOut);
 
-// The mod menu's title (dlvr\menu\title.png) on its own head-locked quad ABOVE the panel's top-left corner, at the panel's pixel
+// The mod menu's title (dlvr\menu\title.png) on its own quad ABOVE the panel's top-left corner, at the panel's pixel
 // scale (Jay 2026-11-11). Only while the panel is drawn and title.png loaded. No ImGui frame (own ImDrawList, as the sphere), so
 // its order against OverlayRender does not matter. False = nothing to submit. COST menu closed: two bool tests.
-bool OverlayRenderTitle(XrSpace viewSpace, XrCompositionLayerQuad* out);
+// Held in the room with the panel (appSpace, the menu anchor - trace 20261124_1855); viewSpace until the anchor latches.
+bool OverlayRenderTitle(XrSpace viewSpace, XrSpace appSpace, XrTime time, XrCompositionLayerQuad* out);
 
 // Draws the same frame again into the desktop mirror texture, so the panel is
 // visible to a screenshot. The quad layer never reaches the flat window.

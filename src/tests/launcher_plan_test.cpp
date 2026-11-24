@@ -95,6 +95,26 @@ int main()
         CHECK(a.empty());
         CHECK(refusal.find("Data3") != std::string::npos && refusal.find("erify") != std::string::npos);
     }
+    {   // an OLDER release's Data3 left on disk (1.0 - 1.065), no mod, no stock copy -> refused too (trace 20261124_2110)
+        DetectedState s;
+        InstallInputs in = Fresh(r, s);
+        in.diskMd5 = {{"dw/data3.pak", "394248e75c65b83ad2f26151a9b3566a"}};
+        std::string refusal;
+        const auto a = PlanLauncherInstall(in, &refusal);
+        CHECK(a.empty());
+        CHECK(refusal.find("Data3") != std::string::npos && refusal.find("erify") != std::string::npos);
+    }
+    {   // any OTHER Data3 (the game's own) -> not refused, saved as stock
+        DetectedState s;
+        InstallInputs in = Fresh(r, s);
+        in.diskMd5 = {{"dw/data3.pak", kOther}};
+        std::string refusal;
+        const auto a = PlanLauncherInstall(in, &refusal);
+        CHECK(refusal.empty());
+        bool saved = false;
+        for (const auto& x : a) { saved = saved || (x.kind == LAct::SaveStock && x.relPath == "DW/Data3.pak"); }
+        CHECK(saved);
+    }
     {   // an UPDATE (launcher record present): our older files are NOT saved as stock
         DetectedState s;
         s.modPresent = true;
@@ -141,6 +161,24 @@ int main()
         // ...and the game paths hold the STOCK files then: none of them is deleted
         CHECK(IndexOf(f, LAct::Delete, "DW/Data3.pak") < 0 && IndexOf(f, LAct::Delete, "LibOVRRT64_1.dll") < 0);
         CHECK(IndexOf(f, LAct::Delete, "dlvr_ovr2xr.log") >= 0 && f.back().relPath == "dlvr/");
+    }
+    {   // the scan keeps every folder a release puts a file in (trace 20261124_2135: 1.07's DW\Data files were left by uninstall / flat)
+        for (const char* p : {"libovrrt64_1.dll", "dlvr/calib/title.png", "dw/data3.pak", "dw_dlc24/datadlc24_2.pak", "dw/data/common_textures_3_pc.rpack",
+                              "dw/data/optimized_dlc29_dx11.mp", "dw/data/dlvr_prompts_pc.rpack", "dw", "dw/data"}) {
+            CHECK(detail::ScanWants(p));
+        }
+        for (const char* p : {"dw/data/sub/file.bin", "dw_dlc24/data/file.bin", "dw_dlc17/datadlc17_2.pak", "other/file.txt", "dw/menu/file.bin"}) {
+            CHECK(!detail::ScanWants(p));
+        }
+        // Remove with a DW/Data release file: ours goes, the game's own neighbour is never named
+        Release r2 = r;
+        r2.files.push_back({kOurs, "DW/Data/dlvr_prompts_PC.rpack", false});
+        DetectedState s;
+        s.modPresent = true;
+        s.present = {"libovrrt64_1.dll", "dw/data/dlvr_prompts_pc.rpack", "dw/data/menu_common_pc.rpack"};
+        const auto a = PlanLauncherRemove(s, r2, {}, false);
+        CHECK(IndexOf(a, LAct::Delete, "DW/Data/dlvr_prompts_PC.rpack") >= 0);
+        for (const auto& x : a) { CHECK(x.relPath.find("menu_common") == std::string::npos); }
     }
     std::printf("launcher_plan_test: %d failure(s)\n", g_fail);
     return g_fail;

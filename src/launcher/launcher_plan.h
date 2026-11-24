@@ -66,6 +66,25 @@ inline LAction FromSetup(const setup::Action& a)
     return {LAct::Delete, a.relPath, "", "", "", false};
 }
 
+// The Data3.pak of every public release: this build's, then each OLDER one (add the old pin here whenever kFixedData3Md5 moves).
+// For the fresh-install refusal only - the bootstrap's own verdict stays exactly this build's (fixed_data3_md5.h).
+inline bool IsModData3(const std::string& md5)
+{
+    return md5 == kFixedData3Md5 || md5 == "394248e75c65b83ad2f26151a9b3566a";   // 1.0 - 1.065
+}
+
+// Which game-folder paths the scan (launcher_sys.cpp Detect) keeps - lower-case, forward slashes. EVERY folder a release puts a file in must be
+// here: Remove, switch to flat and Update's keep-previous only act on what the scan saw (1.07 is the first with DW\Data files).
+inline bool ScanWants(const std::string& r)
+{
+    const auto directlyIn = [&r](const char* dir) {
+        const std::string d = dir;
+        return r.compare(0, d.size(), d) == 0 && r.find('/', d.size()) == std::string::npos;
+    };
+    return r.find('/') == std::string::npos || r.compare(0, 5, "dlvr/") == 0 || directlyIn("dw/") || directlyIn("dw/data/") ||
+           directlyIn("dw_dlc24/");
+}
+
 }  // namespace detail
 
 // Empty + *refusal set = nothing may be done (the reason is for the user, naming what to do).
@@ -86,7 +105,7 @@ inline std::vector<LAction> PlanLauncherInstall(const InstallInputs& in, std::st
             const auto it = in.diskMd5.find(detail::LowerPath(f.relPath));
             if (it == in.diskMd5.end()) { continue; }
             // checked BEFORE the same-as-ours skip: the release's Data3 IS kFixedData3Md5, so "ours" here means not stock
-            if (detail::LowerPath(f.relPath) == "dw/data3.pak" && it->second == kFixedData3Md5) {
+            if (detail::LowerPath(f.relPath) == "dw/data3.pak" && detail::IsModData3(it->second)) {
                 *refusal = "DW\\Data3.pak in the game folder is the mod's, not the game's own. Verify the game files in your "
                            "store, then install again.";
                 return {};

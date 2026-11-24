@@ -6,7 +6,7 @@
 // No Windows, no logging, so src/src/tests/data3_md5_test.cpp compiles it on its own.
 #pragma once
 
-static const char* const kFixedData3Md5 = "394248e75c65b83ad2f26151a9b3566a";   // 2026-10-31 (6) inventory_special.scr + Melee_VRShove (the light open-hand shove, RESEARCH-ENEMY-GRAB 10r); was 9b5a4c7f
+static const char* const kFixedData3Md5 = "935318518b7a3d0624ca4ffb84df18be";   // 2026-11-24 (208) + per-eye reflection history (render_loop.ppfx; trace 20261124_2050); was 60556476 = 2026-11-22 (74) + data/panel/boxed_light_15.fm (U+E075 = the grip glyph; trace 20261122_1740); the GG1 test remap b4c70b1b dropped; was 394248e7 (2026-10-31 (6) Melee_VRShove)
 
 // DlvrData3State() values. 0 = not checked yet.
 static const int kData3Ours       = 1;

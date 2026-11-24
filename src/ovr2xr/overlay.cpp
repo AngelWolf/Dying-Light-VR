@@ -1769,6 +1769,8 @@ Tab TabForSetting(const Setting& st)
     // moved to it's own new HUD/UI Tab"): every ui_ key, BEFORE the group test - they all sit in the "VR Comfort" group (which is what
     // keeps their text in BETA lean), and that group would otherwise claim them.
     if (KeyHasPrefix(st.key, "ui_")) { return Tab::Hud; }
+    // the in-world prompt's switch keeps its key (on disk; the bootstrap reads it by name) - filed with ui_prompt_* (trace 20261123_1730)
+    if (strcmp(st.key, "inworld_prompts") == 0) { return Tab::Hud; }
     // Groups that already own a dedicated tab keep it.
     if (strcmp(st.group, kControllerBindingsGroup) == 0) { return Tab::Bindings; }
     if (strcmp(st.group, kAimGroup) == 0)                { return Tab::Aim; }
@@ -2526,8 +2528,8 @@ void DrawWristHud()
 
     int cur = (UiWristPreset < 0 || UiWristPreset > 2) ? 2 : UiWristPreset;
     if (RowCombo("Layout", "##ui_wrist_preset", &cur, kPresetItems, 3,
-                 "A: minimap and quest list on the back of the right hand, health on the back of the left, the weapon boxes above "
-                 "the palms. B: health and minimap on the left wrist, both weapon boxes on the right wrist, no quest list. Custom: "
+                 "A: minimap on the left hand; health, quest list and quick item on the left forearm; weapon on the right "
+                 "forearm. B: health and minimap on the left wrist, both weapon boxes on the right wrist, no quest list. Custom: "
                  "your own placement.")) {
         if (cur == 2) {
             UiWristPreset = 2;
@@ -2658,9 +2660,17 @@ void DrawHudTab()
     // DROPDOWNS (Jay 2026-11-14: "make the main options in the HUD/UI tab as dropdowns, the menu is rather lengthy"; trace
     // docs/traces/20261114_1210_hud_tab_dropdowns.md): each of the three sections is a MenuSection, closed by default (as Hand
     // Steadiness); a section with no rows is not drawn. SaveSettingsIfChanged runs every frame either way.
+    // NOT OFFERED (trace docs/traces/20261124_2015_hud_panel_menu_hidden.md; Jay 2026-11-24: "we don't really want the "HUD on face" as
+    // an option anymore" -> "Hide only"): these rows are never drawn here, but they are NOT locked - the file value is still read at
+    // load (U-68: ui_hud_panel=0 by hand is the Linux SteamVR workaround). tools/settings_schema.py reads this list (launcher: hidden).
+    static const char* const kMenuHiddenKeys[] = { "ui_hud_panel" };
+    const auto menuHidden = [](const Setting& st) {
+        for (const char* k : kMenuHiddenKeys) { if (strcmp(st.key, k) == 0) { return true; } }
+        return false;
+    };
     const auto rows = [&](const char* heading, const char* sid, auto pick) {
         const auto take = [&](const Setting& st) {
-            return !st.locked && TabForSetting(st) == Tab::Hud && !KeyHasPrefix(st.key, "ui_wrist_") && pick(st);
+            return !st.locked && !menuHidden(st) && TabForSetting(st) == Tab::Hud && !KeyHasPrefix(st.key, "ui_wrist_") && pick(st);
         };
         bool any = false;
         for (int i = 0; i < count && !any; ++i) { any = take(all[i]); }
@@ -2671,7 +2681,10 @@ void DrawHudTab()
         ImGui::TreePop();
     };
     rows("Menu panel", "hudtab_menu", [](const Setting& st) { return KeyHasPrefix(st.key, "ui_panel_"); });
-    rows("HUD panel", "hudtab_hud", [](const Setting& st) { return !KeyHasPrefix(st.key, "ui_panel_"); });
+    // the in-world prompt's three (trace 20261123_1730) get their own section; HUD panel excludes them so none is drawn twice
+    const auto isPrompt = [](const Setting& st) { return KeyHasPrefix(st.key, "ui_prompt_") || strcmp(st.key, "inworld_prompts") == 0; };
+    rows("HUD panel", "hudtab_hud", [&](const Setting& st) { return !KeyHasPrefix(st.key, "ui_panel_") && !isPrompt(st); });
+    rows("Prompts in the world", "hudtab_prompts", [&](const Setting& st) { return isPrompt(st); });
     if (MenuSection("Wrist HUD", "hudtab_wrist", true)) {
         DrawWristHud();
         ImGui::TreePop();
@@ -2689,7 +2702,7 @@ void DrawButtonRow()
     ImGui::BeginDisabled(!UiHudPanel);
     if (MenuButton("Re-centre HUD###recentre", sz,
                    UiHudPanel ? "Puts the HUD panel back in front of you."
-                              : "Puts the HUD panel back in front of you. Needs 'HUD on a fixed panel' on (HUD tab).")) {
+                              : "Puts the HUD panel back in front of you. The HUD panel is off in the settings file (ui_hud_panel=0).")) {
         ::dlvr::uipanel::HudRecentre();
     }
     ImGui::EndDisabled();
@@ -4627,6 +4640,73 @@ void DrawMenuTitle(void* drawList, float w, float h, const void* user)
     ImDrawList* dl = static_cast<ImDrawList*>(drawList);
     ArtDraw(dl, t, ImVec2(0.0f, 0.0f), ImVec2((std::min)(static_cast<float>(t->w), w), (std::min)(static_cast<float>(t->h), h)));
 }
+
+// THE MENU HELD IN THE WORLD (Jay 2026-11-24: "I'd like the mod menu to be held in world" -> "Level, build it"; trace
+// docs/traces/20261124_1855_menu_world_lock.md). At open the head is located once in the app space (the room); the panel is placed
+// overlay_distance ahead of the head's LEVEL facing, at head height, turned about +y only to face it, and stays there while open.
+// Cleared on close (OverlayRender), so every open places it again; a new app space (recenter) re-latches - the calibration panel's
+// pattern (calibscreen.cpp). Not located yet -> the old head-locked pose that frame, retried every submit, said once per open.
+// COST: one xrLocateSpace per submit until latched (the first frame of an open), then a few multiplies; closed = one bool test.
+struct MenuAnchor {
+    bool set = false;
+    bool missSaid = false;
+    XrSpace space = XR_NULL_HANDLE;
+    XrVector3f head{};
+    float fx = 0.0f, fz = -1.0f;   // the level facing (unit, horizontal)
+};
+MenuAnchor g_menuAnchor;
+
+void MenuAnchorClear()
+{
+    g_menuAnchor.set = false;
+    g_menuAnchor.missSaid = false;
+    g_menuAnchor.space = XR_NULL_HANDLE;
+}
+
+// The world pose of a point at (ox, oy) on the panel's plane (panel centre = 0, 0), facing the head; false = not anchored (use
+// viewSpace). Latches on the first call of an open (the title runs first in a frame, the panel second - both see one anchor).
+bool MenuWorldPose(XrSpace viewSpace, XrSpace appSpace, XrTime time, float ox, float oy, XrPosef* pose)
+{
+    if (appSpace == XR_NULL_HANDLE || viewSpace == XR_NULL_HANDLE || !xrLocateSpace_) { return false; }
+    if (!g_menuAnchor.set || g_menuAnchor.space != appSpace) {
+        XrSpaceLocation loc{ XR_TYPE_SPACE_LOCATION };
+        const XrSpaceLocationFlags need = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+        if (!XR_SUCCEEDED(xrLocateSpace_(viewSpace, appSpace, time, &loc)) || (loc.locationFlags & need) != need) {
+            if (!g_menuAnchor.missSaid) {
+                g_menuAnchor.missSaid = true;
+                // [PROBE: MENUANCHOR] gate=none (every mod-menu open)  site=HEADSET  log-only=yes
+                LOG("overlay: [MENUANCHOR] head NOT located this frame - the menu is HEAD-LOCKED until it is (retried every submit)");
+            }
+            return false;
+        }
+        const XrQuaternionf& q = loc.pose.orientation;
+        // forward = q * (0, 0, -1); keep its horizontal part. Straight up / down (no horizontal part) -> tracking forward.
+        float fx = -2.0f * (q.x * q.z + q.w * q.y);
+        float fz = -(1.0f - 2.0f * (q.x * q.x + q.y * q.y));
+        const float len = std::sqrt(fx * fx + fz * fz);
+        if (len > 1e-3f) { fx /= len; fz /= len; } else { fx = 0.0f; fz = -1.0f; }
+        const bool relatch = g_menuAnchor.set;
+        g_menuAnchor.set = true;
+        g_menuAnchor.space = appSpace;
+        g_menuAnchor.head = loc.pose.position;
+        g_menuAnchor.fx = fx;
+        g_menuAnchor.fz = fz;
+        // [PROBE: MENUANCHOR] gate=none (every mod-menu open)  site=HEADSET  log-only=yes
+        LOG("overlay: [MENUANCHOR] menu %s in the room: head (%+.3f, %+.3f, %+.3f) m, level facing (%+.3f, %+.3f) = %+.1f deg off "
+            "tracking forward, panel centre %.2f m ahead at head height", relatch ? "RE-PLACED (the app space changed - recenter)" :
+            "PLACED", g_menuAnchor.head.x, g_menuAnchor.head.y, g_menuAnchor.head.z, fx, fz,
+            static_cast<double>(std::atan2(-fx, -fz) * 57.29578f), static_cast<double>(OverlayDistance()));
+    }
+    // The panel faces the head: its +z (towards the viewer) = -facing, i.e. a rotation about +y by th = atan2(-fx, -fz).
+    const float th = std::atan2(-g_menuAnchor.fx, -g_menuAnchor.fz);
+    const float c = std::cos(th), s = std::sin(th);
+    const float d = OverlayDistance();
+    // panel centre + R_y(th) * (ox, oy, 0) = (ox c, oy, -ox s)
+    pose->position = { g_menuAnchor.head.x + g_menuAnchor.fx * d + ox * c, g_menuAnchor.head.y + oy,
+                       g_menuAnchor.head.z + g_menuAnchor.fz * d - ox * s };
+    pose->orientation = { 0.0f, std::sin(th * 0.5f), 0.0f, std::cos(th * 0.5f) };
+    return true;
+}
 }  // namespace
 
 // THE MENU TITLE, OUTSIDE THE PANEL (Jay 2026-11-11: "For the title though, I'd like it to sit above the menu, top left side, out
@@ -4635,7 +4715,7 @@ void DrawMenuTitle(void* drawList, float w, float h, const void* user)
 // Only while the panel is drawn (not while a holster placement hides it). Drawn into its own ImDrawList with no ImGui frame - the
 // same path as the holster sphere, safe in the panel's submit (RenderCalibQuadInto's ownList comment). No title.png = no quad
 // (the panel shows the text title instead). COST: menu closed = two bool tests; open = one tiny draw-list fill + one quad.
-bool OverlayRenderTitle(XrSpace viewSpace, XrCompositionLayerQuad* out)
+bool OverlayRenderTitle(XrSpace viewSpace, XrSpace appSpace, XrTime time, XrCompositionLayerQuad* out)
 {
     if (!g.initialised || !g.visible || AnyPlacing() || !out || viewSpace == XR_NULL_HANDLE) { return false; }
     const MenuArt* t = ArtOf(kArtTitle);
@@ -4644,11 +4724,19 @@ bool OverlayRenderTitle(XrSpace viewSpace, XrCompositionLayerQuad* out)
     const int tw = (std::min)(t->w, kPanelW), th = (std::min)(t->h, kPanelH);
     const float mpp = OverlayWidth() / static_cast<float>(kPanelW);   // metres per panel pixel
     const float panelH = OverlayWidth() * static_cast<float>(kMenuH) / static_cast<float>(kPanelW);   // the menu quad's height
+    const float ox = -OverlayWidth() * 0.5f + tw * mpp * 0.5f;              // the title's centre on the panel's plane
+    const float oy = panelH * 0.5f + (kTitleGapPx + th * 0.5f) * mpp;
     XrPosef pose{};
     pose.orientation = { 0.0f, 0.0f, 0.0f, 1.0f };
-    pose.position = { -OverlayWidth() * 0.5f + tw * mpp * 0.5f, panelH * 0.5f + (kTitleGapPx + th * 0.5f) * mpp, -OverlayDistance() };
+    pose.position = { ox, oy, -OverlayDistance() };
+    XrSpace space = viewSpace;                                             // head-locked until the menu anchor latches
+    XrPosef world{};
+    if (MenuWorldPose(viewSpace, appSpace, time, ox, oy, &world)) {        // held in the room with the panel
+        space = appSpace;
+        pose = world;
+    }
     if (!g.titleList) { g.titleList = IM_NEW(ImDrawList)(ImGui::GetDrawListSharedData()); }
-    if (!RenderCalibQuadInto(g.swapchain9, g.images9, g.rtvs9, g.titleTried, "menu title", viewSpace, pose, OverlayWidth(), false,
+    if (!RenderCalibQuadInto(g.swapchain9, g.images9, g.rtvs9, g.titleTried, "menu title", space, pose, OverlayWidth(), false,
                              DrawMenuTitle, t, out, g.titleList, "the menu title is not shown above the panel")) {
         return false;
     }
@@ -4782,6 +4870,7 @@ bool OverlayRender(XrSpace viewSpace, XrSpace appSpace, XrTime displayTime,
         return false;
     }
     if (!g.visible) {
+        if (g_menuAnchor.set || g_menuAnchor.missSaid) { MenuAnchorClear(); }   // the next open places the menu again
         // The 2 s L3 + R3 hold to OPEN: its bar replaces the reticle for those 2 s (one swapchain, one quad).
         if (g.holdProgress > 0.0f) {
             return RenderHoldBar(viewSpace, out);
@@ -4837,7 +4926,7 @@ bool OverlayRender(XrSpace viewSpace, XrSpace appSpace, XrTime displayTime,
 
     *out = XrCompositionLayerQuad{ XR_TYPE_COMPOSITION_LAYER_QUAD };
     out->layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-    out->space = viewSpace;   // head-locked: it is reachable wherever you are
+    out->space = viewSpace;   // head-locked only until the menu anchor latches (the first frame of an open) - then held in the room
     out->eyeVisibility = XR_EYE_VISIBILITY_BOTH;
     out->subImage.swapchain = g.swapchain;
     out->subImage.imageArrayIndex = 0;
@@ -4845,8 +4934,12 @@ bool OverlayRender(XrSpace viewSpace, XrSpace appSpace, XrTime displayTime,
     out->subImage.imageRect.extent = { kPanelW, kMenuH };
     out->pose.orientation = { 0.0f, 0.0f, 0.0f, 1.0f };
     out->pose.position = { 0.0f, 0.0f, -OverlayDistance() };
+    XrPosef world{};
+    if (MenuWorldPose(viewSpace, appSpace, displayTime, 0.0f, 0.0f, &world)) {   // Jay 2026-11-24: "Level, build it"
+        out->space = appSpace;
+        out->pose = world;
+    }
     out->size = { width, height };
-    (void)displayTime;
     return true;
 }
 

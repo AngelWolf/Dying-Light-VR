@@ -57,8 +57,8 @@ static void both_eyes_identical()
     CHECK(Differ(e0, e1));
 }
 
-// Meta's PC runtime (Quest Link): any symmetrising acts as 0; every other runtime keeps the setting (Jay 2026-11-16: "A").
-// Names as logged: "Oculus 1.208.0" (the runtimeName field is "Oculus"), "VirtualDesktopXR", "SteamVR/OpenXR".
+// Meta's PC runtime (Quest Link) is named: its views are submitted as its own FOV's window (fovcrop_logic.h, 2026-11-24; until then
+// symmetric_fov was forced to 0 there). Names as logged: "Oculus 1.208.0" (runtimeName "Oculus"), "VirtualDesktopXR", "SteamVR/OpenXR".
 static void meta_runtime_uses_its_own_fov()
 {
     CHECK(RuntimeStretchesToOwnFov("Oculus"));
@@ -67,12 +67,6 @@ static void meta_runtime_uses_its_own_fov()
     CHECK(!RuntimeStretchesToOwnFov("Ocul"));
     CHECK(!RuntimeStretchesToOwnFov(""));
     CHECK(!RuntimeStretchesToOwnFov(nullptr));
-    CHECK(EffectiveSymmetric(2, true) == 0);
-    CHECK(EffectiveSymmetric(1, true) == 0);
-    CHECK(EffectiveSymmetric(0, true) == 0);
-    CHECK(EffectiveSymmetric(2, false) == 2);
-    CHECK(EffectiveSymmetric(1, false) == 1);
-    CHECK(EffectiveSymmetric(0, false) == 0);
 }
 
 int main()

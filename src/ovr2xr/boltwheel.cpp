@@ -19,6 +19,8 @@
 //       0x1110BC0 -> 0x1110050, exact) in the BETA tree; any build whose 16 bytes differ is refused by name. Who else reads 288 through
 //       the lookup (awh1 (b)): of 108 instructions putting 0x120 in an argument register or comparing with it, none is in a function
 //       that calls the lookup or its three wrappers (+782E60 / +9FAB90 / +BA0F20) - a data-driven id is not excluded (as for 310).
+//       2026-11-22 (71) (INV-765, trace 20261122_1620): also action 20 for the local player's target while loot by hand's search
+//       want is fresh (TriggerController::Update's hold test) - and the detour installs while loot_by_hand is on, wheels or not.
 //   (2) each wheel's MAIN vtable (found by RTTI name, object-locator offset 0 - never by rva) slot 178 -> UpdateHook, accepted only if
 //       the slot's target starts with +575C70's 24 bytes. UpdateHook tells the wheels apart by the object's own vtable pointer, runs
 //       that wheel's original FIRST (its full argument list is not proven - nothing of ours may run before it), then, if the want is
@@ -49,6 +51,8 @@
 #include "boltwheel_logic.h"
 #include "boneblend.h"    // InstallSingleGameDetour - the shared verify / suspend / commit path; BowManualDraw
 #include "bownock.h"      // BowManualNock - the arrow wheel's master
+#include "looting.h"      // LootByHand - loot by hand's search hold also installs the lookup detour (trace 20261122_1620)
+#include "looting_logic.h"   // looting::kSearchTapS (the READY line)
 #include "pushgrab.h"     // EnemyPushGrab - the grapple prompt's gate (the native grabs replace the Grapple skill)
 #include "reload.h"       // ManualReload - the bolt wheel's master
 #include "rtti_vtable.h"  // RttiFindVtable
@@ -117,15 +121,37 @@ uintptr_t g_detourAt = 0;
 int g_detourAttempts = 0;
 volatile LONG g_unknownObj = 0;
 
+// Loot by hand's search hold (trace 20261122_1620): written by the pad thread (InputLookupSetTriggerHold), read by LookupHook.
+volatile LONG    g_trigWant = 0;
+volatile LONG64  g_trigWantMs = 0;
+volatile LONG64  g_trigTarget = 0;
+volatile LONG    g_trigFirst = 0;       // the first forced read (one line)
+volatile LONG    g_trigSaid = 0;        // the loot install line (one, READY or REFUSED)
+
 bool WantFreshNow(const Wheel& w)
 {
     return boltwheel::WantFresh(w.want != 0, static_cast<unsigned long long>(w.wantMs), GetTickCount64());
 }
 
-// COST per call (every input value read of the game, many a frame): two int compares on the common path; for id 310 / 288 only, two
-// volatile loads and a GetTickCount64.
+// COST per call (every input value read of the game, many a frame): three int compares on the common path; for id 310 / 288 only, two
+// volatile loads and a GetTickCount64; for id 20 (loot by hand's search hold) three volatile loads, a GetTickCount64 and a compare.
 __m128 __fastcall LookupHook(void* im, int id, void* target)
 {
+    // [LOADBEARING: loot search hold] (loot_by_hand) the body / container search advances while this reads action 20 held for the
+    //      local player - LootPadByte sends only a 0.15 s X tap to start it, so Survivor Sense (X held 0.5 s) never fires (INV-765).
+    if (id == boltwheel::kTriggerHoldAction) {
+        const bool fresh = boltwheel::WantFresh(g_trigWant != 0, static_cast<unsigned long long>(g_trigWantMs), GetTickCount64());
+        if (boltwheel::TriggerHoldLookup(id, fresh, reinterpret_cast<unsigned long long>(target),
+                                         static_cast<unsigned long long>(g_trigTarget))) {
+            if (InterlockedCompareExchange(&g_trigFirst, 1, 0) == 0) {
+                // [PROBE: LOOTHAND] gate=loot_by_hand  site=HEADSET  log-only=yes
+                LOG("boltwheel: [LOOTHAND] FIRST FORCED READ of action 20 = 1.0 for target %p (thread %lu) - a hand is searching; "
+                    "the search is held by the input lookup, X is only its start tap.", target, GetCurrentThreadId());
+            }
+            return _mm_set_ss(1.0f);
+        }
+        return g_lookupTrue(im, id, target);
+    }
     if (id == boltwheel::kShowAction || id == boltwheel::kArrowShowAction) {
         const int k = id == boltwheel::kShowAction ? kBolts : kArrows;
         Wheel& w = g_w[k];
@@ -620,11 +646,25 @@ void BoltWheelInstall()
                 "nothing patched for the arrow wheel.", BowManualNock ? 1 : 0, BowManualDraw ? 1 : 0);
         }
     }
-    if (!any) { return; }
+    // Loot by hand's search hold (trace 20261122_1620) needs the lookup detour too, with no wheel gate.
+    const bool lootWants = LootByHand;
+    if (!any && !lootWants) { return; }
     const uintptr_t gd = reinterpret_cast<uintptr_t>(GetModuleHandleA("gamedll_x64_rwdi.dll"));
     if (!gd) { return; }   // not mapped yet - the 1 Hz caller retries
     // (1) the lookup detour FIRST.
     const bool live = DetourLive(gd);
+    if (lootWants && InterlockedCompareExchange(&g_trigSaid, 1, 0) == 0) {
+        if (live) {
+            // [PROBE: LOOTHAND] gate=loot_by_hand  site=FLAT  log-only=yes
+            LOG("boltwheel: [LOOTHAND] SEARCH HOLD READY - the input lookup detour is in at gamedll +%zX (%d attempt(s)); a hand's "
+                "search is held as action 20 for the local player, X is only a %.2f s start tap (Survivor Sense never sees a hold).",
+                static_cast<size_t>(g_detourAt - gd), g_detourAttempts, looting::kSearchTapS);
+        } else {
+            // [PROBE: LOOTHAND] gate=loot_by_hand  site=FLAT  log-only=yes
+            LOG("boltwheel: [LOOTHAND] SEARCH HOLD REFUSED - %s. Loot by hand holds X for the whole search as before (Survivor Sense "
+                "can fire during it).", g_detourWhy);
+        }
+    }
     for (int k = 0; k < 2; ++k) {
         if (g_w[k].state != 0 || !gate[k]) { continue; }
         if (!live) { Refuse(k, g_detourWhy); continue; }
@@ -651,6 +691,16 @@ void ArrowWheelSetWant(bool want)
 bool ArrowWheelLive() { return g_w[kArrows].state == 1; }
 
 bool ArrowWheelXBlocked() { return g_w[kArrows].xBlock != 0; }
+
+void InputLookupSetTriggerHold(bool want, unsigned long long target)
+{
+    // stamp and target first, then the want (LookupHook reads the want first) - a want is never seen with an older target
+    InterlockedExchange64(&g_trigTarget, static_cast<LONG64>(target));
+    InterlockedExchange64(&g_trigWantMs, static_cast<LONG64>(GetTickCount64()));
+    InterlockedExchange(&g_trigWant, want ? 1 : 0);
+}
+
+bool InputLookupTriggerHoldLive() { return g_detour == 1; }
 
 long ArrowWheelOpensSent() { return static_cast<long>(g_w[kArrows].opens); }
 

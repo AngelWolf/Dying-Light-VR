@@ -21007,6 +21007,8 @@ bool ReadBranchState(uintptr_t owner, bool& eye, bool& flag4, bool& vehicle)
 // rates +4488 (integrator) / +4480 (smoother) so nothing glides back.
 // [LOADBEARING: LOOK-PITCH-ANCHOR] with look_pitch_anchor>0 this is the ONLY thing that removes a rope-imposed
 //      look pitch in VR - INV-272 (4)-(6): the rope snaps +4472 and the head only ever adds deltas afterwards.
+//      Since 2026-11-24 also the ONLY thing that removes the pitch LookController's own narrowed limits clamped away
+//      (climbs / ladders / slides / landings, INV-772): the same write on the update the limits return to normal.
 namespace lookpitch {
 
 using SelectFn = uintptr_t(__fastcall*)(uintptr_t player);
@@ -21046,6 +21048,17 @@ long long g_fromRope = 0, g_fromOther = 0;
 double    g_sumOff = 0.0;
 float     g_minOff = 0.0f, g_maxOff = 0.0f, g_maxLcDiff = 0.0f;
 long long g_offN = 0;
+// LIMIT RELEASE (INV-772): LookController narrows its own pitch limits in climbs / ladders / slides / landings / sprint-angle states
+// (SetSpringWantedAngles windows) and +BA1350 writes the CLAMPED pitch into +4472, so the head pitch outside the window is lost and
+// stays lost - no owner edge follows. The update the limits return to normal is a second anchor moment. Game thread only.
+bool      g_prevLimited = false;
+long      g_limitedUpdates = 0;          // consecutive limited updates before the release
+float     g_lastLimMax = 89.0f, g_lastLimMin = -70.0f;
+long      g_relaxLines = 0;
+long long g_relaxes = 0, g_limUpd = 0;   // [LOOKPITCH] window counts
+bool      g_saidLimFirst = false, g_saidLimFault = false;
+constexpr float kNormalMaxPitch = 88.5f;   // LookController's normal window is 89 / -70 (+D447F0 / +D443C0 default branch)
+constexpr float kNormalMinPitch = -69.5f;
 
 float Clamp(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
@@ -21095,6 +21108,26 @@ float ReadFloatOr(uintptr_t addr, float fallback)
     }
 }
 
+// The ACTIVE look iface's own pitch limits: vtable slot +64 (max (yaw, pitch)) and +72 (min) - the two calls +BA1350 makes on
+// the same iface in the same update before clamping (gr7 :118-123). Pure getters that fill the caller's buffer and return it.
+// 0 = ok, 2 = fault / non-finite.
+int ReadPitchLimits(uintptr_t iface, float& maxPitch, float& minPitch)
+{
+    __try {
+        const uintptr_t* vt = *reinterpret_cast<uintptr_t* const*>(iface);
+        alignas(16) unsigned char bmax[16] = {};
+        alignas(16) unsigned char bmin[16] = {};
+        const float* mx = reinterpret_cast<PairFn>(vt[64 / 8])(iface, bmax);
+        const float* mn = reinterpret_cast<PairFn>(vt[72 / 8])(iface, bmin);
+        if (!mx || !mn) { return 2; }
+        maxPitch = mx[1];
+        minPitch = mn[1];
+        return (std::isfinite(maxPitch) && std::isfinite(minPitch)) ? 0 : 2;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 2;
+    }
+}
+
 const char* KindOf(uintptr_t vtRva)
 {
     return vtRva == RopeVt() ? "RopeLocomotionController" : (vtRva == 0 ? "none" : "other");
@@ -21119,11 +21152,12 @@ void WindowTick()
     LOG("boneblend: [LOOKPITCH] window: mode %d | local updates %lld, LookController active %lld | game-look minus head "
         "pitch while Look active (before any anchor): %s | hand-backs %lld (from rope %lld, other %lld) | anchors "
         "written %lld | offset jumps > 3 deg with Look active %lld | helper inactive %lld | faults %lld | "
-        "max |head - LookController+236| %.2f deg",
+        "max |head - LookController+236| %.2f deg | limited updates %lld, limit releases %lld",
         LookPitchAnchor, g_upd, g_lookUpd, offs, g_handbacks, g_fromRope, g_fromOther, g_anchors, g_jumps,
-        g_inactive, g_faults, g_maxLcDiff);
+        g_inactive, g_faults, g_maxLcDiff, g_limUpd, g_relaxes);
     g_winStart = now;
     g_upd = g_lookUpd = g_handbacks = g_anchors = g_jumps = g_inactive = g_faults = g_fromRope = g_fromOther = 0;
+    g_limUpd = g_relaxes = 0;
     g_sumOff = 0.0;
     g_minOff = g_maxOff = g_maxLcDiff = 0.0f;
     g_offN = 0;
@@ -21154,6 +21188,8 @@ void Anchor(uintptr_t a1)
         g_fromVt = 0;
         g_notLookUpdates = 0;
         g_havePrevOffset = false;
+        g_prevLimited = false;
+        g_limitedUpdates = 0;
     }
     const bool edge = isLook && !g_prevIsLook;
     if (!isLook) {
@@ -21161,10 +21197,41 @@ void Anchor(uintptr_t a1)
         ++g_notLookUpdates;
         g_prevIsLook = false;
         g_havePrevOffset = false;
+        g_prevLimited = false;   // an owner change ends any limited state; the owner edge anchors on return
+        g_limitedUpdates = 0;
         WindowTick();
         return;
     }
     ++g_lookUpd;
+    // LIMIT RELEASE: LookController's own pitch limits this update (the window +BA1350 just clamped to).
+    float limMax = 89.0f, limMin = -70.0f;
+    const int ls = ReadPitchLimits(iface, limMax, limMin);
+    if (ls != 0 && !g_saidLimFault) {
+        g_saidLimFault = true;
+        // [PROBE: LOOKPITCH] gate=look_pitch_anchor  site=HEADSET  log-only=yes
+        LOG("boneblend: [LOOKPITCH] *** FAULT reading LookController's pitch limits (iface %p, slots +64 / +72) - the "
+            "limit-release anchor is OFF for this update and counts nothing; the owner hand-back anchor is unaffected ***",
+            reinterpret_cast<void*>(iface));
+    }
+    if (ls == 0 && !g_saidLimFirst) {
+        g_saidLimFirst = true;
+        // [PROBE: LOOKPITCH] gate=look_pitch_anchor  site=HEADSET  log-only=yes
+        LOG("boneblend: [LOOKPITCH] LIMITS FIRST READ (logged regardless of diag_look_pitch): LookController pitch max %+.1f "
+            "min %+.1f (normal 89 / -70; limited when max < %.1f or min > %.1f)",
+            limMax, limMin, kNormalMaxPitch, kNormalMinPitch);
+    }
+    const bool limitedNow = ls == 0 && (limMax < kNormalMaxPitch || limMin > kNormalMinPitch);
+    const bool relax = ls == 0 && g_prevLimited && !limitedNow && !edge;
+    const long heldLimited = g_limitedUpdates;
+    if (limitedNow) {
+        ++g_limUpd;
+        ++g_limitedUpdates;
+        g_lastLimMax = limMax;
+        g_lastLimMin = limMin;
+    } else {
+        g_limitedUpdates = 0;
+    }
+    g_prevLimited = limitedNow;   // a fault reads as "not limited" - never a release on the next good read
     float head = 0.0f;
     const int hs = ReadHeadPitchDeg(head);
     float* p4472 = reinterpret_cast<float*>(a1 + 4472);
@@ -21194,10 +21261,10 @@ void Anchor(uintptr_t a1)
     if (std::isfinite(lcDiff) && lcDiff > g_maxLcDiff) { g_maxLcDiff = lcDiff; }
     if (!edge && g_havePrevOffset && fabsf(offset - g_prevOffset) > 3.0f) { ++g_jumps; }
 
-    const bool write = edge || LookPitchAnchor >= 2;
+    const bool write = edge || relax || LookPitchAnchor >= 2;
     if (write) {
         *p4472 = Clamp(head, -80.0f, 89.0f);
-        if (edge) {
+        if (edge || relax) {
             *p4464 = Clamp(head, -70.0f, 89.0f);
             *reinterpret_cast<float*>(a1 + 4488) = 0.0f;   // integrator pitch rate (+BA1350 :233)
             *reinterpret_cast<float*>(a1 + 4480) = 0.0f;   // smoother pitch rate (+BA1110 :69-73)
@@ -21229,6 +21296,17 @@ void Anchor(uintptr_t a1)
                 offset, look, head, lc236, after,
                 g_handbackLines == kMaxHandbackLines ? "  (line cap reached - further hand-backs are counted only)"
                                                      : "");
+        }
+    }
+    if (relax) {
+        ++g_relaxes;
+        if (g_relaxLines < kMaxHandbackLines) {
+            ++g_relaxLines;
+            // [PROBE: LOOKPITCH] gate=look_pitch_anchor  site=HEADSET  log-only=yes
+            LOG("boneblend: [LOOKPITCH] LIMIT RELEASE #%ld after %ld limited update(s) (last window pitch max %+.1f min %+.1f): "
+                "offset BEFORE %+.1f deg (look %+.1f, head %+.1f) -> AFTER %+.1f%s",
+                g_relaxLines, heldLimited, g_lastLimMax, g_lastLimMin, offset, look, head, after,
+                g_relaxLines == kMaxHandbackLines ? "  (line cap reached - further releases are counted only)" : "");
         }
     }
     g_prevIsLook = true;
@@ -44050,7 +44128,15 @@ void MaskTick(void* model)
     }
     CatDrain();                                   // the weapon catalogue's notes (empty queue -> one lock, nothing else)
     const ULONGLONG now = GetTickCount64();
-    if (s_was && now < s_next) { return; }
+    // THE CARRIED LOOT ITEMS (trace 20261124_1925, Jay: "LOOT BY HAND ITEMS HAVE AFW GHOSTING WHILE HELD"): lidhand's items on the
+    // hands were in no part of the mask, so the rebuild carried them as static world (the INV-680 / INV-681 shape). A change of
+    // either re-reads the table now instead of at the next 500 ms tick. COST: two volatile loads + one compare per call.
+    void* const carried[2] = { LidHandCarriedItem(0), LidHandCarriedItem(1) };
+    static void* s_carried[2] = {};
+    const bool carryChanged = carried[0] != s_carried[0] || carried[1] != s_carried[1];
+    if (s_was && now < s_next && !carryChanged) { return; }
+    s_carried[0] = carried[0];
+    s_carried[1] = carried[1];
     s_was = true;
     s_next = now + 500;
     unsigned tab[kMaskMax][3] = {};
@@ -44134,6 +44220,14 @@ void MaskTick(void* model)
             vehIn, reinterpret_cast<void*>(veh), s_vehCls[0] ? s_vehCls : "-", nVeh, vehFrom, kMaskMax,
             (vehTake && n >= kMaskMax) ? " - CAP REACHED, the vehicle's later ranges are NOT in the mask" : "");
     }
+    // The carried loot items (above), AFTER the vehicle so its ranges keep their indices: owner 0 (own[] is zeroed) - moved by their
+    // own draw rows like any rigid piece; owner 1 / 2 would send the equipped item's name to the weapon catalogue, 3 the buggy's
+    // wheel / glass rules. Read only while `live`, as the held items. Each read in MaskCollect is SafeRead*-guarded.
+    const int carryFrom = n;
+    for (int h = 0; live && h < 2; ++h) {
+        if (carried[h]) { n = MaskCollect(carried[h], tab, n, kMaskMax); }
+    }
+    const int nCarry = n - carryFrom;
     // ZEROED: the change test below memcmp's the WHOLE arrays, so the bytes after each terminator must be equal too. Left
     // uninitialised (build e2fb4cfa) they differed on every tick - the names line printed 329 times in one run and the mask
     // generation (which the weapon's saved rows are keyed to, g_rwGen) was bumped every 500 ms.
@@ -44174,11 +44268,13 @@ void MaskTick(void* model)
     }
     if (changed || !s_saidFirst) {
         s_saidFirst = true;
-        LOG("boneblend: [AFWFG] MASK ranges %s: %d (body %d, right item %d, left item %d, bow arrow %d; at most %d), "
-            "generation %ld | player model %p, items R %p L %p, arrow model (BowVis+1480) R %p L %p. afw_rb_fg_mask=1",
-            changed ? "CHANGED" : "FIRST (logged unconditionally)", n, nBody, nRight, nLeft, nArrow, kMaskMax, gen, model,
+        LOG("boneblend: [AFWFG] MASK ranges %s: %d (body %d, right item %d, left item %d, bow arrow %d, carried loot %d; at most %d), "
+            "generation %ld | player model %p, items R %p L %p, arrow model (BowVis+1480) R %p L %p, carried loot R %p L %p%s. "
+            "afw_rb_fg_mask=1",
+            changed ? "CHANGED" : "FIRST (logged unconditionally)", n, nBody, nRight, nLeft, nArrow, nCarry, kMaskMax, gen, model,
             reinterpret_cast<void*>(g_lastItem[0]), reinterpret_cast<void*>(g_lastItem[1]),
-            reinterpret_cast<void*>(arrow[0]), reinterpret_cast<void*>(arrow[1]));
+            reinterpret_cast<void*>(arrow[0]), reinterpret_cast<void*>(arrow[1]), carried[0], carried[1],
+            ((carried[0] || carried[1]) && n >= kMaskMax) ? " - CAP REACHED, carried loot ranges may be cut" : "");
     }
 }
 

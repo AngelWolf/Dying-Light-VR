@@ -144,6 +144,8 @@ add_library(LibOVRRT64_1 SHARED
     # Hand-open lids (docs/superpowers/plans/2026-11-18-hand-open-lids-phase2.md): lid bone from the hand, the game's own open /
     # take, items on the hand. The decision is lidhand_logic.h (tests/lidhand_logic_test.cpp).
     ${SRC_ROOT}/ovr2xr/lidhand.cpp
+    # The in-world prompt (trace docs/traces/20261123_1356_inworld_prompt_quad.md): one quad carrying the game's own prompt image.
+    ${SRC_ROOT}/ovr2xr/promptquad.cpp
     # Grab bodies by hand (docs/superpowers/plans/2026-10-23-body-grab.md): the ragdoll pull, driven from the player-update tail.
     # The decisions are bodygrab_logic.h + looting_logic.h's DRAG state (tests/bodygrab_logic_test.cpp, looting_logic_test.cpp).
     ${SRC_ROOT}/ovr2xr/bodygrab.cpp

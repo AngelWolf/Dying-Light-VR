@@ -204,8 +204,25 @@ static void PatchSiteStateReads()
     }
 }
 
+// Loot by hand's search hold (2026-11-22 (71), INV-765): only action 20, only with a fresh want, only the want's own target - never
+// a want with no target, never Survivor Sense (3 is its binds-table row, not an action id - its id is not 20) or the wheels' ids.
+static void TriggerHoldOnlyActionTwentyForItsTarget()
+{
+    static_assert(kTriggerHoldAction == 20, "ida/ctn2: table +139FB18 index 0");
+    const unsigned long long t = 0x12345678ull;
+    CHECK(TriggerHoldLookup(20, true, t, t));
+    CHECK(!TriggerHoldLookup(20, false, t, t));          // stale / no want
+    CHECK(!TriggerHoldLookup(20, true, t + 8, t));       // another player's target
+    CHECK(!TriggerHoldLookup(20, true, 0, 0));           // no target published yet
+    CHECK(!TriggerHoldLookup(310, true, t, t));          // the bolt wheel's show id
+    CHECK(!TriggerHoldLookup(288, true, t, t));          // the arrow wheel's show id
+    CHECK(!TriggerHoldLookup(126, true, t, t));          // the controller's other slots (table index 1..3)
+    CHECK(ShowLookup(20, kShowAction, true, true) == -1);   // the wheels' rule never answers for 20
+}
+
 int main()
 {
+    TriggerHoldOnlyActionTwentyForItsTarget();
     PatchTableIsConsistent();
     PatchSiteStateReads();
     XBlockDropsOnlyTheShowEvent();
