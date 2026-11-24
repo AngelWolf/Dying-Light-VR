@@ -26,6 +26,7 @@
 #include "uipanel.h"               // HudScreenSig - the router also stands down while the 3D HUD reads the HUD screen gone
 #include "uipin.h"                 // GameMenuOpen - the router stands down while an in-game menu is open
 #include "wristquad.h"             // OnThisLaunch - ui_wrist_hud at launch (STAGE 3a, replaces dlvr\wrist_route.txt)
+#include "promptquad.h"            // PromptQuadOnThisLaunch / PromptQuadRouteWanted - the in-world prompt (trace 20261123_1535)
 
 #define LOG(...) ::dlvr::LogTo("dlvr_ovr2xr.log", __VA_ARGS__)
 
@@ -88,7 +89,10 @@ VisFn   g_isVis = nullptr;
 FloatFn g_opGet = nullptr;
 uintptr_t g_gd = 0;
 bool g_probeOn = false;                   // dlvr\wrist_probe.txt (stage 0 lines)
-bool g_routeOn = false;                   // ui_wrist_hud at launch (stage 1: publish the leaves; was dlvr\wrist_route.txt)
+bool g_routeOn = false;                   // the leaves are published: ui_wrist_hud OR inworld_prompts at launch (trace 20261123_1535)
+bool g_wristOn = false;                   // ui_wrist_hud at launch: the five pieces are assigned / held / routed (was all of g_routeOn)
+bool g_promptOn = false;                  // inworld_prompts at launch: HUD_DI's "HudTrigger" = piece wristleaf::kPrompt
+const char* const kPromptWidget = "HudTrigger";   // a direct child of HUD_DI (hud.xui tree read, trace 20261123_1535)
 
 volatile LONG  g_started = 0;
 volatile LONG  g_live = 0;                // 1 once the swaps are in
@@ -349,6 +353,10 @@ wristleaf::Leaf   g_pub[wristleaf::kMaxLeaves] = {};
 wristleaf::Header g_stageHdr = {};        // built here, copied under the lock
 wristleaf::Leaf   g_stage[wristleaf::kMaxLeaves] = {};
 volatile LONG g_pubs = 0, g_pubFaults = 0, g_pubTrunc = 0, g_pubOtherRoot = 0;
+// trace 20261124_0200 (log-only): the prompt walk's elements at opacity > 0 / at 0 in the current publish; publishes where the prompt
+// had elements ONLY at 0 (the pop-up case)
+thread_local int t_promptLitLeaves = 0, t_promptDarkLeaves = 0;
+volatile LONG g_promptDarkOnly = 0;
 volatile LONG64 g_pubCostUs = 0, g_pubMaxUs = 0;
 struct VtText { uintptr_t vt; int text; };
 VtText g_vtText[128] = {};
@@ -452,7 +460,10 @@ void Walk(uintptr_t el, int piece, float above, WidgetLeaves& out, int depth)
     if (!CallIsVis(reinterpret_cast<void*>(el), vis) || !CallOpGet(reinterpret_cast<void*>(el), op)) { InterlockedIncrement(&g_pubFaults); return; }
     if (!vis) { return; }
     const float o = above * op;
-    if (!(o > 0.0f)) { return; }
+    // trace 20261124_0200 (RUN IP13, Jay: "typically on the INITIAL moment that the prompt pops up"): the PROMPT's leaves are kept at
+    // opacity 0 - G_Trigger starts at Opacity 0 (hud.xui :3584) and fades in; without its leaves the first drawn frames were unroutable
+    if (!(o > 0.0f) && piece != wristleaf::kPrompt) { return; }
+    if (piece == wristleaf::kPrompt) { if (o > 0.0f) { ++t_promptLitLeaves; } else { ++t_promptDarkLeaves; } }
     int cnt = 0;
     if (!CallCount(reinterpret_cast<void*>(el), cnt)) { InterlockedIncrement(&g_pubFaults); return; }
     if (cnt > 0) {
@@ -496,7 +507,9 @@ void Publish(uintptr_t el)
         char nm[64];
         NameOf(c, nm, sizeof(nm));
         int piece = -1;
-        for (int p = 0; p < kPieces; ++p) { if (strcmp(nm, kPiece[p]) == 0) { piece = p; break; } }
+        if (g_wristOn) { for (int p = 0; p < kPieces; ++p) { if (strcmp(nm, kPiece[p]) == 0) { piece = p; break; } } }
+        // the in-world prompt (trace 20261123_1535): the game's prompt widget, routed - never a wrist piece
+        if (piece < 0 && g_promptOn && strcmp(nm, kPromptWidget) == 0) { piece = wristleaf::kPrompt; }
         pieceOf[i] = piece;
         if (piece == wristleaf::kMinimap) {   // the widget's own rect - the minimap's box (see g_mmWidget)
             float at[2];
@@ -506,7 +519,7 @@ void Publish(uintptr_t el)
             float at[2];
             g_wpWidgetOk = BoxOf(c, at, g_wpWidget) && g_wpWidget[2] - g_wpWidget[0] >= 1.0f && g_wpWidget[3] - g_wpWidget[1] >= 1.0f;
         }
-        if (piece >= 0) {
+        if (piece >= 0 && piece < kPieces) {   // the WRIST pieces only - the prompt keeps the game's own fades
             // HOLD OPAQUE: this widget's engine object is held at the setter; a fade that went around it is set back here
             InterlockedExchange64(&g_heldObj[piece], static_cast<LONG64>(obj));
             float op = 1.0f;
@@ -517,9 +530,19 @@ void Publish(uintptr_t el)
         const bool due = piece >= 0 || !g_wl[i].read || ((i - g_rotNext + cnt) % cnt) < kRotate;
         if (!due) { continue; }
         g_wl[i].n = 0;
+        if (piece == wristleaf::kPrompt) { t_promptLitLeaves = 0; t_promptDarkLeaves = 0; }
         Walk(c, piece, 1.0f, g_wl[i], 0);
+        if (piece == wristleaf::kPrompt && t_promptDarkLeaves > 0 && t_promptLitLeaves == 0) {
+            const LONG k = InterlockedIncrement(&g_promptDarkOnly);
+            if (k <= 10) {
+                // [PROBE: WRISTROUTE] gate=inworld_prompts  site=HEADSET  log-only=yes
+                LOG("wristprobe: [WRISTROUTE] PROMPT AT OPACITY 0 %ld (first 10) - this publish found the prompt's %d elements only at "
+                    "opacity 0 (the pop-up fade-in); published anyway (trace 20261124_0200)", k, t_promptDarkLeaves);
+            }
+        }
         g_wl[i].read = true;
-        if (piece < 0) { continue; }
+        if (piece < 0 || piece == wristleaf::kPrompt) { continue; }   // the prompt: this walk's leaves every publish (no LAST GOOD - its
+                                                                      // leaf count changes with every prompt; trace 20261123_1535)
         // LAST GOOD: this walk replaces the piece's leaves only if it found the piece and is not suddenly short
         const WidgetLeaves& w = g_wl[i];
         const bool ok = w.n > 0 && (!g_goodHave[piece] || w.n * 2 >= g_good[piece].n);
@@ -562,7 +585,7 @@ void Publish(uintptr_t el)
     };
     for (int i = 0; i < cnt; ++i) {
         const int p = pieceOf[i];
-        if (p < 0) { emit(g_wl[i]); continue; }
+        if (p < 0 || p == wristleaf::kPrompt) { emit(g_wl[i]); continue; }
         if (g_goodHave[p] && !emitted[p]) { emit(g_good[p]); emitted[p] = true; }
     }
     // a piece whose widget this listing did not reach (a read fault) keeps its last good leaves, at the end of the order
@@ -589,6 +612,10 @@ void Publish(uintptr_t el)
     }
     h.count = n;
     h.takenMs = GetTickCount64();
+    // [LOADBEARING: inworld_prompts] which pieces the bootstrap may route: the five with the wrist HUD on; the prompt only while the layer's
+    //      quad is showing (so the game's widget leaves the HUD only while our quad carries it) - trace 20261123_1535
+    h.routeMask = (g_wristOn ? 0x1F : 0) | (g_promptOn && PromptQuadRouteWanted() ? (1 << wristleaf::kPrompt) : 0) |
+                  (g_promptOn && PromptQuadLive() ? (1 << wristleaf::kRouted) : 0);   // bit 6: the prompt feature live (trace 20261124_0230)
     AcquireSRWLockExclusive(&g_pubLock);
     h.gen = g_pubHdr.gen + 1;
     g_pubHdr = h;
@@ -647,7 +674,7 @@ void __fastcall OpHook(void* el, float o)
     // HOLD OPAQUE: the game asks one of the five pieces' widgets for < 1 -> it gets 1.0 (Mamfro ui.rs set_opacity). Only with
     // dlvr\wrist_route.txt. COST per call: one aligned read + up to five compares.
     // [LOADBEARING: ui_wrist_hud] HOLD OPAQUE - without it the game's fades of the five pieces reach the wrist quads
-    if (g_routeOn && o < 1.0f && el) {
+    if (g_wristOn && o < 1.0f && el) {
         uintptr_t obj = 0;
         if (RdP(reinterpret_cast<uintptr_t>(el) + 0x18, obj) && obj) {
             for (int p = 0; p < kPieces; ++p) {
@@ -856,11 +883,14 @@ void Start()
     // FIRST OnThisLaunch call - this one, after LoadLayerConfig), replaces the marker dlvr\wrist_route.txt. A marker left on disk is
     // named so a stale one is not mistaken for the switch.
     // [LOADBEARING: ui_wrist_hud] the route latch + the thread start below: with ui_wrist_hud on, this file is the wrist HUD's plumbing, not a probe
-    g_routeOn = wristquad::OnThisLaunch();
+    g_wristOn = wristquad::OnThisLaunch();
+    g_promptOn = PromptQuadOnThisLaunch();   // [LOADBEARING: inworld_prompts] the leaf publish also for the prompt alone (trace 20261123_1535)
+    g_routeOn = g_wristOn || g_promptOn;
     const bool oldMarker = GetFileAttributesA(route) != INVALID_FILE_ATTRIBUTES;
-    // [PROBE: WRISTROUTE] gate=ui_wrist_hud (read at launch)  site=HEADSET  log-only=no
-    LOG("[WRISTROUTE] layer: %s (logged unconditionally) - ui_wrist_hud=%d at launch.%s", g_routeOn ? "ON - the HUD's leaves are "
-        "published for the bootstrap's draw routing (dlvr_WristLeaves)" : "off", g_routeOn ? 1 : 0,
+    // [PROBE: WRISTROUTE] gate=ui_wrist_hud,inworld_prompts (read at launch)  site=HEADSET  log-only=no
+    LOG("[WRISTROUTE] layer: %s (logged unconditionally) - ui_wrist_hud=%d, inworld_prompts=%d at launch; Header %zu bytes (the "
+        "bootstrap prints its own - they must match).%s", g_routeOn ? "ON - the HUD's leaves are published for the bootstrap's draw "
+        "routing (dlvr_WristLeaves)" : "off", g_wristOn ? 1 : 0, g_promptOn ? 1 : 0, sizeof(wristleaf::Header),
         oldMarker ? " (the old marker dlvr\\wrist_route.txt is on disk - NOT read any more; the setting decides)" : "");
     if (!g_probeOn && !g_routeOn) {
         // [PROBE: WRISTPROBE] gate=dlvr\wrist_probe.txt  site=HEADSET  log-only=yes

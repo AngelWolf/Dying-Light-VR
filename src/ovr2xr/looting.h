@@ -35,7 +35,8 @@ holster::Yield LootYieldAt(int hand, bool pressEdge, float* outDist, bool* outLi
 void GripCamoPoll(bool vrGrip, bool& withholdR1);
 
 // Once per scePad poll, right after ThrowablePadByte and BEFORE the mod-menu block (which zeroes the pad last): ORs Square
-// (0x8000, the game's X = _ACTION_EXECUTE_TRIGGER) while a hand is searching.
+// (0x8000, the game's X = _ACTION_EXECUTE_TRIGGER) as a hand's search START tap (0.15 s) and holds the search through the input
+// lookup (boltwheel.h InputLookupSetTriggerHold); without the lookup detour, Square for the whole search (trace 20261122_1620).
 void LootPadByte(unsigned char* p);
 
 // The camouflage gesture (camogesture.cpp, plan 2026-11-07-camouflage-gesture): is `ai` an AI whose logic module is the infected one

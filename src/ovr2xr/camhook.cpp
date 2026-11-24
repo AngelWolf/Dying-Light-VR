@@ -741,12 +741,12 @@ int StreamBudgetReserveMB = -1;
 #if !defined(DLVR_BETA_LEAN)   // BETA lean: constexpr false in camhook.h (docs/BETA_CENSUS.md)
 bool DiagStreamBudget = false;
 #endif
-// [DEP: shadow_cascade_stagger] required-for=S1 SHADOW CASCADE STAGGER (INV-584 / INV-585, docs/PERF-ENGINE-RESEARCH-2026-10-16.md §1c): a pass-through detour on engine +2B7070 (renders ONE sun cascade, sole caller +2B9680). 0 or 1 = stock (every cascade every frame). N >= 2 = the cascades from shadow_stagger_first up refresh in turn, cascade i when (frame + i) % N == 0; a skipped cascade keeps its texture AND its HSM matrix (EvalSH_HSM_XFORM_* read the HSM's own slot-9 store, written only inside +2B7070), so they stay paired. Forced full refresh when the HSM pointer or the cascade count changes. REFUSED (stock) in HSM atlas mode (index 0 clears the whole atlas), with an active NvidiaEffects(1,...) in video.scr (PCSS records per cascade), or when video.scr cannot be read. Tier A, compiled 2 (2026-10-16, Jay: "Same in both eyes" on 6c68bdb9; "Ship on" after the 2e8a270e run - LIVE, skips balanced, render-queue pool flat at 22).  tree=EXPERIMENT
-int ShadowCascadeStagger = 2;
+// [DEP: shadow_cascade_stagger] required-for=S1 SHADOW CASCADE STAGGER (INV-584 / INV-585, docs/PERF-ENGINE-RESEARCH-2026-10-16.md §1c): a pass-through detour on engine +2B7070 (renders ONE sun cascade, sole caller +2B9680). 0 or 1 = stock (every cascade every frame). N >= 2 = the cascades from shadow_stagger_first up refresh in turn, cascade i when (frame + i) % N == 0; a skipped cascade keeps its texture AND its HSM matrix (EvalSH_HSM_XFORM_* read the HSM's own slot-9 store, written only inside +2B7070), so they stay paired. Forced full refresh when the HSM pointer or the cascade count changes. REFUSED (stock) in HSM atlas mode (index 0 clears the whole atlas), with an active NvidiaEffects(1,...) in video.scr (PCSS records per cascade), or when video.scr cannot be read. Compiled 3 since 2026-11-24 (Jay, RUN SF3: "Done, everything seemed fine" -> "Yes", trace 20261124_1102; ~0.22-0.32 ms/frame over 2). Was Tier A, compiled 2 (2026-10-16, Jay: "Same in both eyes" on 6c68bdb9; "Ship on" after the 2e8a270e run - LIVE, skips balanced, render-queue pool flat at 22).  tree=EXPERIMENT
+int ShadowCascadeStagger = 3;
 // [DEP: texture_aniso] required-for=Jay's floor-blur fix (INV-684, RUN TX1: "That looks better"): the anisotropy level the BOOTSTRAP applies to the engine's mipped samplers (dlssflat.cpp reads this key from ovr2xr.txt as text before the layer loads). The layer only holds and saves the value; no layer code reads it except the menu. 0 / 1 = the game's own filtering, 2-16 = that level. Restart to apply (samplers are created at load). Tier A, compiled 16.  tree=EXPERIMENT
 int TextureAniso = 16;
-// [DEP: shadow_stagger_first] required-for=shadow_cascade_stagger >= 2 only: the first cascade index that is staggered (cascades below it render every frame). Default 2 = cascades 0 and 1 every frame. Inert at stagger 0 / 1.  tree=EXPERIMENT
-int ShadowStaggerFirst = 2;
+// [DEP: shadow_stagger_first] required-for=shadow_cascade_stagger >= 2 only: the first cascade index that is staggered (cascades below it render every frame). Default 1 = only cascade 0 every frame (Jay 2026-11-23, RUN SF2: "It all looked completely fine"; was 2). Inert at stagger 0 / 1.  tree=EXPERIMENT
+int ShadowStaggerFirst = 1;
 // [DEP: lens_mask] required-for=F2 LENS MASK (docs/PERF-ENGINE-RESEARCH-2026-10-16.md §1e): the bootstrap's ClearDepthStencilView hook writes depth 1.0 (the near plane, reversed-Z) + stencil 255 into every texel of the scene ZBUFFER the runtime cannot display (outside its per-eye FOV + lens_mask_margin_deg, after the declared pitch), re-stamps the stencil after each stencil clear, and sets those texels to depth 0 (far) at the tonemap draw before AFW's depth copy and the AA. The geometry comes from dlvr_LensMask (ovr2xr.cpp), stored per engine eye at each submit. VR only. Tier C, compiled 0.  tree=EXPERIMENT
 bool LensMask = false;
 // [DEP: lens_mask_margin_deg] required-for=lens_mask only: degrees added to each side of the runtime's per-eye FOV before masking - the room the runtime's reprojection to the newest head pose needs (more for AFW's held eye). Not measured; the tint check sets it. Inert with lens_mask off.  tree=EXPERIMENT
@@ -3852,12 +3852,40 @@ volatile LONG g_netVpEver = 0;
 LONG64    g_netHeldAt = 0;          // g_frame at the hold, for the resume line
 int       g_netHolds = 0;
 
+// OFF-CENTRE (trace docs/traces/20261124_1425_afwnet_offcentre_hold.md; RUN AF1 2026-11-24): AFW as built cannot rebuild an eye of an
+// off-centre frustum - the gate's GpuCam reads the off-centre as ~13.6 deg of rotation and refuses every image (INV-612) - so with
+// symmetric_fov 0 / 1 (Meta's runtime forces 0) the alternation ran with NO rebuild: half-rate eyes, the main menu text doubled on
+// head movement (AF1). 1 = either eye's GAME frustum (dlvr_GameEyeTan, ungated) is off-centre, 0 = both symmetric (symmetric_fov 2:
+// exactly), -1 = not known yet (no submit has described an eye). COST: two calls copying 4 floats each.
+extern "C" int dlvr_GameEyeTan(int eye, float* out);
+float g_offTan[4] = {};             // eye 0's tangents at the last test, for the hold line
+// STAGE 1 OF AFW OFF-CENTRE (trace docs/traces/20261124_1700_afw_offcentre_stage1.md): a bootstrap that exports DlvrAfwOffCentreOk rebuilds an
+// off-centre eye, so the off-centre hold below does not fire with it. An older bootstrap (no export) keeps the hold. Resolved once in NetTick.
+typedef int (*PFN_OffCentreOk)();
+int g_offOk = -1;                   // 1 = the export answered 1, 0 = missing / answered 0, -1 = not looked yet
+int OffCentre()
+{
+    for (int e = 0; e < 2; ++e) {
+        float t[4] = {};
+        if (!dlvr_GameEyeTan(e, t)) { return -1; }
+        if (e == 0) { for (int i = 0; i < 4; ++i) { g_offTan[i] = t[i]; } }
+        if (fabsf(t[0] - t[1]) > 0.001f * (t[0] + t[1]) || fabsf(t[2] - t[3]) > 0.001f * (t[2] + t[3])) { return 1; }
+    }
+    return 0;
+}
+
 void NetTick(ULONGLONG now, bool two)
 {
     if (!g_tsLooked) {
         g_tsLooked = true;
         HMODULE b = GetModuleHandleA("xinput1_3.dll");
         g_tsFn = b ? reinterpret_cast<PFN_TonemapSeen>(reinterpret_cast<void*>(GetProcAddress(b, "DlvrTonemapSeen"))) : nullptr;
+        PFN_OffCentreOk ok = b ? reinterpret_cast<PFN_OffCentreOk>(reinterpret_cast<void*>(GetProcAddress(b, "DlvrAfwOffCentreOk"))) : nullptr;
+        g_offOk = (ok && ok() == 1) ? 1 : 0;
+        // [PROBE: AFWNET] gate=none (once per session, logged unconditionally, with the ARMED line)  site=HEADSET  log-only=no
+        LOG("[AFWNET] OFF-CENTRE SUPPORT (logged unconditionally): DlvrAfwOffCentreOk %s - %s", ok ? "FOUND" : "NOT FOUND",
+            g_offOk == 1 ? "the bootstrap rebuilds an off-centre eye: no off-centre hold (symmetric_fov 0 / 1, Meta's runtime)"
+                         : "an older bootstrap: an off-centre frustum still holds the alternation off");
         // [PROBE: AFWNET] gate=none (once per session, logged unconditionally, at the first eye-0 Scene replay)  site=HEADSET  log-only=no
         LOG("[AFWNET] ARMED (logged unconditionally): %s | tonemap draw seen now %d (1 yes, 0 not yet, 2 the bootstrap's AFW capture is "
             "off on this AA path - NO AA / aa_native / a missing marker, -1 the bootstrap's colour hook is not installed: no verdict, "
@@ -3869,8 +3897,10 @@ void NetTick(ULONGLONG now, bool two)
     if (!g_tsFn) { return; }
     const int seen = g_tsFn();
     const bool vpEver = InterlockedCompareExchange(&g_netVpEver, 1, 1) == 1;
+    // an off-centre frustum blocks AFW only when the bootstrap cannot rebuild one (g_offOk, trace 20261124_1700)
+    const int off = g_offOk == 1 ? 0 : OffCentre();
     if (g_netHeld) {
-        if ((seen == 1 && vpEver) || !AfwEnable) {
+        if ((seen == 1 && vpEver && off != 1) || !AfwEnable) {
             InterlockedExchange(&g_netHeld, 0);
             const bool back = AfwEnable && AfwData3Allowed();
             AfwAltEye = back;
@@ -3879,13 +3909,30 @@ void NetTick(ULONGLONG now, bool two)
             // [PROBE: AFWNET] gate=afw_enable (a resume after a hold; event)  site=HEADSET  log-only=no
             LOG("[AFWNET] RESUMED at frame %lld (held %lld frames): %s - afw_alt_eye / afw_rebuild back to %d", g_frame,
                 g_frame - g_netHeldAt,
-                seen == 1 ? "the bootstrap has now seen the tonemap draw and a view-projection matrix has reached the layer"
+                seen == 1 ? "the bootstrap has seen the tonemap draw, a view-projection matrix has reached the layer and the game's "
+                            "frustum is centred"
                           : "afw_enable was unticked",
                 back ? 1 : 0);
         }
         return;
     }
     const bool intent = AfwEnable && two && AfwData3Allowed();
+    if (intent && off == 1) {
+        // OFF-CENTRE: hold at once - no wait would change it (AFW cannot rebuild an off-centre eye as built).
+        InterlockedExchange(&g_netHeld, 1);
+        g_netHeldAt = g_frame;
+        ++g_netHolds;
+        AfwAltEye = false;
+        AfwRebuild = false;
+        g_netSinceMs = 0;
+        // [PROBE: AFWNET] gate=afw_enable + two eyes rendered (a hold; event)  site=HEADSET  log-only=no
+        LOG("[AFWNET] *** HELD OFF *** at frame %lld (hold #%d): the game's frustum is OFF-CENTRE (eye 0 tangents L %.4f R %.4f U %.4f "
+            "D %.4f - symmetric_fov 0 / 1, or Meta's runtime) and AFW as built cannot rebuild an off-centre eye (INV-612, RUN AF1) - "
+            "both eyes are rendered every frame from now (AFW's frame-rate gain is lost, the image stays right). afw_enable stays as "
+            "set (%d); resumes if the frustum becomes centred.", g_frame, g_netHolds, g_offTan[0], g_offTan[1], g_offTan[2],
+            g_offTan[3], AfwEnable ? 1 : 0);
+        return;
+    }
     // 0 = the tonemap draw not seen yet; 2 = the bootstrap's AFW capture cannot run on this AA path; 1 with no matrix ever = the
     // rebuild refuses every frame (no camera). Any of them: no rebuild. -1 (no verdict) = the net does nothing, as before.
     const bool noRebuild = seen == 0 || seen == 2 || (seen == 1 && !vpEver);
@@ -10916,7 +10963,9 @@ void NoteSubmit()
 }
 
 // Rows r_i = m[4i..4i+3] (row-major, clip_i = r_i . (p,1); row 2 = (0,0,0,near), U-8). The camera position zeroes rows
-// 0, 1 and 3; the forward direction zeroes rows 0 and 1 with row 3 (w) increasing.
+// 0, 1 and 3; the forward direction is row 3's own (w = depth along it). OFF-CENTRE (trace docs/traces/20261124_1700_afw_offcentre_stage1.md):
+// it was row0 x row1, which leans by the frustum's off-centre (~13.6 deg at symmetric_fov 0 - every image refused, INV-612); centred, the two
+// differ only by the jitter (~0.006 deg against the gate's 0.5).
 bool GpuCam(const float m[16], float pos[3], float fwd[3])
 {
     const float* a0 = m; const float* a1 = m + 4; const float* a3 = m + 12;
@@ -10927,8 +10976,7 @@ bool GpuCam(const float m[16], float pos[3], float fwd[3])
     const float det = a0[0] * c13[0] + a0[1] * c13[1] + a0[2] * c13[2];
     if (!(fabsf(det) > 1e-12f)) { return false; }
     for (int i = 0; i < 3; ++i) { pos[i] = -(a0[3] * c13[i] + a1[3] * c30[i] + a3[3] * c01[i]) / det; }
-    float f[3] = { c01[0], c01[1], c01[2] };
-    if (a3[0] * f[0] + a3[1] * f[1] + a3[2] * f[2] < 0.0f) { f[0] = -f[0]; f[1] = -f[1]; f[2] = -f[2]; }
+    float f[3] = { a3[0], a3[1], a3[2] };
     const float len = sqrtf(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
     if (!(len > 1e-12f)) { return false; }
     for (int i = 0; i < 3; ++i) { fwd[i] = f[i] / len; }

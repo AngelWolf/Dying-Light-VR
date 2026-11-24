@@ -31,4 +31,11 @@ long ArrowWheelOpensSent();
 // the "X Reload" prompt hidden while manual_reload is on (the prompt picker's reload candidate, ida/rn6).
 bool ArrowWheelXBlocked();
 
+// Loot by hand's search hold (2026-11-22 (71), INV-765, trace 20261122_1620): the same lookup detour reads action 20 (the trigger
+// hold TriggerController::Update tests) as held for `target` (the local player + 2288) while the want is fresh (kWantFreshMs). Pad
+// thread, every poll while loot_by_hand: want + target, stamped now. BoltWheelInstall installs the detour also while loot_by_hand is
+// on. Live = the detour is in (false = loot by hand holds Square for the whole search, as before).
+void InputLookupSetTriggerHold(bool want, unsigned long long target);
+bool InputLookupTriggerHoldLive();
+
 }  // namespace dlvr

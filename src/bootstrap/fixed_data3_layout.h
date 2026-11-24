@@ -4,7 +4,7 @@
 #pragma once
 
 static const int kPpLayoutVersion = 1;
-static const unsigned long kPpCrcRenderLoop = 0x8F1FB295UL; static const unsigned long kPpSizeRenderLoop = 81446UL;
+static const unsigned long kPpCrcRenderLoop = 0x8C2E3ABBUL; static const unsigned long kPpSizeRenderLoop = 81989UL;
 static const unsigned long kPpCrcOculus     = 0xA2B5C6BBUL; static const unsigned long kPpSizeOculus     = 1207UL;
 static const unsigned long kPpCrcSprite50   = 0xAA971057UL; static const unsigned long kPpSizeSprite50   = 1764UL;
 static const char* const kPpMthName = "dlvr_pp.mth";

@@ -310,7 +310,7 @@ void HudRecentreRuntime(XrTime changeTime, int spaceType)
 
 // The menu panel (stage 1, verified - INV-535). Unchanged by the HUD panel except for Stop()'s deferred hand-back.
 static int RenderMenu(XrSpace appSpace, bool viewsValid, const XrPosef* eyes, const XrQuaternionf& rendered0, const XrFovf& fov0,
-                      XrCompositionLayerQuad* out)
+                      const XrFovf& fov1, XrCompositionLayerQuad* out)
 {
     // v5: not while the panel is REFUSED this session (no brackets - AFW off at launch): flat tab menus with no panel would
     // only change the stock look.
@@ -402,17 +402,28 @@ static int RenderMenu(XrSpace appSpace, bool viewsValid, const XrPosef* eyes, co
     if (rc == 0 && rc1 != 0) { rc = rc1; ++g_eye1Fail; }
     if (rc != 0) { ++g_noPass; Periodic(); return 0; }
 
-    float width = 0.0f, height = 0.0f;
-    SizeM(r, W, H, std::tan(fov0.angleLeft), std::tan(fov0.angleRight), std::tan(fov0.angleDown), std::tan(fov0.angleUp),
-          UiPanelDistanceM, UiPanelScale, &width, &height);
+    // Per eye (trace docs/traces/20261124_1345_panel_eye_offcentre.md): each eye's quad is sized from ITS OWN declared frustum and
+    // centred on ITS OWN crop centre's direction (EyeQuadOffset) - 0 / 0 and identical sizes for a symmetric frustum (as before).
+    const XrFovf* fovE[2] = { &fov0, &fov1 };
+    float widthE[2] = {}, heightE[2] = {}, dxE[2] = {}, dyE[2] = {};
+    for (int e = 0; e < 2; ++e) {
+        const float tl = std::tan(fovE[e]->angleLeft), tr = std::tan(fovE[e]->angleRight);
+        const float td = std::tan(fovE[e]->angleDown), tu = std::tan(fovE[e]->angleUp);
+        SizeM(r, W, H, tl, tr, td, tu, UiPanelDistanceM, UiPanelScale, &widthE[e], &heightE[e]);
+        EyeQuadOffset(r, W, H, tl, tr, td, tu, UiPanelDistanceM, UiPanelScale, &dxE[e], &dyE[e]);
+    }
+    const float width = widthE[0], height = heightE[0];
     static bool s_saidFirst = false;
     if (!s_saidFirst) {
         s_saidFirst = true;
         // [PROBE: UIPANEL] gate=ui_panel_menus  site=HEADSET  log-only=no
         LOG("[UIPANEL] FIRST panel submitted (logged unconditionally): %s | STEREO: each eye's whole pass %dx%d on its own quad "
             "(eye 0 -> LEFT, eye 1 -> RIGHT), one room pose | eye 0 declared field of view tangents L %.4f R %.4f D %.4f U %.4f | "
-            "panel %.3f x %.3f m", StateName(state), W, H, std::tan(fov0.angleLeft), std::tan(fov0.angleRight),
-            std::tan(fov0.angleDown), std::tan(fov0.angleUp), width, height);
+            "panel %.3f x %.3f m | per-eye quad shift (right, up) eye 0 %+.4f %+.4f m, eye 1 %+.4f %+.4f m (0 = a symmetric "
+            "frustum); eye 1 tangents L %.4f R %.4f D %.4f U %.4f, panel %.3f x %.3f m", StateName(state), W, H,
+            std::tan(fov0.angleLeft), std::tan(fov0.angleRight), std::tan(fov0.angleDown), std::tan(fov0.angleUp), width, height,
+            dxE[0], dyE[0], dxE[1], dyE[1], std::tan(fov1.angleLeft), std::tan(fov1.angleRight), std::tan(fov1.angleDown),
+            std::tan(fov1.angleUp), widthE[1], heightE[1]);
     }
     // v4 (3) THE ROLL (INV-534 (3)): the game image is rendered at `rendered0` and declared at eyes[0].orientation (the
     // declared pitch). The runtime holds a room-space quad rigid, so the latched pose is turned by the same difference
@@ -445,6 +456,12 @@ static int RenderMenu(XrSpace appSpace, bool viewsValid, const XrPosef* eyes, co
     } else {
         ++g_noRedecl;
     }
+    float mAx[3], mAy[3];
+    {
+        const float xAxis[3] = { 1.0f, 0.0f, 0.0f }, yAxis[3] = { 0.0f, 1.0f, 0.0f };
+        Rotate(sQuat, xAxis, mAx);   // the panel's own right / up as submitted (after Redeclare)
+        Rotate(sQuat, yAxis, mAy);
+    }
     for (int e = 0; e < 2; ++e) {
         XrCompositionLayerQuad& q = out[e];
         q = XrCompositionLayerQuad{ XR_TYPE_COMPOSITION_LAYER_QUAD };
@@ -456,8 +473,9 @@ static int RenderMenu(XrSpace appSpace, bool viewsValid, const XrPosef* eyes, co
         q.subImage.imageRect.offset = { e * r.w, 0 };
         q.subImage.imageRect.extent = { r.w, r.h };
         q.pose.orientation = { sQuat[0], sQuat[1], sQuat[2], sQuat[3] };
-        q.pose.position = { sPos[0], sPos[1], sPos[2] };
-        q.size = { width, height };
+        q.pose.position = { sPos[0] + mAx[0] * dxE[e] + mAy[0] * dyE[e], sPos[1] + mAx[1] * dxE[e] + mAy[1] * dyE[e],
+                            sPos[2] + mAx[2] * dxE[e] + mAy[2] * dyE[e] };
+        q.size = { widthE[e], heightE[e] };
     }
     ++g_shown;
     Periodic();
@@ -512,7 +530,7 @@ void HudPeriodic()
 }
 
 int RenderHud(XrSpace appSpace, bool viewsValid, const XrPosef* eyes, const XrQuaternionf& rendered0, const XrFovf& fov0,
-              XrCompositionLayerQuad* out)
+              const XrFovf& fov1, XrCompositionLayerQuad* out)
 {
     // Selection wheels (Task 6, D13): while a wheel shows, the quad pair carries ONLY the wheel's rectangle, at its own latch
     // ui_wheel_distance_m ahead (same angle), and ui_hud_hide does not hide it (spec C5). The HUD's own latch is kept for after.
@@ -653,6 +671,15 @@ int RenderHud(XrSpace appSpace, bool viewsValid, const XrPosef* eyes, const XrQu
             ++g_hNoSize; HudPeriodic(); return 0;
         }
     }
+    // Eye 1's box (trace docs/traces/20261124_1612_wheel_taa_fsr_offcentre.md): from eye 1's OWN frustum at eye 0's size (SameSizeAt) -
+    // on an off-centre frustum eye 1's wheel is at its own projection axis, and eye 0's box cut it. Eye 1 not known: eye 0's, as before.
+    // Symmetric frustum: identical to r.
+    Rect r1 = r;
+    if (wheelShow) {
+        EyeTan t1{};
+        Rect own{};
+        if (GameEyeTan(1, &t1) && WheelRect(W, H, t1, &own)) { r1 = SameSizeAt(r, own, W, H); }
+    }
     if (!EnsureSwapchain(2 * W, H)) { HudStop("no panel swapchain"); return 0; }
     if (UiHudHide && !wheelShow) { ++g_hHidden; HudPeriodic(); return 0; }   // handed over (not on the eyes), nothing shown
 
@@ -665,7 +692,7 @@ int RenderHud(XrSpace appSpace, bool viewsValid, const XrPosef* eyes, const XrQu
     int rc = 7, rc1 = 7;
     if (waited) {
         rc = g_hudCopy(g_images[index].texture, 0, r.x, r.y, r.w, r.h, 0);
-        rc1 = g_hudCopy(g_images[index].texture, 1, r.x, r.y, r.w, r.h, r.w);
+        rc1 = g_hudCopy(g_images[index].texture, 1, r1.x, r1.y, r1.w, r1.h, r.w);
     }
     XrSwapchainImageReleaseInfo ri{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
     xrReleaseSwapchainImage_(g_sc, &ri);
@@ -779,11 +806,12 @@ int RenderHud(XrSpace appSpace, bool viewsValid, const XrPosef* eyes, const XrQu
             if (g_hWheelLines < 200) {
                 ++g_hWheelLines;
                 // [PROBE: HUDPANEL] gate=ui_hud_panel  site=HEADSET  log-only=no
-                LOG("[HUDPANEL] WHEEL #%ld: only the wheel shows (the HUD hidden), %s at %.2f m | wheel rect %d,%d %dx%d of %dx%d | %s",
+                LOG("[HUDPANEL] WHEEL #%ld: only the wheel shows (the HUD hidden), %s at %.2f m | wheel rect %d,%d %dx%d of %dx%d "
+                    "(eye 1: %d,%d) | %s",
                     g_hWheelShows, g_wheelLatched ? "latched"
                         : wheelOnly ? "*** NOT LATCHED (no heading) - not shown this submit, tried again ***"
                                     : "*** NOT LATCHED (no heading) - on the HUD's placement ***",
-                    static_cast<double>(UiWheelDistanceM), r.x, r.y, r.w, r.h, W, H,
+                    static_cast<double>(UiWheelDistanceM), r.x, r.y, r.w, r.h, W, H, r1.x, r1.y,
                     wheelOnly ? "ui_hud_panel OFF: the wheel alone, the HUD on the eyes after" : "ui_hud_panel on");
             }
         }
@@ -796,16 +824,27 @@ int RenderHud(XrSpace appSpace, bool viewsValid, const XrPosef* eyes, const XrQu
     } else if (g_wheelLatched) {
         g_wheelLatched = false;   // closed: the HUD is back on its own latch
     }
-    float width = 0.0f, height = 0.0f;
-    SizeM(r, W, H, std::tan(fov0.angleLeft), std::tan(fov0.angleRight), std::tan(fov0.angleDown), std::tan(fov0.angleUp),
-          dist, UiHudScale, &width, &height);
+    // Per eye (trace docs/traces/20261124_1345_panel_eye_offcentre.md): as the menu panel - each eye's own size and crop-centre
+    // direction (EyeQuadOffset); 0 / 0 and identical sizes for a symmetric frustum (as before). `r` is the whole image, or the
+    // wheel's crop while a wheel shows; eye 1 uses its own box r1 (same size; trace 20261124_1612).
+    const XrFovf* fovE[2] = { &fov0, &fov1 };
+    float widthE[2] = {}, heightE[2] = {}, dxE[2] = {}, dyE[2] = {};
+    for (int e = 0; e < 2; ++e) {
+        const float tl = std::tan(fovE[e]->angleLeft), tr = std::tan(fovE[e]->angleRight);
+        const float td = std::tan(fovE[e]->angleDown), tu = std::tan(fovE[e]->angleUp);
+        const Rect& re = e == 0 ? r : r1;
+        SizeM(re, W, H, tl, tr, td, tu, dist, UiHudScale, &widthE[e], &heightE[e]);
+        EyeQuadOffset(re, W, H, tl, tr, td, tu, dist, UiHudScale, &dxE[e], &dyE[e]);
+    }
+    const float width = widthE[0], height = heightE[0];
     if (!g_hudSaidFirst) {
         g_hudSaidFirst = true;
         // [PROBE: HUDPANEL] gate=ui_hud_panel  site=HEADSET  log-only=no
         LOG("[HUDPANEL] FIRST HUD panel submitted (logged unconditionally): each eye's whole pass %dx%d on its own quad (eye 0 "
             "-> LEFT, eye 1 -> RIGHT), one room pose | eye 0 declared field of view tangents L %.4f R %.4f D %.4f U %.4f | "
-            "panel %.3f x %.3f m", W, H, std::tan(fov0.angleLeft), std::tan(fov0.angleRight), std::tan(fov0.angleDown),
-            std::tan(fov0.angleUp), width, height);
+            "panel %.3f x %.3f m | per-eye quad shift (right, up) eye 0 %+.4f %+.4f m, eye 1 %+.4f %+.4f m (0 = a symmetric "
+            "frustum); eye 1 panel %.3f x %.3f m", W, H, std::tan(fov0.angleLeft), std::tan(fov0.angleRight),
+            std::tan(fov0.angleDown), std::tan(fov0.angleUp), width, height, dxE[0], dyE[0], dxE[1], dyE[1], widthE[1], heightE[1]);
     }
     // The declared pitch, as for the menu panel (INV-534 (3)): the latched pose is turned about the head by the difference
     // between the rendered and the declared eye orientation every submit. In play that difference is still the pitch alone
@@ -825,6 +864,12 @@ int RenderHud(XrSpace appSpace, bool viewsValid, const XrPosef* eyes, const XrQu
     } else {
         ++g_hNoRedecl;
     }
+    float hAx[3], hAy[3];
+    {
+        const float xAxis[3] = { 1.0f, 0.0f, 0.0f }, yAxis[3] = { 0.0f, 1.0f, 0.0f };
+        Rotate(sQuat, xAxis, hAx);   // the panel's own right / up as submitted (after Redeclare)
+        Rotate(sQuat, yAxis, hAy);
+    }
     for (int e = 0; e < 2; ++e) {
         XrCompositionLayerQuad& q = out[e];
         q = XrCompositionLayerQuad{ XR_TYPE_COMPOSITION_LAYER_QUAD };
@@ -836,8 +881,9 @@ int RenderHud(XrSpace appSpace, bool viewsValid, const XrPosef* eyes, const XrQu
         q.subImage.imageRect.offset = { e * r.w, 0 };
         q.subImage.imageRect.extent = { r.w, r.h };
         q.pose.orientation = { sQuat[0], sQuat[1], sQuat[2], sQuat[3] };
-        q.pose.position = { sPos[0], sPos[1], sPos[2] };
-        q.size = { width, height };
+        q.pose.position = { sPos[0] + hAx[0] * dxE[e] + hAy[0] * dyE[e], sPos[1] + hAx[1] * dxE[e] + hAy[1] * dyE[e],
+                            sPos[2] + hAx[2] * dxE[e] + hAy[2] * dyE[e] };
+        q.size = { widthE[e], heightE[e] };
     }
     // Selection wheels (spec D12): publish the wheel's centre and the panel's axes. The quad shows the crop r of the eye image;
     // the wheel sits at the UI canvas centre (CanvasCentre: the projection axis of eye 0's game frustum - (W / 2, H / 2) only for a
@@ -862,7 +908,7 @@ int RenderHud(XrSpace appSpace, bool viewsValid, const XrPosef* eyes, const XrQu
         const float v = r.h > 0 ? (0.5f - (wcy - r.y) / r.h) * height : 0.0f;   // image y grows downward
         AcquireSRWLockExclusive(&g_wfLock);
         for (int i = 0; i < 3; ++i) {
-            g_wfC[i] = sPos[i] + u * ax[i] + v * ay[i];
+            g_wfC[i] = sPos[i] + dxE[0] * ax[i] + dyE[0] * ay[i] + u * ax[i] + v * ay[i];   // + eye 0's quad shift (0 when symmetric)
             g_wfR[i] = ax[i];
             g_wfU[i] = ay[i];
             g_wfN[i] = az[i];
@@ -884,7 +930,7 @@ int RenderHud(XrSpace appSpace, bool viewsValid, const XrPosef* eyes, const XrQu
 }  // namespace
 
 int Render(XrSpace appSpace, bool viewsValid, const XrPosef* eyes, const XrQuaternionf& rendered0, const XrFovf& fov0,
-           XrCompositionLayerQuad* out, XrTime displayTime)
+           const XrFovf& fov1, XrCompositionLayerQuad* out, XrTime displayTime)
 {
     // A runtime recentre is due: hand it to the button's path (kept through a menu or the panel being off, like the button).
     const long long due = g_hudRtDue.load();
@@ -893,7 +939,7 @@ int Render(XrSpace appSpace, bool viewsValid, const XrPosef* eyes, const XrQuate
         g_hudRecentre = true;
         g_hudRtReason = true;
     }
-    int quads = RenderMenu(appSpace, viewsValid, eyes, rendered0, fov0, out);
+    int quads = RenderMenu(appSpace, viewsValid, eyes, rendered0, fov0, fov1, out);
     if (g_active) {
         // A menu owns the pass (also on a submit it could not show): the HUD panel stands down and KEEPS its latch.
         if (g_hudActive) {
@@ -910,7 +956,7 @@ int Render(XrSpace appSpace, bool viewsValid, const XrPosef* eyes, const XrQuate
         g_hudLostMs = 0;
         g_hudNoPassMs = 0;
     } else {
-        quads = RenderHud(appSpace, viewsValid, eyes, rendered0, fov0, out);
+        quads = RenderHud(appSpace, viewsValid, eyes, rendered0, fov0, fov1, out);
     }
     if (g_endOwed) {
         // A panel stopped this submit. Drop the bootstrap's handshake only if neither panel has the pass now.

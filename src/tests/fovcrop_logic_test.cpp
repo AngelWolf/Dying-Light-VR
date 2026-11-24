@@ -144,8 +144,87 @@ static void viewport_offset_is_carried()
     CHECK(r.rect.x == 700 + 250 && r.rect.y == 50 + 250 && r.rect.w == 500 && r.rect.h == 500);
 }
 
+// META'S RUNTIME (trace docs/traces/20261124_1550_meta_panel_crop.md): it spreads the submitted rectangle over its own FOV. Where a
+// direction lands = the panel tangent at that fraction of the rectangle. Straight ahead (tangent 0) must land on 0 in both eyes.
+static double ShownForwardDeg(const Fov& declared, const Fov& panel)
+{
+    const double dL = std::tan(static_cast<double>(declared.left)), dR = std::tan(static_cast<double>(declared.right));
+    const double pL = std::tan(static_cast<double>(panel.left)), pR = std::tan(static_cast<double>(panel.right));
+    const double u = (0.0 - dL) / (dR - dL);
+    return std::atan(pL + u * (pR - pL)) * 57.29577951308232;
+}
+
+// The Meta tester's own numbers (2026-11-23 20:34: runtime L1.3076 R0.7971 U0.9174 D1.3567, 1968x2160 per eye): symmetrised + grown to
+// the texture's shape, then cut: the window is the panel to under a pixel and straight ahead stays straight ahead in both eyes.
+static void meta_tester_both_eyes()
+{
+    double h = 1.3076, v = 1.3567;
+    const double aspect = 1968.0 / 2160.0;
+    if (h / v > aspect) { v = h / aspect; } else { h = v * aspect; }
+    const Fov image = FromTans(h, h, v, v);
+    const Fov p0 = FromTans(1.3076, 0.7971, 0.9174, 1.3567), p1 = FromTans(0.7971, 1.3076, 0.9174, 1.3567);
+    const Rect v0{ 0, 0, 1968, 2160 }, v1{ 1968, 0, 1968, 2160 };
+    const Result r0 = CropScaled(image, p0, v0), r1 = CropScaled(image, p1, v1);
+    CheckCropInvariants(image, p0, v0, r0);
+    CheckCropInvariants(image, p1, v1, r1);
+    CHECK(r0.rect.w == r1.rect.w && r0.rect.h == r1.rect.h && r0.rect.y == r1.rect.y);
+    CHECK(std::fabs(ShownForwardDeg(r0.fov, p0)) < 0.05);
+    CHECK(std::fabs(ShownForwardDeg(r1.fov, p1)) < 0.05);
+    std::printf("meta tester: eye0 rect (%d,%d %dx%d) eye1 rect (%d,%d %dx%d), forward %.4f / %.4f deg\n", r0.rect.x, r0.rect.y, r0.rect.w,
+                r0.rect.h, r1.rect.x, r1.rect.y, r1.rect.w, r1.rect.h, ShownForwardDeg(r0.fov, p0), ShownForwardDeg(r1.fov, p1));
+    // the control: the UNCUT symmetric image (the 2026-11-16 cross-eye) lands far off, opposite ways
+    CHECK(ShownForwardDeg(image, p0) < -10.0 && ShownForwardDeg(image, p1) > 10.0);
+}
+
+// The first-launch table row (Quest 3: L1.38 R1.01 U1.12 D1.43), symmetrised: contains both FOVs Meta reported, so it is plainly cut.
+static void meta_first_launch_row()
+{
+    const Fov image = FromTans(1.38, 1.38, 1.43, 1.43);
+    const Rect v{ 0, 0, 2064, 2272 };
+    const Fov big = FromTans(1.3764, 0.8391, 0.9657, 1.4281), small = FromTans(1.3076, 0.7971, 0.9174, 1.3567);
+    const Result a = CropScaled(image, big, v), b = CropScaled(image, small, v);
+    CheckCropInvariants(image, big, v, a);
+    CheckCropInvariants(image, small, v, b);
+    CHECK(std::fabs(ShownForwardDeg(a.fov, big)) < 0.05 && std::fabs(ShownForwardDeg(b.fov, small)) < 0.05);
+}
+
+// A cache smaller than the live FOV (1.3076 / 1.3567 cached, 1.3764 / 1.4281 live): the panel reaches past the image. Scaled: the window is
+// the panel shrunk uniformly about straight ahead - inside the image, the panel's own proportions, forward still forward.
+static void meta_cache_too_small_is_zoomed()
+{
+    const Fov image = FromTans(1.3076, 1.3076, 1.4352, 1.4352);
+    const Rect v0{ 0, 0, 1968, 2160 }, v1{ 1968, 0, 1968, 2160 };
+    const Fov p0 = FromTans(1.3764, 0.8391, 0.9657, 1.4281), p1 = FromTans(0.8391, 1.3764, 0.9657, 1.4281);
+    CHECK(Crop(image, p0, v0).why == kOutside);   // SteamVR's path: still not cut
+    const Result r0 = CropScaled(image, p0, v0), r1 = CropScaled(image, p1, v1);
+    CHECK(r0.why == kScaled && r1.why == kScaled);
+    CHECK(r0.rect.x == 0 && r1.rect.x + r1.rect.w == 1968 + 1968);       // the limiting (outer) edge is the image's own
+    CHECK(r0.rect.w == r1.rect.w && r0.rect.w < 1968);
+    CHECK(std::fabs(ShownForwardDeg(r0.fov, p0)) < 0.05 && std::fabs(ShownForwardDeg(r1.fov, p1)) < 0.05);
+    const double k = 1.3076 / 1.3764;
+    CHECK(std::fabs(std::tan(static_cast<double>(r0.fov.right)) - k * 0.8391) < 0.002);
+    CHECK(std::fabs(std::tan(static_cast<double>(r0.fov.up)) - k * 0.9657) < 0.002);
+    CHECK(std::fabs(-std::tan(static_cast<double>(r0.fov.down)) - k * 1.4281) < 0.002);
+}
+
+// A panel that does not contain straight ahead cannot be shrunk about it: refused, never a wrong window.
+static void scaled_refuses_a_panel_without_forward()
+{
+    const Fov image = FromTans(1.0, 1.0, 1.0, 1.0);
+    const Rect v{ 0, 0, 1000, 1000 };
+    CHECK(CropScaled(image, FromTans(-0.2, 1.4, 0.9, 0.9), v).why == kOutside);
+    CHECK(CropScaled(image, FromTans(0.8, 0.8, 0.8, 0.8), Rect{ 0, 0, 0, 100 }).why == kBadInput);
+    const Result w = CropScaled(image, image, v);
+    CHECK(w.why == kWhole);
+    CHECK(CropScaled(image, FromTans(2.0, 2.0, 2.0, 2.0), v).why == kScaled);   // all four past: the whole image, reported as scaled
+}
+
 int main()
 {
+    meta_tester_both_eyes();
+    meta_first_launch_row();
+    meta_cache_too_small_is_zoomed();
+    scaled_refuses_a_panel_without_forward();
     crystal_light_both_eyes();
     quest3_offcentre_both_axes();
     whole_window_is_not_cut();

@@ -88,6 +88,60 @@ static void size_keeps_the_angle_the_menu_has_today()
     CHECK(Near(w, 2.0f * 2.0f * 0.7732f, 0.01f));
 }
 
+// Trace docs/traces/20261124_1345_panel_eye_offcentre.md: each eye's quad on its own crop centre's direction (RUNS SY1-SY3).
+static void eye_quad_offset_follows_each_eyes_frustum()
+{
+    const Rect whole = Crop(3072, 3264);
+    float dx = 9.0f, dy = 9.0f;
+    // symmetric on both axes (symmetric_fov 2): exactly 0 - today's placement
+    EyeQuadOffset(whole, 3072, 3264, -1.3764f, 1.3764f, -1.4281f, 1.4281f, 1.8f, 1.0f, &dx, &dy);
+    CHECK(dx == 0.0f && dy == 0.0f);
+    // RUN SY1 eye 0 (declared l 1.3997 r 0.8533 d 1.4281 u 0.9657), the menu panel at 1.8 m, scale 1: the image centre's direction
+    EyeQuadOffset(whole, 3072, 3264, -1.3997f, 0.8533f, -1.4281f, 0.9657f, 1.8f, 1.0f, &dx, &dy);
+    CHECK(Near(dx, 1.8f * (-1.3997f + 0.8533f) * 0.5f, 1e-4f));   // -0.4918 m (to the left)
+    CHECK(Near(dy, 1.8f * (0.9657f - 1.4281f) * 0.5f, 1e-4f));    // -0.4162 m (down)
+    // eye 1 is its mirror image: the opposite sideways shift, the same vertical one
+    float dx1 = 0.0f, dy1 = 0.0f;
+    EyeQuadOffset(whole, 3072, 3264, -0.8533f, 1.3997f, -1.4281f, 0.9657f, 1.8f, 1.0f, &dx1, &dy1);
+    CHECK(Near(dx1, -dx, 1e-4f));
+    CHECK(Near(dy1, dy, 1e-4f));
+    // scale grows the shift with the panel (the HUD's 0.5 m x 1.5)
+    float dxs = 0.0f, dys = 0.0f;
+    EyeQuadOffset(whole, 3072, 3264, -1.3997f, 0.8533f, -1.4281f, 0.9657f, 0.5f, 1.5f, &dxs, &dys);
+    CHECK(Near(dxs, 0.75f * (-1.3997f + 0.8533f) * 0.5f, 1e-4f));
+    // a crop centred on eye 0's projection axis (the wheel's): ~0 for eye 0
+    const EyeTan t{ 1.3997f, 0.8533f, 0.9657f, 1.4281f };
+    Rect c{};
+    CHECK(UiCrop(3072, 3264, t, &c));
+    EyeQuadOffset(c, 3072, 3264, -1.3997f, 0.8533f, -1.4281f, 0.9657f, 1.8f, 1.0f, &dx, &dy);
+    CHECK(Near(dx, 0.0f, 0.002f));
+    CHECK(Near(dy, 0.0f, 0.002f));
+    // the panel's angle is unchanged by the shift: SizeM still spans the eye's own frustum
+    float w = 0.0f, h = 0.0f;
+    SizeM(whole, 3072, 3264, -1.3997f, 0.8533f, -1.4281f, 0.9657f, 1.8f, 1.0f, &w, &h);
+    CHECK(Near(w, 1.8f * (0.8533f + 1.3997f), 1e-3f));
+}
+
+// Trace docs/traces/20261124_1500_hud_router_offcentre.md: the router's per-eye UI plane on an off-centre frustum.
+static void ui_plane_exact_is_each_eyes_own()
+{
+    float x = 7.0f, y = 7.0f, w = 7.0f, h = 7.0f;
+    CHECK(!UiPlaneExact(3072, 3264, EyeTan{ 1.3764f, 1.3764f, 1.4624f, 1.4624f }, &x, &y, &w, &h));   // symmetric: the old path
+    CHECK(x == 7.0f && w == 7.0f);
+    const EyeTan e0{ 1.3997f, 0.8533f, 0.9657f, 1.4281f }, e1{ 0.8533f, 1.3997f, 0.9657f, 1.4281f };
+    CHECK(UiPlaneExact(3072, 3264, e0, &x, &y, &w, &h));
+    CHECK(Near(x + 0.5f * w, 3072.0f * 1.3997f / 2.2530f, 0.01f));   // centred on the projection axis
+    CHECK(Near(y + 0.5f * h, 3264.0f * 0.9657f / 2.3938f, 0.01f));
+    // a draw logged in RUN AF2 (old UI px 2449.4, 1789.4 on the 3816 x 2634 size) -> HL2's MATCHED leaf (1494.4, 2738.1)
+    const float fx = (2449.4f / 6144.0f * 2126.0f + 845.0f) / 3816.0f, fy = (1789.4f / 3264.0f * 1130.0f + 752.0f) / 2634.0f;
+    CHECK(Near((fx * 3072.0f - x) / w * 6144.0f, 1494.4f, 0.6f));
+    CHECK(Near((fy * 3264.0f - y) / h * 3264.0f, 2738.1f, 0.6f));
+    float x1 = 0.0f, y1 = 0.0f, w1 = 0.0f, h1 = 0.0f;
+    CHECK(UiPlaneExact(3072, 3264, e1, &x1, &y1, &w1, &h1));
+    CHECK(Near(x1 + 0.5f * w1, 3072.0f - (x + 0.5f * w), 0.01f));   // eye 1 mirrored
+    CHECK(Near(y1, y, 0.01f) && Near(w1, w, 0.01f) && Near(h1, h, 0.01f));
+}
+
 static void straight_ahead_puts_it_in_front_and_below()
 {
     const float pos[3] = { 0.3f, 1.6f, -0.2f };
@@ -501,8 +555,31 @@ static void wheel_centre_is_the_canvas_centre()
     CHECK(!CanvasCentre(2688, 2880, none, &cx, &cy));
 }
 
+// Eye 1's wheel box at symmetric_fov 0 (RUN SY1's eye 0 tangents, eye 1 mirrored): its own projection axis, eye 0's size.
+static void wheel_eye1_box_is_its_own()
+{
+    const EyeTan e0 = { 1.3997f, 0.8533f, 0.9657f, 1.4281f }, e1 = { 0.8533f, 1.3997f, 0.9657f, 1.4281f };
+    Rect r0{}, own{};
+    CHECK(WheelRect(2688, 2880, e0, &r0) && WheelRect(2688, 2880, e1, &own));
+    const Rect r1 = SameSizeAt(r0, own, 2688, 2880);
+    CHECK(r1.w == r0.w && r1.h == r0.h && r1.y == r0.y);
+    float cx1 = 0.0f, cy1 = 0.0f;
+    CHECK(CanvasCentre(2688, 2880, e1, &cx1, &cy1));
+    CHECK(Near(r1.x + 0.5f * r1.w, cx1, 2.0f));
+    CHECK(!Near(static_cast<float>(r1.x), static_cast<float>(r0.x), 300.0f));   // the old shared box missed it by ~650 px
+    CHECK(r0.x >= 0 && r0.x + r0.w <= 2688 && r1.x >= 0 && r1.x + r1.w <= 2688);
+    std::printf("wheel at 0: eye0 box (%d,%d %dx%d) eye1 box (%d,%d %dx%d)\n", r0.x, r0.y, r0.w, r0.h, r1.x, r1.y, r1.w, r1.h);
+    Rect s0{};
+    CHECK(WheelRect(2688, 2880, kQuest3, &s0));
+    const Rect s1 = SameSizeAt(s0, s0, 2688, 2880);                               // symmetric: unchanged
+    CHECK(s1.x == s0.x && s1.y == s0.y && s1.w == s0.w && s1.h == s0.h);
+    const Rect c = SameSizeAt(Rect{ 0, 0, 1000, 500 }, Rect{ 2500, 2700, 400, 400 }, 2688, 2880);   // kept inside the image
+    CHECK(c.x == 2688 - 1000 && c.y == 2880 - 500 && c.w == 1000 && c.h == 500);
+}
+
 int main()
 {
+    wheel_eye1_box_is_its_own();
     wrist_piece_metres_follow_the_ui_screen();
     router_tolerances_follow_the_ui_screen();
     slot_fit_steps_down_instead_of_clipping();
@@ -520,6 +597,8 @@ int main()
     redeclared_panel_is_rigid_against_the_game_image();
     crop_is_the_measured_menu_rectangle();
     size_keeps_the_angle_the_menu_has_today();
+    eye_quad_offset_follows_each_eyes_frustum();
+    ui_plane_exact_is_each_eyes_own();
     straight_ahead_puts_it_in_front_and_below();
     turned_left_puts_it_to_the_left();
     pitch_does_not_tilt_or_pull_the_panel();

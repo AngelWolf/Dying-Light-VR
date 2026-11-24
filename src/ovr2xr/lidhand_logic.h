@@ -92,6 +92,42 @@ inline void EdgeWorld(const float parentW[12], const float local[12], const floa
     MulPoint34(local, edge + 3, t); MulPoint34(parentW, t, b);
 }
 
+// ---- THE FREE LIFT (trace 20261122_1830, Jay: basket B "1" -> "Yes") ----
+// out = a . b (3x4 rigid, row-major, translation in column 3).
+inline void Compose34(const float a[12], const float b[12], float out[12])
+{
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            out[r * 4 + c] = a[r * 4 + 0] * b[0 * 4 + c] + a[r * 4 + 1] * b[1 * 4 + c] + a[r * 4 + 2] * b[2 * 4 + c] + (c == 3 ? a[r * 4 + 3] : 0.0f);
+        }
+    }
+}
+// The inverse of a rigid 3x4 (rotation transposed, translation -R^T t). A bone / holder world is rigid (no scale).
+inline void InvRigid34(const float m[12], float out[12])
+{
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) { out[r * 4 + c] = m[c * 4 + r]; }
+        out[r * 4 + 3] = -(m[0 * 4 + r] * m[3] + m[1 * 4 + r] * m[7] + m[2 * 4 + r] * m[11]);
+    }
+}
+// Distance from q to the circle (centre c, unit normal n, radius r): sqrt((in-plane distance from c - r)^2 + height^2). The free lift's
+// grab zone is "within reach of anywhere on the round rim".
+inline float RingDist(const float c[3], const float n[3], float r, const float q[3])
+{
+    const double d[3] = { static_cast<double>(q[0]) - c[0], static_cast<double>(q[1]) - c[1], static_cast<double>(q[2]) - c[2] };
+    const double h = d[0] * n[0] + d[1] * n[1] + d[2] * n[2];
+    const double rho = std::sqrt(std::fmax(0.0, d[0] * d[0] + d[1] * d[1] + d[2] * d[2] - h * h));
+    return static_cast<float>(std::sqrt((rho - r) * (rho - r) + h * h));
+}
+// The let-go: the game's own open fires when the cover's rim centre is more than this far from where it rests (my call, Jay approved
+// the design); closer = it goes back on, still closed.
+constexpr float kFreeLiftOpenM = 0.20f;
+inline bool FreeLiftOpens(const float restC[3], const float nowC[3])
+{
+    const double d[3] = { static_cast<double>(nowC[0]) - restC[0], static_cast<double>(nowC[1]) - restC[1], static_cast<double>(nowC[2]) - restC[2] };
+    return std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]) > kFreeLiftOpenM;
+}
+
 // Distance from q to the segment a-b (a == b -> the distance to a).
 inline float SegDist(const float a[3], const float b[3], const float q[3])
 {

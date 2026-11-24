@@ -73,8 +73,10 @@ void Shutdown();
 // panel is latched in that frame and re-expressed in the declared one every submit (uipanel_logic.h Redeclare). Each call
 // also keeps the tab-menu patch (gamedll +7AF08D) in step with ui_panel_menus.
 // ui_hud_panel: when no menu owns the pass and the in-game HUD is showing, the two quads are the HUD panel's instead.
+// fov0 / fov1: each eye's DECLARED frustum (projViews[e].fov) - each quad is sized and centred from its own (EyeQuadOffset,
+// trace docs/traces/20261124_1345_panel_eye_offcentre.md); identical and unshifted for a symmetric frustum.
 int Render(XrSpace appSpace, bool viewsValid, const XrPosef* eyes, const XrQuaternionf& rendered0, const XrFovf& fov0,
-           XrCompositionLayerQuad* out, XrTime displayTime);
+           const XrFovf& fov1, XrCompositionLayerQuad* out, XrTime displayTime);
 
 // True while a panel - the menu's or the HUD's (ui_hud_panel) - owns the bracketed pass: the caller must skip
 // DlvrHudLayerSubmit this submit (the pass is going to the panel, not onto the eyes).

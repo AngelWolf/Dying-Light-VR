@@ -33,6 +33,8 @@ static const Measured kMeasured[] = {
     { "SteamVR/OpenXR : playstation_vr2", { 1.842f, 0.947f, 1.329f, 1.329f },     { 0.947f, 1.842f, 1.329f, 1.329f } },
     { "SteamVR/OpenXR : lighthouse",      { 1.5396f, 1.0514f, 1.4060f, 1.4129f }, { 1.0515f, 1.5416f, 1.4080f, 1.4127f } },
     { "SteamVR/OpenXR : cv",              { 1.6713f, 1.2053f, 1.1722f, 1.7260f }, { 1.2038f, 1.6827f, 1.1974f, 1.6938f } },
+    // a second "lighthouse" headset (trace 20261124_2050): its nose side did not fit the row once mode 0 handed each side over as it is
+    { "SteamVR/OpenXR : lighthouse",      { 1.3287f, 1.1518f, 1.0012f, 1.0012f }, { 1.1518f, 1.3287f, 1.0012f, 1.0012f } },
 };
 
 static void every_measured_lens_fits_its_row()

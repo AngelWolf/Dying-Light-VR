@@ -12,6 +12,9 @@
 // pixel edges (so the declaration still describes exactly the pixels - same rays, no resampling). The layer's frustum then IS the
 // panel's (to under a pixel), and a driver that ignores it shows it right.
 //
+// META'S PC RUNTIME (Jay 2026-11-24: "Go ahead with 1"; trace docs/traces/20261124_1550_meta_panel_crop.md) is the same case: it shows a
+// view's rectangle over its OWN FOV. CropScaled is its entry (eyefov_logic.h RuntimeStretchesToOwnFov).
+//
 // Pure maths, no globals, no OpenXR types: fovcrop_logic_test.cpp compiles this same header with cl.
 
 #include <cmath>
@@ -26,6 +29,7 @@ enum Why : int {
     kWhole    = 1,   // the panel window is the whole image: nothing to cut (rect / fov = the input)
     kOutside  = 2,   // the panel reaches past the image by more than kTolPx on some edge: not cut (the image does not contain it)
     kBadInput = 3,   // non-finite, empty or inverted frustum / viewport: not cut
+    kScaled   = 4,   // CropScaled only: the panel reached past the image, so its window was shrunk about straight ahead until it fits
 };
 
 constexpr double kTolPx = 0.5;
@@ -87,10 +91,37 @@ inline Result Crop(const Fov& image, const Fov& panel, const Rect& vp)
     return r;
 }
 
+// Crop for a runtime that spreads the rectangle over its own FOV (Meta's): a panel past the image may NOT fall back to the whole image
+// (that is the 2026-11-16 cross-eye), so the panel is shrunk by one factor about the forward axis until it fits. Shown over the runtime's
+// FOV that is a uniform zoom with straight ahead kept straight ahead. kOutside stays when the panel does not contain straight ahead.
+inline Result CropScaled(const Fov& image, const Fov& panel, const Rect& vp)
+{
+    Result r = Crop(image, panel, vp);
+    if (r.why != kOutside) { return r; }
+    const double i[4] = { -std::tan(static_cast<double>(image.left)), std::tan(static_cast<double>(image.right)),
+                          std::tan(static_cast<double>(image.up)), -std::tan(static_cast<double>(image.down)) };
+    const double p[4] = { -std::tan(static_cast<double>(panel.left)), std::tan(static_cast<double>(panel.right)),
+                          std::tan(static_cast<double>(panel.up)), -std::tan(static_cast<double>(panel.down)) };
+    double k = 1.0;
+    for (int e = 0; e < 4; ++e) {
+        if (!(i[e] > 1e-6) || !(p[e] > 1e-6)) { return r; }
+        if (p[e] * k > i[e]) { k = i[e] / p[e]; }
+    }
+    const Fov fit{ static_cast<float>(-std::atan(p[0] * k)), static_cast<float>(std::atan(p[1] * k)),
+                   static_cast<float>(std::atan(p[2] * k)), static_cast<float>(-std::atan(p[3] * k)) };
+    const Result s = Crop(image, fit, vp);
+    if (s.why != kCropped && s.why != kWhole) { return r; }
+    r.rect = s.rect;   // marginPx stays the real panel's (negative edges = what was missing)
+    r.fov = s.fov;
+    r.why = kScaled;
+    return r;
+}
+
 inline const char* WhyName(int why)
 {
     switch (why) {
         case kCropped:  return "CROPPED to the panel window";
+        case kScaled:   return "CROPPED, zoomed to fit: the panel reaches past the image (the rendered FOV is smaller than the runtime's)";
         case kWhole:    return "NOT CUT: the panel window is the whole image";
         case kOutside:  return "NOT CUT: the panel reaches past the image (the image does not contain it)";
         default:        return "NOT CUT: bad input (empty / non-finite frustum or viewport)";
