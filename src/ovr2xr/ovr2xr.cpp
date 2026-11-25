@@ -872,19 +872,18 @@ XrPosef PitchPose(const XrPosef& p, float degrees)
     return out;
 }
 
-ovrFovPort SymmetriseFov(ovrFovPort f)
+dlvr::eyefov::Tans ToTans(const ovrFovPort& f)
 {
-    const int mode = SymmetricFovMode();
-    if (mode >= 1) {
-        const float v = (f.UpTan > f.DownTan) ? f.UpTan : f.DownTan;
-        f.UpTan = v;
-        f.DownTan = v;
-    }
-    if (mode >= 2) {
-        const float h = (f.LeftTan > f.RightTan) ? f.LeftTan : f.RightTan;
-        f.LeftTan = h;
-        f.RightTan = h;
-    }
+    return dlvr::eyefov::Tans{ f.LeftTan, f.RightTan, f.UpTan, f.DownTan };
+}
+
+ovrFovPort FromTans(const dlvr::eyefov::Tans& t)
+{
+    ovrFovPort f;
+    f.LeftTan = t.l;
+    f.RightTan = t.r;
+    f.UpTan = t.u;
+    f.DownTan = t.d;
     return f;
 }
 bool  g_configLoaded = false;
@@ -7120,12 +7119,11 @@ bool RealEyeFov(Session* s, int idx, ovrFovPort& out)
 
 // The FOV we hand the game - the single source of truth for it.
 //
-// Everything downstream is derived from this one function: ovrHmdDesc's
-// DefaultEyeFov/MaxEyeFov, the eye texture size, PixelsPerTanAngleAtCenter, and
-// (via the Fov the game echoes back in its layer) the FOV we declare to OpenXR
-// at xrEndFrame. Declared must equal rendered or the compositor resamples with
-// the wrong mapping and the whole image warps, so there is exactly one place
-// that decides it.
+// TWO answers come out of it since 2026-11-25 (trace docs/traces/20261125_1040_live_eye_fov.md):
+//   ovr_GetHmdDesc (startup)          = `mode` 2, the centred superset: the engine's one game camera (culling, sun-shadow fit, light lists).
+//   ovr_GetRenderDesc (every frame)   = `mode` symmetric_fov, what each eye is DRAWN with (EyeFovForFrame below).
+// What ovr_SubmitFrame declares is the second one: declared must equal rendered or the compositor resamples with the wrong mapping and
+// the whole image warps.
 //
 // The engine is assumed to handle only a SYMMETRIC frustum. A Quest 3 lens is
 // not symmetric (54 deg out / 40 deg in, 44 up / 55 down), and the fix is not
@@ -7137,7 +7135,7 @@ bool RealEyeFov(Session* s, int idx, ovrFovPort& out)
 // that assumes one projection for the pair - but only on a headset whose eyes are
 // mirror images: OwnEyeFov symmetrises EACH eye from its own FOV, and GameEyeFov
 // below is what makes the two identical everywhere (INV-597).
-ovrFovPort OwnEyeFov(Session* s, int idx, const char** srcOut)
+ovrFovPort OwnEyeFov(Session* s, int idx, const char** srcOut, int mode)
 {
     LoadLayerConfig();
 
@@ -7153,9 +7151,9 @@ ovrFovPort OwnEyeFov(Session* s, int idx, const char** srcOut)
         src = (s && s->posesValid) ? "live runtime" : "cached from a previous session";
     } else if (g_fovSource >= 1) {
         // [LOADBEARING: FOV-FIRST-LAUNCH] no live views and no hmd_cache.txt (a first launch): the game is handed this
-        // frustum for the WHOLE session (BETA-FINDINGS-2026-10-19 section 9 - nothing re-reads it), so a row that is
-        // too small is black bars until the next launch. fovtable_logic.h: largest measured FOV for the runtime's
-        // name, or the wide row for a name not in the table.
+        // frustum until the live FOV is known (EyeFovForFrame, 2026-11-25; the whole session before that), and its centred superset
+        // is the cull camera's for the WHOLE session (ovr_GetHmdDesc, read once). fovtable_logic.h: largest measured FOV for the
+        // runtime's name, or the wide row for a name not in the table.
         dlvr::fovtable::Tans t{};
         const char* row = dlvr::fovtable::Lookup(g_xrSystemName, idx, t);
         f.LeftTan = t.l; f.RightTan = t.r; f.UpTan = t.u; f.DownTan = t.d;
@@ -7173,27 +7171,17 @@ ovrFovPort OwnEyeFov(Session* s, int idx, const char** srcOut)
         }
     }
 
-    f = SymmetriseFov(f);
+    dlvr::eyefov::Tans t = dlvr::eyefov::Symmetrise(ToTans(f), mode);
 
     // Grow (never shrink) to the eye texture's aspect, so the tangent-derived
     // and aspect-derived readings of this frustum are the same frustum.
     if (g_fovMatchAspect && s) {
         const ovrSizei sz = EyeRenderSize(s, (idx == 1) ? ovrEye_Right : ovrEye_Left, 1.0f);
-        const float tw = f.LeftTan + f.RightTan;
-        const float th = f.UpTan + f.DownTan;
-        if (sz.w > 0 && sz.h > 0 && tw > 0.0f && th > 0.0f) {
-            const float texAspect = static_cast<float>(sz.w) / static_cast<float>(sz.h);
-            if (tw / th > texAspect) {
-                const float k = (tw / texAspect) / th;   // widen vertically
-                f.UpTan *= k;
-                f.DownTan *= k;
-            } else {
-                const float k = (th * texAspect) / tw;   // widen horizontally
-                f.LeftTan *= k;
-                f.RightTan *= k;
-            }
+        if (sz.w > 0 && sz.h > 0) {
+            t = dlvr::eyefov::GrowToAspect(t, static_cast<float>(sz.w) / static_cast<float>(sz.h));
         }
     }
+    f = FromTans(t);
 
     if (srcOut) {
         *srcOut = src;
@@ -7201,17 +7189,17 @@ ovrFovPort OwnEyeFov(Session* s, int idx, const char** srcOut)
     return f;
 }
 
-ovrFovPort GameEyeFov(Session* s, int idx, const char** srcOut)
+ovrFovPort GameEyeFov(Session* s, int idx, const char** srcOut, int mode)
 {
     const char* src = "";
-    ovrFovPort f = OwnEyeFov(s, idx, &src);
+    ovrFovPort f = OwnEyeFov(s, idx, &src, mode);
     // [LOADBEARING: FOV-SHARED-FRUSTUM] symmetric_fov=2: both eyes are handed the frustum that contains both. The AFW rebuild
     //      draws the held eye with the FRESH eye's projection (dlssflat.cpp AfwRebuildRun, INV-597), so two different
     //      frustums put every rebuilt frame off in zoom - 1.9 % on the Steam Frame (eye0 1.7260 / eye1 1.6938). Mirror-image
     //      headsets compute identical frustums here and are unchanged. Modes 0 / 1 hand over deliberately mirrored frustums
     //      and are left alone.
-    if (SymmetricFovMode() >= 2) {
-        const ovrFovPort o = OwnEyeFov(s, 1 - (idx & 1), nullptr);
+    if (mode >= 2) {
+        const ovrFovPort o = OwnEyeFov(s, 1 - (idx & 1), nullptr, mode);
         const dlvr::eyefov::Tans own{ f.LeftTan, f.RightTan, f.UpTan, f.DownTan };
         const dlvr::eyefov::Tans oth{ o.LeftTan, o.RightTan, o.UpTan, o.DownTan };
         const dlvr::eyefov::Tans sh = dlvr::eyefov::Shared(own, oth);
@@ -7228,6 +7216,63 @@ ovrFovPort GameEyeFov(Session* s, int idx, const char** srcOut)
         *srcOut = src;
     }
     return f;
+}
+
+// THE LIVE EYE FOV (trace docs/traces/20261125_1040_live_eye_fov.md; Jay 2026-11-25). The engine rebuilds each eye's frustum every frame from the
+// Fov ovr_GetRenderDesc RETURNS (engine +2E5530 -> +2E68F0, its only writer), so the eyes can follow the headset's FOV of THIS launch; the
+// startup answer alone left a headset whose driver changes the FOV at every start drawn short (a tester 2026-11-24). The state
+// machine, and why the switch is never seen, is eyefov_logic.h LiveFov. Read and written under the frame lock (Guard) only.
+dlvr::eyefov::LiveFov g_liveFov;
+
+// What eye `idx` is drawn with and declared with now. `asked` = the engine's own number, used only before there is a session.
+// COST after the switch: one bool test + a 16-byte copy (~470 calls / s); while it waits for a hidden moment the same.
+ovrFovPort EyeFovForFrame(Session* s, int idx, const ovrFovPort& asked)
+{
+    namespace ef = dlvr::eyefov;
+    if (!ef::Ready(g_liveFov)) {
+        if (!s) {
+            return asked;
+        }
+        const ef::Tans st[2] = { ToTans(GameEyeFov(s, 0, nullptr, SymmetricFovMode())),
+                                 ToTans(GameEyeFov(s, 1, nullptr, SymmetricFovMode())) };
+        ef::SetStart(g_liveFov, st);
+        // [PROBE: LIVEFOV] gate=none (once per launch, logged unconditionally)  site=HEADSET  log-only=no
+        LOG("[LIVEFOV] START (logged unconditionally): the eyes are drawn with eye0 L %.4f R %.4f U %.4f D %.4f eye1 L %.4f R %.4f U %.4f "
+            "D %.4f (%s; symmetric_fov=%d) until the runtime reports this launch's own FOV", st[0].l, st[0].r, st[0].u, st[0].d, st[1].l,
+            st[1].r, st[1].u, st[1].d, s->posesValid ? "the live FOV already" : "saved by the previous launch, or the first-launch row",
+            SymmetricFovMode());
+    }
+    if (!g_liveFov.latched && s && s->posesValid && (!g_liveFov.saidWait || g_liveFov.lastHidden)) {
+        const ef::Tans live[2] = { ToTans(GameEyeFov(s, 0, nullptr, SymmetricFovMode())),
+                                   ToTans(GameEyeFov(s, 1, nullptr, SymmetricFovMode())) };
+        const ef::LatchResult r = ef::TryLatch(g_liveFov, true, live);
+        const char* what = nullptr;
+        switch (r) {
+            case ef::LatchResult::kSame:
+                what = "SAME as the startup one: nothing changes";
+                break;
+            case ef::LatchResult::kSwitched:
+                what = "SWITCHED to the live one - no game image was on the display; it stays off it for the next 4 submits";
+                break;
+            case ef::LatchResult::kWaiting:
+                what = "WAITING: it differs and the game is on the display - the startup one stays until the next loading screen";
+                break;
+            case ef::LatchResult::kRefused:
+                what = "*** REFUSED: not a plausible FOV - the startup one stays until a plausible one is reported ***";
+                break;
+            default:
+                break;
+        }
+        if (what) {
+            // [PROBE: LIVEFOV] gate=none (one line per outcome, at most 4 a launch)  site=HEADSET  log-only=no
+            // [LOADBEARING: FOV-LIVE-EYE] this switch is what makes the drawn frustum the headset's own on a launch whose FOV is not the saved
+            //      one; without it the SteamVR panel crop is refused there (STEAMVR-PANEL-CROP) and the image is short at every edge.
+            LOG("[LIVEFOV] %s | live eye0 L %.4f R %.4f U %.4f D %.4f eye1 L %.4f R %.4f U %.4f D %.4f | startup eye0 L %.4f R %.4f U %.4f D %.4f",
+                what, live[0].l, live[0].r, live[0].u, live[0].d, live[1].l, live[1].r, live[1].u, live[1].d, g_liveFov.start[0].l,
+                g_liveFov.start[0].r, g_liveFov.start[0].u, g_liveFov.start[0].d);
+        }
+    }
+    return FromTans(ef::Used(g_liveFov, idx));
 }
 
 // The single source of truth for per-eye render size.
@@ -8915,14 +8960,16 @@ OVR_PUBLIC_FUNCTION(ovrHmdDesc) ovr_GetHmdDesc(ovrSession session)
 
     for (int i = 0; i < 2; ++i) {
         const char* src = "";
-        const ovrFovPort f = GameEyeFov(s, i, &src);
+        // Mode 2 whatever symmetric_fov is (trace 20261125_1040): the engine's one centred game camera - culling, sun-shadow fit, light
+        // lists - is built from this answer alone and must reach each eye's outer edge. What the eyes are DRAWN with is ovr_GetRenderDesc's.
+        const ovrFovPort f = GameEyeFov(s, i, &src, 2);
         d.DefaultEyeFov[i] = f;
         d.MaxEyeFov[i] = f;
 
         ovrFovPort real{};
         if (RealEyeFov(s, i, real)) {
             LOG_FIRST(4, "   HmdDesc eye%d FOV (%s): runtime L=%.4f R=%.4f U=%.4f D=%.4f "
-                         "-> given L=%.4f R=%.4f U=%.4f D=%.4f (symmetric_fov=%d)",
+                         "-> given L=%.4f R=%.4f U=%.4f D=%.4f (the cull camera's superset; the eyes are drawn by [LIVEFOV]; symmetric_fov=%d)",
                       i, src, real.LeftTan, real.RightTan, real.UpTan, real.DownTan,
                       f.LeftTan, f.RightTan, f.UpTan, f.DownTan, SymmetricFovMode());
             // How much the symmetric superset costs, so the waste is a measured
@@ -9184,7 +9231,9 @@ ovr_GetRenderDesc(ovrSession session, ovrEyeType eye, ovrFovPort fov)
     int idx = (eye == ovrEye_Right) ? 1 : 0;
 
     d.Eye = eye;
-    d.Fov = fov;
+    // [LOADBEARING: FOV-LIVE-EYE] the engine builds this eye's frustum from the Fov returned HERE (+2E5530); ovr_SubmitFrame declares the same.
+    const ovrFovPort used = EyeFovForFrame(s, idx, fov);
+    d.Fov = used;
 
     // ---- JITTER ROUTE TEST (dlss_jitter_test.txt) -------------------------
     //
@@ -9212,11 +9261,11 @@ ovr_GetRenderDesc(ovrSession session, ovrEyeType eye, ovrFovPort fov)
         // a static shift could be mistaken for a calibration error.
         const float dir = (ph & 2) ? 1.0f : -1.0f;
         const ovrSizei sz = EyeRenderSize(s, eye, 1.0f);
-        const float tanSpan = fov.LeftTan + fov.RightTan;
+        const float tanSpan = used.LeftTan + used.RightTan;
         if (sz.w > 0 && tanSpan > 0.0f) {
             const float delta = tanSpan * (kJitterTestPixels * dir) / static_cast<float>(sz.w);
-            d.Fov.LeftTan  = fov.LeftTan  + delta;
-            d.Fov.RightTan = fov.RightTan - delta;
+            d.Fov.LeftTan  = used.LeftTan  + delta;
+            d.Fov.RightTan = used.RightTan - delta;
         }
         static volatile LONG s_said = 0;
         if (InterlockedCompareExchange(&s_said, 1, 0) == 0) {
@@ -9234,8 +9283,8 @@ ovr_GetRenderDesc(ovrSession session, ovrEyeType eye, ovrFovPort fov)
     d.DistortedViewport.Pos.y = 0;
     d.DistortedViewport.Size = eyeSize;
 
-    float tanH = fov.LeftTan + fov.RightTan;
-    float tanV = fov.UpTan + fov.DownTan;
+    float tanH = used.LeftTan + used.RightTan;
+    float tanV = used.UpTan + used.DownTan;
     d.PixelsPerTanAngleAtCenter.x = tanH > 0.0f ? d.DistortedViewport.Size.w / tanH : 1000.0f;
     d.PixelsPerTanAngleAtCenter.y = tanV > 0.0f ? d.DistortedViewport.Size.h / tanV : 1000.0f;
 
@@ -10542,6 +10591,8 @@ ovr_SubmitFrame(ovrSession session, long long frameIndex,
     const ovrRecti* viewport = nullptr;
     const ovrPosef* renderPose = nullptr;
     const ovrFovPort* layerFov = nullptr;  // EyeFov layers only
+    ovrFovPort usedFov[2] = {};            // what the eyes were drawn with (EyeFovForFrame), copied under the lock
+    bool fovNoted = false;                 // dlvr::eyefov::NoteSubmit ran for this submit
 
     for (unsigned int i = 0; i < layerCount && submitted == 0; ++i) {  // first usable layer wins
         const ovrLayerHeader* h = layerPtrList ? layerPtrList[i] : nullptr;
@@ -10556,6 +10607,13 @@ ovr_SubmitFrame(ovrSession session, long long frameIndex,
             viewport = l->Viewport;
             renderPose = l->RenderPose;
             layerFov = l->Fov;
+            // [LOADBEARING: FOV-LIVE-EYE] the layer's own Fov is rd3d11's one copy of the STARTUP answer (the cull camera's superset) -
+            //      the frustum this image was drawn with is the one ovr_GetRenderDesc returned. Declared must equal rendered.
+            if (dlvr::eyefov::Ready(g_liveFov)) {
+                usedFov[0] = FromTans(dlvr::eyefov::Used(g_liveFov, 0));
+                usedFov[1] = FromTans(dlvr::eyefov::Used(g_liveFov, 1));
+                layerFov = usedFov;
+            }
         } else if (h->Type == ovrLayerType_EyeMatrix) {
             auto* l = reinterpret_cast<const ovrLayerEyeMatrix*>(h);
             colorTex = l->ColorTexture;
@@ -10646,7 +10704,7 @@ ovr_SubmitFrame(ovrSession session, long long frameIndex,
             }
         }
         if (layerFov) {
-            LOG_FIRST(3, "   game Fov[0]=(L%.3f R%.3f U%.3f D%.3f) Fov[1]=(L%.3f R%.3f U%.3f D%.3f)",
+            LOG_FIRST(3, "   game Fov[0]=(L%.3f R%.3f U%.3f D%.3f) Fov[1]=(L%.3f R%.3f U%.3f D%.3f) (as drawn)",
                       layerFov[0].LeftTan, layerFov[0].RightTan, layerFov[0].UpTan,
                       layerFov[0].DownTan, layerFov[1].LeftTan, layerFov[1].RightTan,
                       layerFov[1].UpTan, layerFov[1].DownTan);
@@ -11255,9 +11313,17 @@ ovr_SubmitFrame(ovrSession session, long long frameIndex,
         // [LOADBEARING: LOADSCREEN-VOID] while the engine draws its background path (loading screens) the game image is NOT
         //      submitted: declared at the head's own pose it sits stuck to the face at ~32 fps (Jay 2026-10-20, motion
         //      sickness reports). Removing this test puts the face-locked picture and the stale menu border back.
-        if (!::dlvr::CalibScreenVoid() && !::dlvr::loadscreen::SkipProjection(::dlvr::CalibScreenVoid())) {
+        // [LOADBEARING: FOV-LIVE-EYE] the flicker guard: after the FOV switch the game image stays off the display for kHoldSubmits more
+        //      submits (frames recorded before it), and the switch itself asks whether the last submit showed one (eyefov_logic.h).
+        const bool wouldShow = !::dlvr::CalibScreenVoid() && !::dlvr::loadscreen::SkipProjection(::dlvr::CalibScreenVoid());
+        const bool mayShow = fovNoted ? (wouldShow && !g_liveFov.lastHidden) : dlvr::eyefov::NoteSubmit(g_liveFov, wouldShow);
+        fovNoted = true;
+        if (mayShow) {
             layers[submitted++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&proj);
         }
+    }
+    if (!fovNoted) {
+        dlvr::eyefov::NoteSubmit(g_liveFov, false);   // no game image this submit
     }
 
     // Calibration screen, build B: the once-per-launch auto-open, the void flag (read by the NEXT submit's projection

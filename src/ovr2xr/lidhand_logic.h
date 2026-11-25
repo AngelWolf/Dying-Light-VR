@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cmath>
+#include <cstdint>
 
 namespace dlvr {
 namespace lidhand {
@@ -411,6 +412,38 @@ inline int InvDeltaMatch(const void* const* bp, const int* bc, int bn, const voi
         if (ac[i] > was) { *count = ac[i] - was; return i; }
     }
     return -1;
+}
+
+// ---- THE INSTANCE CHECK (trace docs/traces/20261125_1610_lidhand_instance_check_v2.md; ENGINE_ARCHITECTURE "Game-object LIFETIME") ----
+// A container is DELETED when no reference object is within 11 m (or none exists - the PlayerDI is replaced at a sleep), and a new one
+// can be built into the freed block at the SAME address. So a remembered address is checked against the object itself every tick:
+// its id (IGSObject::GetID) and its destroying / destroyed flags (set by the delete before the free, INV-663 addendum).
+enum class SlotVerdict { Unanswered, Keep, Rekey, Drop };
+// storedOk / storedId: the id the slot was made with; readOk / idNow / dying: read from the object now (dying = IsDestroying ||
+// IsDestroyed); rekey: this tick's stamp says the level's ids were renumbered (StampChange == Rekey). Unanswered = the read faulted ->
+// the caller keeps today's behaviour for this slot.
+inline SlotVerdict CheckSlot(bool storedOk, int storedId, bool readOk, int idNow, bool dying, bool rekey)
+{
+    if (!readOk) { return SlotVerdict::Unanswered; }
+    if (dying) { return SlotVerdict::Drop; }
+    if (!storedOk || rekey) { return SlotVerdict::Rekey; }
+    return idNow == storedId ? SlotVerdict::Keep : SlotVerdict::Drop;
+}
+
+// The level / id-counter stamp (record+72 = the level, level+3452 = its next id; engine e9fbfc2c). level 0 = not read. Another level ->
+// Flush; the counter going DOWN on the same level (the renumber CLevel +2AC350 / a new level object) -> Rekey; rising = new objects.
+enum class StampVerdict { None, Rekey, Flush };
+inline StampVerdict StampChange(uintptr_t prevLevel, int prevNext, uintptr_t level, int next)
+{
+    if (!prevLevel || !level) { return StampVerdict::None; }
+    if (level != prevLevel) { return StampVerdict::Flush; }
+    return next < prevNext ? StampVerdict::Rekey : StampVerdict::None;
+}
+
+// The HUD thread's identity-cache hit: stale only when BOTH ids read and differ (an entry or a read without an id = today's behaviour).
+inline bool CacheHitStale(bool cachedOk, int cachedId, bool liveOk, int liveId)
+{
+    return cachedOk && liveOk && cachedId != liveId;
 }
 
 }  // namespace lidhand
