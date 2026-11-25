@@ -428,6 +428,83 @@ inline FacingWhy FacingStepV2(Facing& f, const Vec3& neck, const Vec3& l, const 
     return why;
 }
 
+// ===== ROOMSCALE PHYSICAL-TURN FACING (Added by AngelWolf 2026-11-24: zero deadband, smooth continuous follow) =====
+inline FacingWhy FacingStepRoomscale(
+    Facing& f, const Vec3& neck, const Vec3& l, const Vec3& r,
+    bool lOk, bool rOk, float headYaw, float headPitch,
+    bool zoneFreeze, bool otherFreeze, double nowS, float dtS)
+{
+    if (!f.have) {
+        f.have = true;
+        f.yaw = headYaw;
+        f.steadyRef = headYaw;
+        f.steadySince = nowS;
+    }
+
+    // Freeze only while placing a holster by hand, when a hand is inside a zone (grabbing/holstering),
+    // or when looking straight down at your belt within 70 deg of current facing.
+    const float off = std::fabs(WrapPi(headYaw - f.yaw));
+    const bool lookDownHold = (headPitch < -kPitchFreezeR) && (off <= kLookDownLimitR);
+    if (otherFreeze || zoneFreeze || lookDownHold) {
+        return FacingWhy::Frozen;
+    }
+
+    float targetYaw = headYaw;
+    FacingWhy why = FacingWhy::Drift;
+
+    if (lOk && rOk) {
+        const float dx = r.x - l.x;
+        const float dz = r.z - l.z;
+        const float handSpan = std::sqrt(dx * dx + dz * dz);
+
+        // Smoothly fade hand-line influence between 22 cm and 34 cm span so bringing hands together never snaps
+        float spanWeight = (handSpan - 0.22f) / 0.12f;
+        if (spanWeight < 0.0f) { spanWeight = 0.0f; }
+        if (spanWeight > 1.0f) { spanWeight = 1.0f; }
+
+        if (spanWeight > 0.0f) {
+            const float handsYaw = HandLineYaw(l, r);
+            const float yawDelta = WrapPi(handsYaw - headYaw);
+
+            // Height weight: 1.0 when hands hang >= 45 cm below neck, fading to 0.0 at 15 cm below neck
+            const float avgHandY = 0.5f * (l.y + r.y);
+            const float dropFromNeck = neck.y - avgHandY;
+            float heightWeight = (dropFromNeck - 0.15f) / 0.30f;
+            if (heightWeight < 0.0f) { heightWeight = 0.0f; }
+            if (heightWeight > 1.0f) { heightWeight = 1.0f; }
+
+            // Angle weight: ignore hand line if hands are crossed or reaching > 75 deg across body
+            constexpr float kMaxNeckTurnR = 75.0f * 0.0174532925f;
+            float angleWeight = 1.0f - (std::fabs(yawDelta) / kMaxNeckTurnR);
+            if (angleWeight < 0.0f) { angleWeight = 0.0f; }
+
+            const float blend = 0.70f * spanWeight * heightWeight * angleWeight;
+            if (blend > 0.001f) {
+                targetYaw = WrapPi(headYaw + yawDelta * blend);
+                why = FacingWhy::Rest;
+            }
+        }
+    }
+
+    // Fast continuous exponential follow (45 ms time constant): keeps up with physical turns in real time
+    // while smoothing out single-frame jumps when exiting zoneFreeze, lookDownHold, or hand-span thresholds.
+    constexpr float kRoomscaleTauS = 0.045f;
+    const float dt = dtS > 0.0f ? dtS : 0.0f;
+    const float alpha = dt > 0.0f ? (1.0f - std::exp(-dt / kRoomscaleTauS)) : 1.0f;
+    f.yaw = WrapPi(f.yaw + alpha * WrapPi(targetYaw - f.yaw));
+
+    f.following = false;
+    f.outsideSince = -1.0;
+    f.farSince = -1.0;
+
+    if (std::fabs(WrapPi(f.yaw - f.steadyRef)) > kSteadyR) {
+        f.steadyRef = f.yaw;
+        f.steadySince = nowS;
+    }
+
+    return why;
+}
+
 // THE POSTURE (v2.1): STANDING once the eye has been above kStandEyeM for kPostureHoldS; SEATED once below kSeatEyeM for kPostureHoldS
 // (the gap and the hold stop it flickering; a crouch only switches the held turn off while it lasts). No floor -> SEATED (the safe
 // side: exactly the f365b5c0 facing). Eye height above the runtime's STAGE floor, metres.
@@ -516,16 +593,21 @@ struct HipPoint {
     float ref = 0.0f;             // the standing neck height, reference frame
 };
 
-inline Vec3 HipStep(HipPoint& h, const Vec3& neck, float facingYaw, float dtS)
+inline Vec3 HipStep(HipPoint& h, const Vec3& neck, float facingYaw, float dtS, bool standing = false)
 {
     if (!h.have) {
         h.have = true;
         h.px = neck.x; h.pz = neck.z; h.ref = neck.y;
     }
     if (neck.y > h.ref) { h.ref = neck.y; }
+
+    // Modified by AngelWolf 2026-11-24: tighter hip tracking when standing; preserve original behavior when seated
+    const float catchTauS = standing ? 0.02f : kHipCatchTauS;
+    const float counterSide = standing ? 0.15f : kHipCounterSide;
+
     const float dt = dtS > 0.0f ? dtS : 0.0f;
     if (h.ref - neck.y <= kHipDipTolM && dt > 0.0f) {
-        const float a = 1.0f - std::exp(-dt / kHipCatchTauS);
+        const float a = 1.0f - std::exp(-dt / catchTauS);
         h.px += (neck.x - h.px) * a;
         h.pz += (neck.z - h.pz) * a;
     }
@@ -549,7 +631,7 @@ inline Vec3 HipStep(HipPoint& h, const Vec3& neck, float facingYaw, float dtS)
     const float dip = kHipTorsoM - std::sqrt(kHipTorsoM * kHipTorsoM - dc * dc);
     float resid = (h.ref - neck.y) - dip;
     if (resid < 0.0f) { resid = 0.0f; }
-    const Vec3 hw = ToWorldYaw({ -kHipCounterSide * lb.x, 0.0f, -kHipCounterFwd * lb.z + kHipSquatBack * resid }, facingYaw);
+    const Vec3 hw = ToWorldYaw({ -counterSide * lb.x, 0.0f, -kHipCounterFwd * lb.z + kHipSquatBack * resid }, facingYaw);
     return { h.px + hw.x, h.ref - kHipSquatDrop * resid, h.pz + hw.z };
 }
 

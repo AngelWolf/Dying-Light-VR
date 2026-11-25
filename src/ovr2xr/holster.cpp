@@ -752,8 +752,11 @@ void BodyFrameUpdate()
         }
     }
     const bool wasFollowing = b.facing.following;
-    b.lastWhy = holster::FacingStepV2(b.facing, neck, l, r, lOk, rOk, headYaw, headPitch, zoneFreeze, g_placing != 0, squeezed, now,
-        dt, b.posture.standing, CalibPosture == 0);
+    // Modified by AngelWolf 2026-11-24: use zero-deadband smooth roomscale facing when standing
+    b.lastWhy = (b.posture.standing && CalibPosture == 0)
+        ? holster::FacingStepRoomscale(b.facing, neck, l, r, lOk, rOk, headYaw, headPitch, zoneFreeze, g_placing != 0, now, dt)
+        : holster::FacingStepV2(b.facing, neck, l, r, lOk, rOk, headYaw, headPitch, zoneFreeze, g_placing != 0, squeezed, now,
+            dt, b.posture.standing, CalibPosture == 0);
     if (b.facing.following && !wasFollowing) {
         const bool byHands = b.facing.lastConfirmed;
         if (!byHands) { ++b.heldFollows; }
@@ -791,7 +794,9 @@ void BodyFrameUpdate()
             const holster::Vec3 neckRef{ nw.x + base[0], nw.y + base[1], nw.z + base[2] };
             const bool hadHip = b.hip.have;   // SAT DOWN only for a hip point that existed before this step (a restart is not a sit)
             const float refBefore = hadHip ? b.hip.ref : 0.0f;
-            const holster::Vec3 aRef = holster::HipStep(b.hip, neckRef, holster::WrapPi(b.facing.yaw + by), dt);
+            // Modified by AngelWolf 2026-11-24: pass standing posture so seated hip tracking stays unchanged
+            const holster::Vec3 aRef = holster::HipStep(b.hip, neckRef, holster::WrapPi(b.facing.yaw + by), dt,
+                b.posture.standing && CalibPosture == 0);
             b.hipAnchor = holster::LocalOffsetYaw({ base[0], base[1], base[2] }, by, aRef);
             b.hipAnchorOk = true;
             b.anchor[kZoneRHip] = b.hipAnchor;
