@@ -448,6 +448,60 @@ static void TestFreeLift()
     Check(!lh::FreeLiftOpens(rest, rest), "no movement goes back on");
 }
 
+// (p) trace 20261125_1610 v2 - the INSTANCE CHECK of a remembered lid slot, read from the object itself (GetID / IsDestroying /
+//     IsDestroyed). The tester's sleep (evidence/tester_20261124_223836_lidhand): containers deleted while the PlayerDI was replaced,
+//     a new one built into a freed block at the same address -> the slot must be DROPPED, never kept. deliberateMiss: a different id
+//     where Keep is expected must not give Keep.
+static void TestCheckSlot(bool deliberateMiss)
+{
+    using V = lh::SlotVerdict;
+    if (deliberateMiss) {
+        Check(lh::CheckSlot(true, 41, true, 42, false, false) != V::Keep, "deliberate miss: another id must not be kept");
+        return;
+    }
+    Check(lh::CheckSlot(true, 41, false, 0, false, false) == V::Unanswered, "a read that faulted -> no verdict (today's behaviour)");
+    Check(lh::CheckSlot(true, 41, true, 41, true, false) == V::Drop, "the same id but destroying / destroyed -> drop");
+    Check(lh::CheckSlot(true, 41, true, 41, true, true) == V::Drop, "dying wins over a rekey");
+    Check(lh::CheckSlot(false, -1, true, 57, false, false) == V::Rekey, "no stored id yet, live -> adopt");
+    Check(lh::CheckSlot(true, 41, true, 9, false, true) == V::Rekey, "a renumber on the same level, live -> adopt the new id");
+    Check(lh::CheckSlot(true, 41, true, 41, false, false) == V::Keep, "the same id, live -> keep");
+    Check(lh::CheckSlot(true, 41, true, 42, false, false) == V::Drop, "another id at the same address -> drop (a new object)");
+    Check(lh::CheckSlot(false, -1, true, 57, true, false) == V::Drop, "no stored id but dying -> drop");
+}
+
+// (q) the level / id-counter stamp (record+72 = level, level+3452 = the next id): a different level = flush, the counter going DOWN on
+//     the same level = a renumber (CLevel +2AC350) = rekey. deliberateMiss: a drop on the same level must not read as "nothing".
+static void TestStampChange(bool deliberateMiss)
+{
+    using S = lh::StampVerdict;
+    const uintptr_t A = 0x1000, B = 0x2000;
+    if (deliberateMiss) {
+        Check(lh::StampChange(A, 900, A, 12) != S::None, "deliberate miss: the counter going down must not be ignored");
+        return;
+    }
+    Check(lh::StampChange(0, 0, A, 900) == S::None, "no previous stamp -> nothing to compare");
+    Check(lh::StampChange(A, 900, 0, 0) == S::None, "this stamp did not read -> nothing decided");
+    Check(lh::StampChange(A, 900, A, 900) == S::None, "unchanged");
+    Check(lh::StampChange(A, 900, A, 951) == S::None, "the counter rising (new objects) -> nothing");
+    Check(lh::StampChange(A, 900, A, 12) == S::Rekey, "the counter going down on the same level -> rekey");
+    Check(lh::StampChange(A, 900, B, 900) == S::Flush, "another level -> flush");
+    Check(lh::StampChange(A, 900, B, 3) == S::Flush, "another level wins over the counter");
+}
+
+// (r) the HUD thread's identity-cache hit: the live candidate's id vs the id the entry was made with. deliberateMiss: two different
+//     ids must read as stale.
+static void TestCacheHitStale(bool deliberateMiss)
+{
+    if (deliberateMiss) {
+        Check(lh::CacheHitStale(true, 41, true, 42), "deliberate miss: a different id must be stale");
+        return;
+    }
+    Check(lh::CacheHitStale(true, 41, true, 42), "a different id -> stale");
+    Check(!lh::CacheHitStale(true, 41, true, 41), "the same id -> not stale");
+    Check(!lh::CacheHitStale(false, -1, true, 41), "an entry without an id -> not stale (today's behaviour)");
+    Check(!lh::CacheHitStale(true, 41, false, 0), "the live id did not read -> not stale (today's behaviour)");
+}
+
 int main()
 {
     TestFreeLift();
@@ -493,6 +547,12 @@ int main()
     TestInvDeltaMatch(false);
     TestInvDeltaMatch(true);
     TestPoseFind();
+    TestCheckSlot(false);
+    TestCheckSlot(true);
+    TestStampChange(false);
+    TestStampChange(true);
+    TestCacheHitStale(false);
+    TestCacheHitStale(true);
     std::printf("lidhand_logic_test: %d failure(s)\n", g_fail);
     return g_fail;
 }

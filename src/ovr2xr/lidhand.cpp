@@ -152,6 +152,11 @@ constexpr size_t    kStateOff = 824;           // PersistentTriggerObjectDI stat
 constexpr size_t    kItemOwnerOff = 1016;      // ContainerItem -> its ComplexContainer (CreateItem +A6E720 writes it, §12e)
 constexpr size_t    kActionSlotOff = 1432;     // vfunc: the trigger's action for a use info (ContainerItem +A69FD0: 1 or 23)
 constexpr size_t    kCtlObjOff = 24;           // IControlObject (INV-402)
+// IGSObject: ComplexContainer +0x28 (OUR gamedll 97046bba RTTI hierarchy, ida/ccr11_out.txt: GameObject / IGSObject at mdisp 40) - the
+// same +40 as PlayerDI (handcarry.cpp kGsoOff). Its record = *(IGSObject+32): record+72 = the level, record+80 = the id (INV-663);
+// level+3452 = the level's next id (engine e9fbfc2c AssignNewID +252090 / SetLevel +1347D0). Trace 20261125_1610 v2.
+constexpr size_t    kGsoOff = 40;
+constexpr size_t    kRecLevelOff = 72, kLevelNextIdOff = 3452;
 constexpr int       kStateOpened = 1, kStateClosed = 2, kStateLocked = 10;
 constexpr float     kGrip = 0.5f;              // ovr2xr.cpp's vr_grip threshold
 constexpr int       kMaxPub = 16;
@@ -262,6 +267,14 @@ DropItemFn      g_dropItem = nullptr;    // null = its head bytes do not match (
 SetXformFn      g_setXform = nullptr;    // null = the dropped item stays where the game's drop put it (named at READY)
 volatile LONG   g_ready = 0;      // 0 not tried, 1 ready, -1 refused (named once)
 void* volatile  g_player = nullptr;   // the PlayerDI NearbyHook was called with (the execute's actor)
+// THE INSTANCE CHECK (trace 20261125_1610 v2): the object's own id and its destroying / destroyed flags. Engine exports (dumpbin
+// e9fbfc2c): GetID +252080 = *(*(this+32)+80); IsDestroying +252250; IsDestroyed +252280 - the delete +2384D0 sets the first before
+// the second, both before the free (INV-663 addendum). Any null = the check is OFF (named at READY), remembered lids trusted as before.
+using ObjIdFn = int(__fastcall*)(const void* gso);
+using ObjFlagFn = bool(__fastcall*)(const void* gso);
+ObjIdFn         g_objId = nullptr;
+ObjFlagFn       g_objDying = nullptr, g_objDead = nullptr;
+volatile LONG   g_nStaleSlot = 0, g_nStaleId = 0;   // run totals: slots dropped (game thread), cache entries dropped (HUD thread)
 
 // ---- published by LidHandOnNearby (HUD) -> LidHandTick (game) ----
 volatile LONG g_pubSeq = 0;
@@ -280,7 +293,9 @@ float g_pubLootBox[kMaxPub][6] = {};
 // identity cache (HUD thread only): object -> its doors' rows / bones (n = 0: not a lid), checked once per object pointer. A 2-door
 // object (wardrobe / cabinet, trace 20261121_1549) = two rows of the same mesh, each its own lid. loot = a grip-loot mesh (a purse).
 constexpr int kMaxDoors = 2;
-struct IdCache { void* obj; int n; int row[kMaxDoors]; int bone[kMaxDoors]; bool loot; };
+// gid / gidOk (trace 20261125_1610 v2): the object's IGSObject id when the entry was made - a later hit on the same address with another
+// live id is a different object built into a freed block, and is identified afresh.
+struct IdCache { void* obj; int n; int row[kMaxDoors]; int bone[kMaxDoors]; bool loot; int gid; bool gidOk; };
 IdCache g_idc[64] = {};
 int     g_idcNext = 0;
 
@@ -299,6 +314,9 @@ struct LidState {
     // a 2-door object's door after that object's game open (trace 20261121_1549, Jay: the other door "Stays shut"): written every tick
     // even at rest, so the game's jumped open pose never shows on a door the hand did not open
     bool  hold = false;
+    // the object's IGSObject id this slot belongs to (trace 20261125_1610 v2) - checked against the object itself every tick
+    int   gid = -1;
+    bool  gidOk = false;
 };
 LidState g_lids[kMaxLids];
 struct HandState {
@@ -351,6 +369,34 @@ bool ReadI32(uintptr_t a, int* out)
 {
     __try { *out = *reinterpret_cast<const int*>(a); return true; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// THE INSTANCE CHECK (trace 20261125_1610 v2): obj's IGSObject id and whether it is being / has been destroyed, read from obj itself
+// (it may be a freed block - the same SEH-guarded exposure IsVt already has every tick). False = the check is off or a read faulted.
+// COST: three export calls (2-3 reads each).
+bool ObjIdentity(void* obj, int* id, bool* dying)
+{
+    if (!obj || !g_objId || !g_objDying || !g_objDead) { return false; }
+    __try {
+        const void* g = static_cast<const char*>(obj) + kGsoOff;
+        *id = g_objId(g);
+        *dying = g_objDying(g) || g_objDead(g);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// The level and its next id through a PLAYER's IGSObject record (player+40 -> +32 record, +72 level, level+3452). False = not read.
+// COST: three guarded reads.
+bool LevelStamp(void* player, uintptr_t* level, int* next)
+{
+    uintptr_t rec = 0, lv = 0;
+    int n = 0;
+    if (!player || !ReadPtr(reinterpret_cast<uintptr_t>(player) + kGsoOff + 32, &rec) || !rec || !ReadPtr(rec + kRecLevelOff, &lv) ||
+        !lv || !ReadI32(lv + kLevelNextIdOff, &n)) {
+        return false;
+    }
+    *level = lv;
+    *next = n;
+    return true;
 }
 bool SafeBox(void* obj, float out[6])
 {
@@ -746,6 +792,11 @@ bool Ready()
                        : "*** OFF - its code does not match the Steam bytes (EGL has no row): a let-go chest / placed item goes home ***",
             g_setXform ? "found" : "*** MISSING - a dropped item stays where the game's drop puts it ***");
     }
+    // THE INSTANCE CHECK's exports (trace 20261125_1610 v2) - written BEFORE g_ready = 1, read only after it. NOT in `missing`: without
+    // them the check is OFF and remembered lids are trusted by address as before (named on the INSTANCE CHECK line below).
+    g_objId = reinterpret_cast<ObjIdFn>(GetProcAddress(en, "?GetID@IGSObject@@QEBAHXZ"));
+    g_objDying = reinterpret_cast<ObjFlagFn>(GetProcAddress(en, "?IsDestroying@IGSObject@@QEBA_NXZ"));
+    g_objDead = reinterpret_cast<ObjFlagFn>(GetProcAddress(en, "?IsDestroyed@IGSObject@@QEBA_NXZ"));
     InterlockedExchange(&g_ready, 1);
     // [PROBE: LIDHAND] gate=lid_by_hand  site=FLAT  log-only=no
     LOG("lidhand: [LIDHAND] READY - ComplexContainer vt +%llX (want +165A950 Steam), ContainerItem vt +%llX (want +165BA58), execute "
@@ -761,20 +812,46 @@ bool Ready()
                    : "OFF - IControlObject::PhysicsBind not exported by this engine: the item keeps its own category (may crouch)",
         (g_setWorld && g_elemNum) ? "ON (the carried item follows the DRAWN hand's grip socket each tick, like the weapons)"
                                   : "OFF - SetElementWorldMatrix / GetElementsNumber not exported: the item rides the animation's holder");
+    {
+        const uintptr_t enb = reinterpret_cast<uintptr_t>(en);
+        auto er = [enb](const void* p) { return static_cast<unsigned long long>(p ? reinterpret_cast<uintptr_t>(p) - enb : 0); };
+        // [PROBE: LIDHAND] gate=lid_by_hand  site=FLAT  log-only=no
+        LOG("lidhand: [LIDHAND] INSTANCE CHECK (logged unconditionally) - %s | GetID +%llX (want +252080), IsDestroying +%llX (want "
+            "+252250), IsDestroyed +%llX (want +252280) [0 = not exported]",
+            (g_objId && g_objDying && g_objDead)
+                ? "ON - every remembered lid is checked against the object itself each tick (its id + destroying / destroyed flags); a "
+                  "container rebuilt at the same address is identified afresh (trace 20261125_1610)"
+                : "*** OFF - an export is missing: remembered lids are trusted by address, as before ***",
+            er(reinterpret_cast<const void*>(g_objId)), er(reinterpret_cast<const void*>(g_objDying)),
+            er(reinterpret_cast<const void*>(g_objDead)));
+    }
     return true;
 }
 
 // HUD thread: is `obj` a lid container? -> its doors' rows + bones (the count returned; 0 = not a lid), cached per object pointer.
 // Hinge rows first, then CLIP rows (trace 20261121_2145). *loot = a grip-loot mesh (a purse) with no row.
-int LidIdentity(void* obj, int* rows, int* bones, bool* loot)
+// gid / gidOk = obj's IGSObject id read NOW (it is live: the game's gather just returned it, this call) - trace 20261125_1610 v2.
+int LidIdentity(void* obj, int* rows, int* bones, bool* loot, int gid, bool gidOk)
 {
     *loot = false;
-    for (const IdCache& c : g_idc) {
-        if (c.obj == obj) {
-            for (int d = 0; d < c.n; ++d) { rows[d] = c.row[d]; bones[d] = c.bone[d]; }
-            *loot = c.loot;
-            return c.n;
+    for (IdCache& c : g_idc) {
+        if (c.obj != obj) { continue; }
+        if (lh::CacheHitStale(c.gidOk, c.gid, gidOk, gid)) {
+            // THE TESTER's SLEEP (evidence/tester_20261124_223836_lidhand): a different container built into a freed block at the same
+            // address - its rows / bones must come from ITS mesh, not from the object that lived here before.
+            const LONG n = InterlockedIncrement(&g_nStaleId);
+            if (n <= 16) {
+                // [PROBE: LIDHAND] gate=lid_by_hand  site=HEADSET  log-only=no
+                LOG("lidhand: [LIDHAND] STALE IDENTITY - object %p: cached as %s (id %d), the live object here has id %d -> identified "
+                    "afresh from its own mesh (%ld of 16 logged)", obj, c.n > 0 ? RowObject(c.row[0]) : c.loot ? "a grip-loot mesh"
+                    : "not a lid", c.gid, gid, n);
+            }
+            c = IdCache{};
+            break;
         }
+        for (int d = 0; d < c.n; ++d) { rows[d] = c.row[d]; bones[d] = c.bone[d]; }
+        *loot = c.loot;
+        return c.n;
     }
     char mesh[96] = {};
     int r = -1, b = -1;   // the FIRST door found (the logs below name it, as before)
@@ -841,7 +918,7 @@ int LidIdentity(void* obj, int* rows, int* bones, bool* loot)
                 haveName ? mesh : "(name not read)", base, s_nSaid);
         }
     }
-    g_idc[g_idcNext] = { obj, nd, { drow[0], drow[1] }, { dbone[0], dbone[1] }, isLoot };
+    g_idc[g_idcNext] = { obj, nd, { drow[0], drow[1] }, { dbone[0], dbone[1] }, isLoot, gid, gidOk };
     g_idcNext = (g_idcNext + 1) % static_cast<int>(sizeof(g_idc) / sizeof(g_idc[0]));
     for (int d = 0; d < nd; ++d) {
         static LONG s_saidRow[kRows + kClipRows] = {};
@@ -909,6 +986,11 @@ int NewLidSlot(void* obj, int row, int bone)
             if (g_hand[0].lid == k || g_hand[1].lid == k) { continue; }
             g_lids[k] = LidState{};
             g_lids[k].obj = obj; g_lids[k].row = row; g_lids[k].bone = bone;
+            // its id (trace 20261125_1610 v2) - obj comes from this tick's snapshot of the game's gather, so it is the live object;
+            // a dying one is not given an id (the next tick's check drops it)
+            int id = -1;
+            bool dying = false;
+            if (ObjIdentity(obj, &id, &dying) && !dying) { g_lids[k].gid = id; g_lids[k].gidOk = true; }
             return k;
         }
     }
@@ -1287,6 +1369,30 @@ bool LidHandOnNearby(void* player, void* const* gameData, unsigned gameCount, vo
     if (promptOut) { *promptOut = nullptr; }
     if (!LidByHand || !Ready() || !player) { return false; }
     g_player = player;
+    // THE STAMP, HUD side (trace 20261125_1610 v2): another level, or the level's next id going down (a renumber) -> every cached identity
+    // is made again (one GetMeshName + row match each, as at session start). `player` is the live PlayerDI the game passed this call.
+    {
+        static uintptr_t s_level = 0;
+        static int s_next = 0;
+        uintptr_t lv = 0;
+        int nx = 0;
+        if (g_objId && LevelStamp(player, &lv, &nx)) {
+            const lh::StampVerdict v = lh::StampChange(s_level, s_next, lv, nx);
+            if (v != lh::StampVerdict::None) {
+                for (IdCache& c : g_idc) { c = IdCache{}; }
+                g_idcNext = 0;
+                static LONG s_said = 0;
+                if (InterlockedIncrement(&s_said) <= 8) {
+                    // [PROBE: LIDHAND] gate=lid_by_hand  site=HEADSET  log-only=no
+                    LOG("lidhand: [LIDHAND] ID STAMP (HUD) - %s (level %p -> %p, next id %d -> %d): the identity cache is cleared (%ld of 8 "
+                        "logged)", v == lh::StampVerdict::Flush ? "another level" : "the level's ids were renumbered (next id went down)",
+                        reinterpret_cast<void*>(s_level), reinterpret_cast<void*>(lv), s_next, nx, s_said);
+                }
+            }
+            s_level = lv;
+            s_next = nx;
+        }
+    }
     void* lids[kMaxPub]; int rows[kMaxPub]; int bones[kMaxPub]; float lbox[kMaxPub][6];
     void* items[kMaxPub]; float ibox[kMaxPub][6]; int ikind[kMaxPub];
     void* loots[kMaxPub]; float lootBox[kMaxPub][6];
@@ -1310,7 +1416,10 @@ bool LidHandOnNearby(void* player, void* const* gameData, unsigned gameCount, vo
             // one published entry PER DOOR (trace 20261121_1549): same object + box, its own row / bone
             int dr[kMaxDoors], db[kMaxDoors];
             bool isLoot = false;
-            const int nd = LidIdentity(obj, dr, db, &isLoot);
+            int gid = -1;
+            bool dyingNow = false;
+            const bool gidOk = ObjIdentity(obj, &gid, &dyingNow);   // obj is live: the game's gather returned it this call
+            const int nd = LidIdentity(obj, dr, db, &isLoot, gid, gidOk);
             float box[6];
             if (nd > 0 && SafeBox(obj, box)) {
                 for (int d = 0; d < nd && nl < kMaxPub; ++d) {
@@ -1399,6 +1508,80 @@ void LidHandTick()
     }
     Snapshot s;
     const bool haveSnap = ReadSnapshot(s);
+    // THE INSTANCE CHECK (trace 20261125_1610 v2) - before ANY use of a remembered slot this tick. A container is deleted when no reference
+    // object is within 11 m (or none exists: the PlayerDI is replaced at a sleep / an outfit change) and a new one can be built into the
+    // freed block at the same address (ENGINE_ARCHITECTURE "Game-object LIFETIME"). Serial with those deletes: both run in CLevel::Frame's
+    // post-update loop (LevelDI slot 129 / our HookTail). COST: one stamp (3 reads) + three export calls per slot with an object.
+    {
+        auto letGo = [](int k, const char* why) {
+            for (int side = 0; side < 2; ++side) {
+                HandState& H = g_hand[side];
+                if (H.lid != k) { continue; }
+                H.lid = -1;    // FreeRelease is NOT called: it reads and writes the object, which may be gone
+                H.free = false;
+                // [PROBE: LIDHAND] gate=lid_by_hand  site=HEADSET  log-only=no
+                LOG("lidhand: [LIDHAND] RELEASE %s hand's lid %s - %s (the instance check; nothing written to it)", kSideName[side],
+                    RowObject(g_lids[k].row), why);
+            }
+        };
+        static uintptr_t s_level = 0;
+        static int s_next = 0;
+        bool rekey = false;
+        uintptr_t lv = 0;
+        int nx = 0;
+        // the PlayerDI (the rig's captured model IS it: roomscale.cpp:5's PlayerDI == the rig's model in the tester's log); null while the
+        // game replaces the player - the stamp is then simply not read this tick
+        void* const pl = const_cast<void*>(BoneProbeCapturedModel());
+        // No stamp this tick (no player) -> no rekey: a changed id is then dropped. Deliberate - deferring it would keep writing into
+        // what may be a different object (the defect this fixes); the cost is a renumber inside a player swap dropping live lids once.
+        if (g_objId && pl && LevelStamp(pl, &lv, &nx)) {
+            const lh::StampVerdict v = lh::StampChange(s_level, s_next, lv, nx);
+            if (v != lh::StampVerdict::None) {
+                static LONG s_said = 0;
+                if (InterlockedIncrement(&s_said) <= 8) {
+                    // [PROBE: LIDHAND] gate=lid_by_hand  site=HEADSET  log-only=no
+                    LOG("lidhand: [LIDHAND] ID STAMP (tick) - %s (level %p -> %p, next id %d -> %d): %s (%ld of 8 logged)",
+                        v == lh::StampVerdict::Flush ? "another level" : "the level's ids were renumbered (next id went down)",
+                        reinterpret_cast<void*>(s_level), reinterpret_cast<void*>(lv), s_next, nx,
+                        v == lh::StampVerdict::Flush ? "every remembered lid is forgotten" : "every live lid adopts its new id", s_said);
+                }
+            }
+            if (v == lh::StampVerdict::Flush) {
+                for (int k = 0; k < kMaxLids; ++k) {
+                    if (!g_lids[k].obj) { continue; }
+                    letGo(k, "another level");
+                    g_lids[k] = LidState{};
+                }
+            }
+            rekey = v == lh::StampVerdict::Rekey;
+            s_level = lv;
+            s_next = nx;
+        }
+        for (int k = 0; k < kMaxLids; ++k) {
+            LidState& L = g_lids[k];
+            if (!L.obj) { continue; }
+            int idNow = -1;
+            bool dying = false;
+            const bool readOk = ObjIdentity(L.obj, &idNow, &dying);
+            const lh::SlotVerdict v = lh::CheckSlot(L.gidOk, L.gid, readOk, idNow, dying, rekey);
+            if (v == lh::SlotVerdict::Rekey) {
+                L.gid = idNow;
+                L.gidOk = true;
+            } else if (v == lh::SlotVerdict::Drop) {
+                const LONG n = InterlockedIncrement(&g_nStaleSlot);
+                const bool owned = g_hand[0].lid == k || g_hand[1].lid == k;
+                if (n <= 16) {
+                    // [PROBE: LIDHAND] gate=lid_by_hand  site=HEADSET  log-only=no
+                    LOG("lidhand: [LIDHAND] STALE LID SLOT - %s %p: %s (slot id %d, object id now %d)%s - forgotten, nothing written to it "
+                        "(%ld of 16 logged)", RowObject(L.row), L.obj,
+                        dying ? "the object is being / has been destroyed" : "a DIFFERENT object lives at this address now",
+                        L.gidOk ? L.gid : -1, idNow, owned ? " | a hand held it - it lets go" : "", n);
+                }
+                letGo(k, dying ? "the container is being destroyed" : "a different container lives at its address now");
+                L = LidState{};
+            }
+        }
+    }
     // THE HELD DOORS (trace 20261121_1631, Jay CL1b: "after opening it I'm unable to open the other"): an OPENED container leaves the
     // game's gathered triggers, so none of its doors is published. A 2-door object's doors carry `hold` after its open - they join this
     // tick's local list (never g_pub*) while the object is still a ComplexContainer, so a hand can grab them. 1-door lids never get hold.

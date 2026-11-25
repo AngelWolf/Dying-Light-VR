@@ -5,6 +5,7 @@
 #include "vsclass.h"
 #include "../common/shaderbin.h"
 #include "vpstore_logic.h"   // fix A's slot-2 buffer table (evicts least recently bound - 2026-10-20)
+#include "stubpool_logic.h"  // the near block for rd3d11's call-site stubs (INV-777, 2026-11-25)
 #include "fmtbytes_logic.h"  // bytes per pixel - the panel capture refuses an 8-byte (RIFT float) layer, 2026-10-21
 #include "afwtarget_logic.h" // the AFW rebuild's held-eye target on an off-centre frustum (trace 20261124_1700)
 #include "../common/lenscrop_logic.h"   // the DLSS / FSR lens crop's row band (2026-11-11, docs/superpowers/plans/2026-11-11-dlss-lens-crop.md)
@@ -6804,6 +6805,56 @@ UINT             g_vpBytes      = 0;
 // inside the GBuffer pass then serves the matrix of the buffer it binds. No dependence on the Map / Unmap vtable entries, the
 // latch order, or the pass flag at map time. The vtable capture stays as a second source.
 extern volatile LONG g_cbSnaps;   // the vtable capture's count (defined with the CPU snapshot below) - reported beside ours
+
+// THE NEAR BLOCK (INV-777, 2026-11-25; trace docs/traces/20261125_1135_rd3d11_stub_pool.md). Every rd3d11 call-site patch needs a stub
+// within rel32 of rd3d11. Each used to search for its own free 64 KB when it ran: on a launch with rd3d11 loaded at a low (heap-range)
+// address the early patches got theirs and the later ones (the Unmap site, the draw sites) did not - the launch lost the wrist HUD,
+// the AFW mask and the camera-matrix store together (3 of 215 launches). One block is taken here the moment rd3d11 is mapped, before
+// the heaps grow round it, and all the stubs come out of it.
+// [LOADBEARING: STUBPOOL] every rd3d11 stub (setter sites, Unmap site, draw sites) is asked from here first; with no block, or a slot
+//      that does not reach, the caller's old search runs.
+namespace stubpool {
+volatile LONG g_state = 0;        // 0 not tried, 1 being reserved, 2 done (g_mem may still be null: refused)
+unsigned char* g_mem = nullptr;
+volatile LONG g_used = 0;
+char g_said[128] = "near block not reserved";
+
+void Reserve(HMODULE rd3d11, const char* who)
+{
+    if (!rd3d11 || InterlockedCompareExchange(&g_state, 1, 0) != 0) { return; }
+    const unsigned long long base = reinterpret_cast<unsigned long long>(rd3d11);
+    int tries = 0;
+    for (int i = 0; ; ++i) {
+        const unsigned long long c = stubpool_logic::Candidate(base, i);
+        if (c == stubpool_logic::kEnd) { break; }
+        if (!c) { continue; }
+        ++tries;
+        g_mem = static_cast<unsigned char*>(VirtualAlloc(reinterpret_cast<void*>(c), stubpool_logic::kBlockBytes,
+                                                         MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+        if (g_mem) { break; }
+    }
+    const long long off = g_mem ? static_cast<long long>(reinterpret_cast<unsigned long long>(g_mem) - base) : 0;
+    if (g_mem) { _snprintf_s(g_said, sizeof(g_said), _TRUNCATE, "near block %+lld bytes from rd3d11", off); }
+    else { strncpy_s(g_said, sizeof(g_said), "near block REFUSED - no free memory within 1.75 GB", _TRUNCATE); }
+    MemoryBarrier();
+    InterlockedExchange(&g_state, 2);
+    // [PROBE: STUBPOOL] gate=none (once per process, logged unconditionally)  site=FLAT  log-only=no
+    LOG("[STUBPOOL] near block for rd3d11's call sites %s (logged unconditionally), from %s: rd3d11 %p, block %p (%+lld bytes), "
+        "addresses tried %d, %d slots of %d bytes", g_mem ? "RESERVED" : "REFUSED - each site searches for itself, as before", who,
+        static_cast<void*>(rd3d11), static_cast<void*>(g_mem), off, tries, stubpool_logic::kSlots, stubpool_logic::kSlotBytes);
+}
+// A 64-byte slot a 5-byte call at `site` can reach, or nullptr (no block yet / none left / out of reach).
+unsigned char* Take(const unsigned char* site)
+{
+    if (InterlockedCompareExchange(&g_state, 2, 2) != 2 || !g_mem) { return nullptr; }
+    const unsigned long long s = reinterpret_cast<unsigned long long>(site);
+    if (!stubpool_logic::SlotAddr(reinterpret_cast<unsigned long long>(g_mem), 0, s)) { return nullptr; }
+    const LONG i = InterlockedIncrement(&g_used) - 1;
+    return reinterpret_cast<unsigned char*>(stubpool_logic::SlotAddr(reinterpret_cast<unsigned long long>(g_mem), static_cast<int>(i), s));
+}
+const char* State() { return g_said; }
+}  // namespace stubpool
+
 namespace vpstore {
 // 2026-10-20 (docs/superpowers/specs/2026-10-20-vpstore-lru-design.md): the table is vpstore_logic.h's - 128 entries, a full table
 // EVICTS the entry bound longest ago instead of refusing (the 32-entry table filled at the main menu and refused every later
@@ -6941,6 +6992,13 @@ void STDMETHODCALLTYPE DetourReplayUnmap(ID3D11DeviceContext* ctx, ID3D11Resourc
 // A stub within reach of a 5-byte call from `nearAddr`: mov r9, rbx (the replay's command record) ; jmp [rip+0] -> target.
 void* RecStub(const unsigned char* nearAddr, void* target)
 {
+    if (unsigned char* b = stubpool::Take(nearAddr)) {   // the block reserved when rd3d11 was mapped (INV-777)
+        b[0] = 0x49; b[1] = 0x89; b[2] = 0xD9;                                  // mov r9, rbx
+        b[3] = 0xFF; b[4] = 0x25; b[5] = b[6] = b[7] = b[8] = 0x00;            // jmp qword ptr [rip+0]
+        memcpy(b + 9, &target, 8);
+        FlushInstructionCache(GetCurrentProcess(), b, 17);
+        return b;
+    }
     SYSTEM_INFO si = {};
     GetSystemInfo(&si);
     const uintptr_t gran = si.dwAllocationGranularity ? si.dwAllocationGranularity : 0x10000;
@@ -6971,6 +7029,7 @@ void Install()
     HMODULE m = GetModuleHandleA("rd3d11_x64_rwdi.dll");
     unsigned char* base = reinterpret_cast<unsigned char*>(m);
     bool okU = false, okR = false, patched = false;
+    const char* why = base ? "bytes NOT AS EXPECTED" : "rd3d11 not mapped";   // the line's reason when it is refused (INV-777)
     if (base) {
         __try {
             okU = memcmp(base + 0x3082D, kU, sizeof(kU)) == 0;
@@ -6982,8 +7041,11 @@ void Install()
         void* stub = RecStub(site, reinterpret_cast<void*>(&DetourReplayUnmap));
         const long long rel = stub ? static_cast<unsigned char*>(stub) - (site + 5) : 0x100000000ll;
         DWORD old = 0;
-        if (stub && rel <= 0x7FFFFFFFll && rel >= -0x80000000ll &&
-            VirtualProtect(site, sizeof(kU), PAGE_EXECUTE_READWRITE, &old)) {
+        why = !stub ? "no free memory within reach of rd3d11" : "the stub is out of rel32 reach";
+        const bool reach = stub && rel <= 0x7FFFFFFFll && rel >= -0x80000000ll;
+        if (reach) { why = "VirtualProtect failed"; }
+        if (reach && VirtualProtect(site, sizeof(kU), PAGE_EXECUTE_READWRITE, &old)) {
+            why = "the bytes changed under the patch";
             if (memcmp(site, kU, sizeof(kU)) == 0) {
                 unsigned char buf[6] = { 0xE8, 0, 0, 0, 0, 0x90 };
                 const int rel32 = static_cast<int>(rel);
@@ -6998,10 +7060,10 @@ void Install()
     if (patched) { g_patch = 1; }
     // [PROBE: VPSTORE] gate=dlss_cbsnap.txt + dlss_mvfix.txt (g_cbSnap, g_mvFix)  site=HEADSET  log-only=no
     LOG("[VPSTORE] replay Unmap detour %s (logged unconditionally): rd3d11 %p | +3082D Unmap bytes %s | +30829 record load %s | "
-        "patched %d. Installed = the view-projection snapshot follows the slot-2 buffer each GBuffer bind uses; refused = the "
-        "snapshot path exactly as before.",
+        "patched %d (%s) | %s. Installed = the view-projection snapshot follows the slot-2 buffer each GBuffer bind uses; refused = "
+        "the snapshot path exactly as before.",
         patched ? "INSTALLED" : "REFUSED", static_cast<void*>(m), okU ? "as expected" : "NOT AS EXPECTED",
-        okR ? "as expected" : "NOT AS EXPECTED", patched ? 1 : 0);
+        okR ? "as expected" : "NOT AS EXPECTED", patched ? 1 : 0, patched ? "ok" : why, stubpool::State());
 }
 void Tick()
 {
@@ -12089,10 +12151,112 @@ void EngineNote(UINT count, ID3D11PixelShader* ps, bool haveDs, const D3D11_DEPT
         glass ? "LEFT OUT (alpha-tested)" : "drawn as before");
 }
 
+// THE GLOW CAPTURE (2026-11-25, the Dark Sickle - Jay: "Go with B"; trace docs/traces/20261125_1210_afw_glow_carry.md, RUN GL1). A held
+// item whose material has a glow pass is drawn again after the GBuffer, additively into the HDR image; the bloom then spreads that light
+// over the world around it, and the rebuild - which carries those pixels as world - left a lit outline round a dark hole where the item
+// was. This draws that pass once more into our own render-size target, so the rebuild knows which texels of this image glow.
+// [LOADBEARING: GLOW-CAPTURE] PSHalo / PSComposeGlow run only while the held image has one.
+// COST: no glow pass -> one owner test per matched draw outside the GBuffer (a held item's shadow draws: one OMGetRenderTargets more).
+ID3D11Texture2D*          g_glowTex[afwdepth::kSlots] = {};
+ID3D11RenderTargetView*   g_glowRtv[afwdepth::kSlots] = {};
+ID3D11ShaderResourceView* g_glowSrv[afwdepth::kSlots] = {};
+long g_glowAt[afwdepth::kSlots] = { -1, -1, -1 };   // the afwdepth::g_total this slot's capture was drawn under
+UINT g_glowW = 0, g_glowH = 0;
+bool g_glowFailed = false, g_glowSaid = false;
+
+bool GlowEnsure(UINT w, UINT h)
+{
+    if (g_glowTex[0] && g_glowW == w && g_glowH == h) { return true; }
+    if (g_glowFailed) { return false; }
+    HRESULT hr = S_OK;
+    for (int i = 0; i < afwdepth::kSlots; ++i) {
+        if (g_glowSrv[i]) { g_glowSrv[i]->Release(); g_glowSrv[i] = nullptr; }
+        if (g_glowRtv[i]) { g_glowRtv[i]->Release(); g_glowRtv[i] = nullptr; }
+        if (g_glowTex[i]) { g_glowTex[i]->Release(); g_glowTex[i] = nullptr; }
+        g_glowAt[i] = -1;
+        D3D11_TEXTURE2D_DESC t = {};
+        t.Width = w; t.Height = h; t.MipLevels = 1; t.ArraySize = 1; t.Format = DXGI_FORMAT_R11G11B10_FLOAT; t.SampleDesc.Count = 1;
+        t.Usage = D3D11_USAGE_DEFAULT; t.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        if (SUCCEEDED(hr)) { hr = g_device->CreateTexture2D(&t, nullptr, &g_glowTex[i]); }
+        if (SUCCEEDED(hr)) { hr = g_device->CreateRenderTargetView(g_glowTex[i], nullptr, &g_glowRtv[i]); }
+        if (SUCCEEDED(hr)) { hr = g_device->CreateShaderResourceView(g_glowTex[i], nullptr, &g_glowSrv[i]); }
+    }
+    g_glowW = w; g_glowH = h;
+    g_glowFailed = FAILED(hr);
+    // [PROBE: AFWGLOW] gate=afw_rb_fg_mask + afw_alt_eye, a held item with a glow pass (once per size)  site=HEADSET  log-only=no
+    LOG("[AFWGLOW] capture targets %s: %d x %ux%u, hr 0x%08lX", FAILED(hr) ? "REFUSED - glowing items keep the old rebuild" : "CREATED",
+        afwdepth::kSlots, w, h, static_cast<unsigned long>(hr));
+    return !g_glowFailed;
+}
+
+// A matched draw outside the GBuffer: a held item, colour target, additive = its glow pass.
+void GlowCapture(ID3D11DeviceContext* ctx, int idx, UINT count, UINT start, INT base, UINT instances, UINT startInstance)
+{
+    if (!g_ownOk || idx < 0 || idx >= g_n || (g_owner[idx] != 1 && g_owner[idx] != 2) || g_glowFailed || !g_tex[0] ||
+        !g_origOMSetRenderTargets) { return; }
+    ID3D11RenderTargetView* rt[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+    ID3D11DepthStencilView* dsv = nullptr;
+    ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rt, &dsv);
+    UINT nrt = 0;
+    for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) { if (rt[i]) { nrt = i + 1; } }
+    bool glow = nrt == 1;                                        // depth only (a shadow map) or several targets: not a glow pass
+    D3D11_TEXTURE2D_DESC td = {};
+    if (glow) {
+        D3D11_RENDER_TARGET_VIEW_DESC rd = {};
+        rt[0]->GetDesc(&rd);
+        glow = rd.Format == DXGI_FORMAT_R11G11B10_FLOAT;         // the HDR scene image
+    }
+    if (glow) {
+        ID3D11BlendState* bs = nullptr;
+        float bf[4] = {};
+        UINT sm = 0;
+        ctx->OMGetBlendState(&bs, bf, &sm);
+        D3D11_BLEND_DESC bd = {};
+        if (bs) { bs->GetDesc(&bd); bs->Release(); }
+        glow = bd.RenderTarget[0].BlendEnable && bd.RenderTarget[0].SrcBlend == D3D11_BLEND_ONE &&
+               bd.RenderTarget[0].DestBlend == D3D11_BLEND_ONE;
+    }
+    if (glow) {
+        ID3D11Resource* res = nullptr;
+        ID3D11Texture2D* tex = nullptr;
+        rt[0]->GetResource(&res);
+        if (res && SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&tex))) && tex) { tex->GetDesc(&td); tex->Release(); }
+        if (res) { res->Release(); }
+        glow = td.SampleDesc.Count == 1 && td.Width == g_w && td.Height == g_h && GlowEnsure(td.Width, td.Height);   // the masks' size
+    }
+    if (glow) {
+        const int slot = static_cast<int>(afwdepth::g_total % afwdepth::kSlots);   // the slot the NEXT depth copy will fill (as Redraw's)
+        if (g_glowAt[slot] != afwdepth::g_total) {
+            const float zero4[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            ctx->ClearRenderTargetView(g_glowRtv[slot], zero4);
+            g_glowAt[slot] = afwdepth::g_total;
+        }
+        g_origOMSetRenderTargets(ctx, 1, &g_glowRtv[slot], dsv);
+        if (instances) { ctx->DrawIndexedInstanced(count, instances, start, base, startInstance); }
+        else { ctx->DrawIndexed(count, start, base); }
+        g_origOMSetRenderTargets(ctx, nrt, rt, dsv);
+        if (!g_glowSaid) {
+            g_glowSaid = true;
+            // [PROBE: AFWGLOW] gate=afw_rb_fg_mask + afw_alt_eye, a held item with a glow pass (once per session)  site=HEADSET  log-only=no
+            LOG("[AFWGLOW] FIRST glow pass of a held item (logged once): mesh '%s', range %d, index count %u, image %ux%u",
+                g_ownMesh[g_owner[idx]], idx, count, td.Width, td.Height);
+        }
+    }
+    for (auto& r : rt) { if (r) { r->Release(); } }
+    if (dsv) { dsv->Release(); }
+}
+// The glow capture of depth copy number `total`, or nullptr (that image had no glow pass).
+ID3D11ShaderResourceView* GlowSrvFor(long total)
+{
+    if (total < 0) { return nullptr; }
+    const int slot = static_cast<int>(total % afwdepth::kSlots);
+    return g_glowAt[slot] == total ? g_glowSrv[slot] : nullptr;
+}
+
 // The matched draw again, depth only, into this frame's mask. instances == 0: DrawIndexed.
 void Redraw(ID3D11DeviceContext* ctx, int idx, UINT count, UINT start, INT base, UINT instances, UINT startInstance)
 {
-    if (!afwfg::g_inG) { ++g_drawsOutsideG; return; }
+    if (!afwfg::g_inG) { ++g_drawsOutsideG; GlowCapture(ctx, idx, count, start, base, instances, startInstance); return; }
     if (!g_tex[0] || !g_origOMSetRenderTargets) { ++g_refused; return; }
     const int slot = static_cast<int>(afwdepth::g_total % afwdepth::kSlots);   // the slot the NEXT depth copy will fill
     ID3D11RenderTargetView*  rt[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
@@ -12360,6 +12524,12 @@ void STDMETHODCALLTYPE DetourDrawInstanced(ID3D11DeviceContext* ctx, UINT count,
 // A 14-byte absolute jump within reach of a 5-byte call from `near`.
 void* NearStub(const unsigned char* nearAddr, void* target)
 {
+    if (unsigned char* b = stubpool::Take(nearAddr)) {   // the block reserved when rd3d11 was mapped (INV-777)
+        b[0] = 0xFF; b[1] = 0x25; b[2] = b[3] = b[4] = b[5] = 0x00;   // jmp qword ptr [rip+0]
+        memcpy(b + 6, &target, 8);
+        FlushInstructionCache(GetCurrentProcess(), b, 14);
+        return b;
+    }
     SYSTEM_INFO si = {};
     GetSystemInfo(&si);
     const uintptr_t gran = si.dwAllocationGranularity ? si.dwAllocationGranularity : 0x10000;
@@ -12380,17 +12550,23 @@ void* NearStub(const unsigned char* nearAddr, void* target)
     return nullptr;
 }
 
+// why the last refused PatchCall refused (the [DRAWSITE] / [CTXSITE] lines print it - the 3 refused launches of INV-777 could not say)
+const char* g_patchWhy = "none refused";
 bool PatchCall(unsigned char* site, const unsigned char* expect, int len, void* target)
 {
     // 6 / 7 (the draw sites) or 9 (ctxsite's mov rax,[rcx]; call [rax+disp32] sites, trace 20261121_1036). Anything else refused.
-    if (len != 6 && len != 7 && len != 9) { return false; }
+    if (len != 6 && len != 7 && len != 9) { g_patchWhy = "unsupported length"; return false; }
     void* stub = NearStub(site, target);
-    if (!stub) { return false; }
+    if (!stub) { g_patchWhy = "no free memory within reach of rd3d11"; return false; }
     const long long rel = static_cast<unsigned char*>(stub) - (site + 5);
-    if (rel > 0x7FFFFFFFll || rel < -0x80000000ll) { return false; }
+    if (rel > 0x7FFFFFFFll || rel < -0x80000000ll) { g_patchWhy = "the stub is out of rel32 reach"; return false; }
     DWORD old = 0;
-    if (!VirtualProtect(site, static_cast<SIZE_T>(len), PAGE_EXECUTE_READWRITE, &old)) { return false; }
-    if (memcmp(site, expect, static_cast<size_t>(len)) != 0) { VirtualProtect(site, static_cast<SIZE_T>(len), old, &old); return false; }
+    if (!VirtualProtect(site, static_cast<SIZE_T>(len), PAGE_EXECUTE_READWRITE, &old)) { g_patchWhy = "VirtualProtect failed"; return false; }
+    if (memcmp(site, expect, static_cast<size_t>(len)) != 0) {
+        g_patchWhy = "the bytes changed under the patch";
+        VirtualProtect(site, static_cast<SIZE_T>(len), old, &old);
+        return false;
+    }
     unsigned char buf[9] = { 0xE8, 0, 0, 0, 0, 0x90, 0x90, 0x90, 0x90 };
     const int rel32 = static_cast<int>(rel);
     memcpy(buf + 1, &rel32, 4);
@@ -12441,9 +12617,10 @@ void InstallSites(const char* who)
                 g_sitePatched[2] ? 1 : 0, g_sitePatched[3] ? 1 : 0);
     // [PROBE: DRAWSITE] gate=ui_wrist_hud or afw_rb_fg_mask (whichever asks first)  site=HEADSET  log-only=no
     LOG("[DRAWSITE] rd3d11 draw sites %s (logged unconditionally), asked first by %s: rd3d11 %p | bytes +30D70 %s, +30D52 %s, +30D24 %s, "
-        "+30D0A %s. A refused site keeps the vtable path as before. The patches stay until the game closes.", g_siteSaid, who,
-        static_cast<void*>(m), g_siteOk[0] ? "as expected" : "NOT AS EXPECTED", g_siteOk[1] ? "as expected" : "NOT AS EXPECTED",
-        g_siteOk[2] ? "as expected" : "NOT AS EXPECTED", g_siteOk[3] ? "as expected" : "NOT AS EXPECTED");
+        "+30D0A %s | last refusal: %s | %s. A refused site keeps the vtable path as before. The patches stay until the game closes.",
+        g_siteSaid, who, static_cast<void*>(m), g_siteOk[0] ? "as expected" : "NOT AS EXPECTED",
+        g_siteOk[1] ? "as expected" : "NOT AS EXPECTED", g_siteOk[2] ? "as expected" : "NOT AS EXPECTED",
+        g_siteOk[3] ? "as expected" : "NOT AS EXPECTED", g_patchWhy, stubpool::State());
 }
 const char* SitesState() { return g_siteSaid; }
 
@@ -12931,6 +13108,60 @@ R"(
 //   4. the fill extends WORLD only - never the body / weapon.
 // NOT built: hand parts the fresh eye cannot see (guide rule 2: frame edges, self-occlusion), the still-weapon shine
 // rule (guide rule 0), the foreground projection gain (not needed here: one projection, INV-396).
+)"
+// split here: MSVC refuses one raw literal over ~16 KB (C2026) - adjacent literals concatenate into the same string
+R"(
+// THE GLOW CARRY (2026-11-25, trace 20261125_1210_afw_glow_carry; PSComposeGlow only - g_glow is false in every other entry). The light a
+// held item's glow pass spills over the world behind it moves with the item, not with the world.
+Texture2D<float4> gloD : register(t10);   // held uv, quarter size, mips: rgb = held minus fresh colour of the same world point, a = share of samples that had one
+Texture2D<float4> gloO : register(t11);   // quarter size, mips. target uv: xy = (held source uv - target uv) x m, z = m, a glowing texel lands here; held uv: w = one was here
+Texture2D<float3> gloE : register(t12);   // the held image's glow pass alone (afwmask::GlowCapture, render size)
+static bool g_glow = false;
+// how far the target point is within reach of the glowing texels, old place or new (0 = out of reach). RUN GL2 (Jay: a thin dark outline
+// left): at 8 x mips 4 / 5 the weight was 0.65 at the old blade's edge and 0.4 beyond while the glow still reached there, so only part of the
+// old light came off; 32 x mips 4 / 5 / 6 holds full weight over the whole halo (offline on GL1's frames: 79 -> 28 against 45 before).
+float gloZone(float2 t) {
+  float4 z4 = gloO.SampleLevel(lin, t, 4), z5 = gloO.SampleLevel(lin, t, 5), z6 = gloO.SampleLevel(lin, t, 6);
+  return saturate(32.0 * max(max(z4.z + z4.w, z5.z + z5.w), z6.z + z6.w));
+}
+// a held texel 2..4 depth texels from the body / weapon: the brightest part of the spilled light, too steep for the quarter-size map
+bool ringWide(float2 uv) {
+  int2 p = clamp(int2(uv * dsz.xy), int2(0, 0), int2(dsz.xy) - 1);
+  static const int2 o8[8] = { int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1), int2(1, 1), int2(-1, 1), int2(1, -1), int2(-1, -1) };
+  [loop] for (int r = 2; r <= 4; ++r) {
+    [loop] for (int k = 0; k < 8; ++k) {
+      int2 q = clamp(p + o8[k] * r, int2(0, 0), int2(dsz.xy) - 1);
+      float a = mskH.Load(int3(q, 0));
+      if (a > 0.0 && abs(a - depH.Load(int3(q, 0))) <= a * 1e-5) { return true; }
+    }
+  }
+  return false;
+}
+// the light at a held uv, coarse to fine: a level counts by how much of it had a reading, so a place with none (under the item, or hidden
+// from the fresh eye) takes its surroundings
+float3 gloAt(float2 p) {
+  float3 v = 0.0;
+  [unroll] for (int l = 6; l >= 0; --l) {
+    float4 s = gloD.SampleLevel(lin, p, l);
+    v = lerp(v, s.a > 1e-4 ? s.rgb / s.a : v, saturate(s.a));
+  }
+  return v;
+}
+// target point -> the held uv the item's surroundings there came from
+float2 gloMove(float2 p) {
+  float2 v = 0.0;
+  [unroll] for (int l = 8; l >= 2; --l) {
+    float4 s = gloO.SampleLevel(lin, p, l);
+    v = lerp(v, s.z > 1e-5 ? s.xy / s.z : v, saturate(s.z * 6.0));
+  }
+  return v;
+}
+// a held texel that glows: the glow pass drew there AND it reads bright in the image (by day the pass adds light nobody sees spill)
+bool gloTexel(float2 uv) {
+  if (!fgH(uv)) { return false; }
+  float3 e = gloE.Load(int3(clamp(int2(uv * dsz.xy), int2(0, 0), int2(dsz.xy) - 1), 0));
+  return dot(e, float3(1.0, 1.0, 1.0)) > 1e-3 && dot(shade(rcH, uv).rgb, float3(0.2125, 0.7154, 0.0721)) > 0.35;
+}
 // [AFWTRAIL] (log-only): the source texel the ladder drew from - xy its uv in that image, z 1 = the FRESH image, 0 = the held.
 static float3 g_src = float3(0.0, 0.0, 0.0);
 float4 compose(float2 t, out float cls, out float resc, out float fg, out float rej) {
@@ -12964,6 +13195,8 @@ float4 compose(float2 t, out float cls, out float resc, out float fg, out float 
   // INV-465 EDGE RING: the held sample is the hand's old edge colour - the held image has no candidate here (not own, not
   // fallback, not near miss); the fresh eye or the fill supplies the pixel
   [branch] if (eH < 6.0 && ringH(sH)) { eH = 1e9; }
+  // GLOW: beside the item's old outline the fresh eye supplies the place whenever it has it
+  [branch] if (g_glow && eH < 6.0 && eF < prm.w && gloZone(t) > 0.5 && !fgH(sH) && !fgF(sF) && ringWide(sH)) { eH = 1e9; }
   bool okH = eH < prm.w, okF = eF < prm.w;
   // the candidates' identity (only looked at when the rules are on)
   bool bF = rules && okF && fgF(sF);                           // the fresh candidate is the body / weapon as it is NOW
@@ -13045,9 +13278,18 @@ float4 compose(float2 t, out float cls, out float resc, out float fg, out float 
   }
   return c;
 }
-float4 PSCompose(FOut i) : SV_Target {
+float4 composeOut(FOut i) {
   float cls, resc, fg, rej;
   float4 c = compose(i.uv, cls, resc, fg, rej);
+  [branch] if (g_glow && fg < 0.5) {
+    float zw = gloZone(i.uv);
+    [branch] if (zw > 0.0) {
+      const float e = 1.5 / 255.0;                               // under the readings' own noise: nothing
+      float3 here = g_src.z > 0.5 ? max(-gloAt(i.uv) - e, 0.0) : max(gloAt(g_src.xy) - e, 0.0);   // the light the source pixel carries
+      float3 there = max(gloAt(i.uv + gloMove(i.uv)) - e, 0.0);  // the light that belongs here now
+      c.rgb = saturate(c.rgb + zw * (there - here));
+    }
+  }
   if (prm.z > 0.5) {
     // untinted = the held eye's own world, blue = fresh (nearer / uncovered), green = fresh because the held point was
     // stale, red = held fallback, cyan = near miss, magenta = fill; orange = drawn through a rescued edge;
@@ -13064,6 +13306,35 @@ float4 PSCompose(FOut i) : SV_Target {
     c.rgb *= tint;
   }
   return c;
+}
+float4 PSCompose(FOut i) : SV_Target { return composeOut(i); }
+float4 PSComposeGlow(FOut i) : SV_Target { g_glow = true; return composeOut(i); }
+// The quarter-size pass the glow carry reads. Target 0 (held uv): over 4 samples, the held image minus the fresh image of the SAME world
+// point - the two eyes see the item's spilled light over different parts of the world, so the difference is the light alone. Target 1:
+// where the glowing texels are in the target and which held uv they came from (xy, z), and where they were (w).
+struct HOut { float4 d : SV_Target0; float4 o : SV_Target1; };
+HOut PSHalo(FOut i) {
+  HOut r = (HOut)0;
+  float2 t = i.uv;
+  float4 k0 = seedH.Load(int3(clamp(int2(t * tsz.zw), int2(0, 0), int2(tsz.zw) - 1), 0));
+  if (k0.a > 0.75 && gloTexel(k0.xy)) { r.o.xy = k0.xy - t; r.o.z = 1.0; }   // unstretched seeds only
+  if (gloTexel(t)) { r.o.w = 1.0; }
+  [loop] for (int j = 0; j < 4; ++j) {
+    float2 s = t + (float2(j & 1, j >> 1) * 2.0 - 1.0) / tsz.xy;
+    if (fgH(s) || ringH(s) || markAt(depH, s)) { continue; }
+    float3 m = mapQ(s, zAt(depH, s), prm.x, gH0, gH1, gH2);
+    if (m.z <= 1e-4) { continue; }
+    float2 tt = uvOf(m);
+    if (any(tt < 0.0) || any(tt > 1.0)) { continue; }
+    float4 kF = seedF.Load(int3(clamp(int2(tt * tsz.zw), int2(0, 0), int2(tsz.zw) - 1), 0));
+    float tF, eF;
+    float2 sF = refineF(tt, kF.a > 0.0 ? kF.xy : tt, tF, eF);
+    if (eF < prm.w && !fgF(sF) && abs(farc(m.z) - farc(tF)) <= farc(tF) * 0.03) {
+      r.d.rgb += 0.25 * (shade(rcH, s).rgb - shade(rcF, sF).rgb);
+      r.d.a += 0.25;
+    }
+  }
+  return r;
 }
 )"
 // (the literal is split here: MSVC refuses a single string literal over ~16 KB - error C2026; adjacent literals join)
@@ -13305,6 +13576,14 @@ long      g_rtN = 0, g_rtNotReady = 0, g_rtDisjoint = 0, g_rbRuns = 0;
 double    g_rtSum = 0.0, g_rtMax = 0.0;
 ULONGLONG g_rbNextLog = 0;
 
+// THE GLOW CARRY (trace docs/traces/20261125_1210_afw_glow_carry.md): its two shaders and the two quarter-size maps, made on first use
+ID3D11PixelShader*        g_psHalo = nullptr;
+ID3D11PixelShader*        g_psCompGlow = nullptr;
+ID3D11Texture2D*          g_glo[2] = {};          // 0 the light (gloD), 1 the move (gloO), full mip chains
+ID3D11RenderTargetView*   g_gloRtv[2] = {};
+ID3D11ShaderResourceView* g_gloSrv[2] = {};
+bool   g_gloFailed = false, g_gloSaid = false;
+
 template <class T> void Rel(T*& p) { if (p) { p->Release(); p = nullptr; } }
 
 void ReleaseTargets()
@@ -13316,6 +13595,7 @@ void ReleaseTargets()
     for (int i = 0; i < 2; ++i) { Rel(g_seedSrv[i]); Rel(g_seedRtv[i]); Rel(g_seed[i]); Rel(g_SaSrv[i]); Rel(g_Sa[i]); }
     for (auto& t : g_Vstage) { Rel(t); }
     Rel(g_R); Rel(g_seedZ);
+    for (int i = 0; i < 2; ++i) { Rel(g_gloSrv[i]); Rel(g_gloRtv[i]); Rel(g_glo[i]); }
     g_S = nullptr; g_Ssrv = nullptr;   // aliases of g_Sa / g_SaSrv
     g_sSerial[0] = g_sSerial[1] = -10;
     g_tW = g_tH = g_eW = g_eH = 0;
@@ -13535,6 +13815,39 @@ bool EnsureTargets(ID3D11Texture2D* T, const D3D11_TEXTURE2D_DESC& td, UINT eW, 
     LOG("[AFWRB] targets CREATED (logged unconditionally): eye image %ux%u %s (viewed as %s), per eye %ux%u, seed maps "
         "%ux%u R16G16B16A16_UNORM + D32", td.Width, td.Height, FmtName(td.Format), FmtName(vf), eW, eH, k.Width, k.Height);
     return true;
+}
+
+// The glow carry's shaders and quarter-size maps. A failure turns only the glow carry off (the rebuild is then today's), for the session.
+bool EnsureGlow()
+{
+    if (g_gloFailed) { return false; }
+    if (g_psHalo && g_psCompGlow && g_gloSrv[0] && g_gloSrv[1]) { return true; }
+    HRESULT hr = S_OK;
+    if (!g_psHalo || !g_psCompGlow) {
+        ID3DBlob* b[2] = {};
+        hr = Compile("PSHalo", "ps_5_0", &b[0]) && Compile("PSComposeGlow", "ps_5_0", &b[1]) ? S_OK : E_FAIL;
+        if (SUCCEEDED(hr)) { hr = g_device->CreatePixelShader(b[0]->GetBufferPointer(), b[0]->GetBufferSize(), nullptr, &g_psHalo); }
+        if (SUCCEEDED(hr)) { hr = g_device->CreatePixelShader(b[1]->GetBufferPointer(), b[1]->GetBufferSize(), nullptr, &g_psCompGlow); }
+        for (auto& x : b) { if (x) { x->Release(); } }
+    }
+    const DXGI_FORMAT fmt[2] = { DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT };   // the move needs 32-bit: its coarse mips are tiny
+    for (int i = 0; i < 2 && SUCCEEDED(hr); ++i) {
+        Rel(g_gloSrv[i]); Rel(g_gloRtv[i]); Rel(g_glo[i]);
+        D3D11_TEXTURE2D_DESC t = {};
+        t.Width = g_eW / 4 ? g_eW / 4 : 1; t.Height = g_eH / 4 ? g_eH / 4 : 1; t.MipLevels = 0; t.ArraySize = 1; t.Format = fmt[i];
+        t.SampleDesc.Count = 1; t.Usage = D3D11_USAGE_DEFAULT; t.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        t.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+        hr = g_device->CreateTexture2D(&t, nullptr, &g_glo[i]);
+        D3D11_RENDER_TARGET_VIEW_DESC rv = {};
+        rv.Format = fmt[i]; rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;   // mip 0
+        if (SUCCEEDED(hr)) { hr = g_device->CreateRenderTargetView(g_glo[i], &rv, &g_gloRtv[i]); }
+        if (SUCCEEDED(hr)) { hr = g_device->CreateShaderResourceView(g_glo[i], nullptr, &g_gloSrv[i]); }
+    }
+    g_gloFailed = FAILED(hr);
+    // [PROBE: AFWGLOW] gate=afw_rebuild + afw_alt_eye + afw_rb_fg_move, a held item with a glow pass (per creation)  site=HEADSET  log-only=no
+    LOG("[AFWGLOW] rebuild resources %s: light + move maps %ux%u with mips, hr 0x%08lX",
+        FAILED(hr) ? "REFUSED - glowing items keep the old rebuild" : "CREATED", g_eW / 4, g_eH / 4, static_cast<unsigned long>(hr));
+    return !g_gloFailed;
 }
 
 bool EnsureDepthViews()
@@ -14284,21 +14597,44 @@ int AfwRebuildRun(ID3D11Texture2D* T, const int hv[4], const int fv[4], int held
         ctx->ClearDepthStencilView(g_seedDsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
         DrawSeedMesh(ctx, cellsX, cellsY, seedIdx);
     }
+    // THE GLOW CARRY: only when the HELD image (afwdepth copy g_total - 2) had a held item's glow pass, with the masks and the move on
+    ID3D11ShaderResourceView* emi = (hmMain && haveMask) ? afwmask::GlowSrvFor(afwdepth::g_total - 2) : nullptr;
+    const bool glow = emi && EnsureGlow();
     // compose into our own target
     ctx->OMSetRenderTargets(1, nullRtv, nullptr);
-    ctx->OMSetRenderTargets(1, &g_Rrtv, nullptr);
     ctx->OMSetDepthStencilState(nullptr, 0);
-    D3D11_VIEWPORT evp = { 0.0f, 0.0f, static_cast<float>(g_eW), static_cast<float>(g_eH), 0.0f, 1.0f };
-    ctx->RSSetViewports(1, &evp);
     ID3D11ShaderResourceView* nullVs[2] = {};
     ctx->VSSetShaderResources(0, 2, nullVs);
     ctx->VSSetShader(g_vsFull, nullptr, 0);
-    ctx->PSSetShader(g_psComp, nullptr, 0);
     ID3D11ShaderResourceView* srvs[5] = { g_depSrv[nh], g_depSrv[nf], g_seedSrv[0], g_seedSrv[1], g_Ssrv };
     g_origPSSetShaderResources(ctx, 0, 5, srvs);
     if (haveMask) { g_origPSSetShaderResources(ctx, 6, 2, msk); }
     if (hmMain) { g_origPSSetShaderResources(ctx, 9, 1, &hmMain); }
     ctx->PSSetSamplers(0, 1, &g_lin);
+    if (glow) {
+        ID3D11ShaderResourceView* g3[3] = { nullptr, nullptr, emi };
+        g_origPSSetShaderResources(ctx, 10, 3, g3);
+        ctx->OMSetRenderTargets(2, g_gloRtv, nullptr);
+        D3D11_VIEWPORT gvp = { 0.0f, 0.0f, static_cast<float>(g_eW / 4), static_cast<float>(g_eH / 4), 0.0f, 1.0f };
+        ctx->RSSetViewports(1, &gvp);
+        ctx->PSSetShader(g_psHalo, nullptr, 0);
+        ctx->Draw(3, 0);
+        ID3D11RenderTargetView* nullRtv2[2] = {};
+        ctx->OMSetRenderTargets(2, nullRtv2, nullptr);
+        ctx->GenerateMips(g_gloSrv[0]);
+        ctx->GenerateMips(g_gloSrv[1]);
+        g3[0] = g_gloSrv[0]; g3[1] = g_gloSrv[1];
+        g_origPSSetShaderResources(ctx, 10, 3, g3);
+        if (!g_gloSaid) {
+            g_gloSaid = true;
+            // [PROBE: AFWGLOW] gate=afw_rebuild + afw_alt_eye + afw_rb_fg_move, a held item with a glow pass (once per session)  site=HEADSET  log-only=no
+            LOG("[AFWGLOW] FIRST rebuild with the glow carried (logged once): the held eye is the %s, %ux%u", heldIsRight ? "right" : "left", g_eW, g_eH);
+        }
+    }
+    ctx->OMSetRenderTargets(1, &g_Rrtv, nullptr);
+    D3D11_VIEWPORT evp = { 0.0f, 0.0f, static_cast<float>(g_eW), static_cast<float>(g_eH), 0.0f, 1.0f };
+    ctx->RSSetViewports(1, &evp);
+    ctx->PSSetShader(glow ? g_psCompGlow : g_psComp, nullptr, 0);
     ctx->Draw(3, 0);
     // [AFWCAP]: the same compose once more with the class tint, into the capture's own target (nothing reaches T).
     if (capThis) {
@@ -14327,6 +14663,7 @@ int AfwRebuildRun(ID3D11Texture2D* T, const int hv[4], const int fv[4], int held
     // the masks are depth targets on the next frames: they must not stay bound as a resource
     if (haveMask) { g_origPSSetShaderResources(ctx, 6, 2, nullSrv); }
     if (hmMain) { g_origPSSetShaderResources(ctx, 9, 1, nullSrv); }
+    if (glow) { g_origPSSetShaderResources(ctx, 10, 3, nullSrv); }   // render targets on the next frames
     {
         static long s_with = 0, s_without = 0;
         static ULONGLONG s_next = 0;
@@ -18711,6 +19048,7 @@ void Install(const char* who)
                           reinterpret_cast<void*>(&SiteVSSetConstantBuffers) };
     HMODULE m = GetModuleHandleA("rd3d11_x64_rwdi.dll");
     unsigned char* base = reinterpret_cast<unsigned char*>(m);
+    stubpool::Reserve(m, "the setter sites");   // normally already done when rd3d11 was mapped (InstallFromWatchdog)
     bool bytesOk[7] = {};
     int n = 0;
     for (int i = 0; i < 7; ++i) {
@@ -18725,7 +19063,7 @@ void Install(const char* who)
     for (int i = 0; i < 7; ++i) {
         char one[96];
         _snprintf_s(one, sizeof(one), _TRUNCATE, "%s%s %s", i ? " | " : "", kSite[i].name,
-                    g_patched[i] ? "PATCHED" : !base ? "NO rd3d11" : !bytesOk[i] ? "bytes NOT AS EXPECTED" : "patch FAILED");
+                    g_patched[i] ? "PATCHED" : !base ? "NO rd3d11" : !bytesOk[i] ? "bytes NOT AS EXPECTED" : afwmask::g_patchWhy);
         strncat_s(list, sizeof(list), one, _TRUNCATE);
     }
     // [PROBE: CTXSITE] gate=none (once per process, logged unconditionally)  site=FLAT  log-only=no
@@ -19762,6 +20100,7 @@ void InstallFromWatchdog(HMODULE rd3d11)
 {
     if (!Enabled || !rd3d11) { return; }
     if (g_realCreateDevice) { return; }
+    stubpool::Reserve(rd3d11, "rd3d11 mapped");   // before the game's heaps grow round it (INV-777)
 
     // Verify the slot holds the REAL export before trusting it. The watchdog
     // catches rd3d11 the millisecond it is mapped, and the loader snaps imports
