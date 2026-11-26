@@ -2112,8 +2112,9 @@ const Setting kSettings[] = {
            "spec 2026-11-18-hand-open-lids-design. Needs \"Loot by hand\" on. Wooden chests, car trunks and lidded baskets: squeeze "
            "a grip with your hand on the lid and swing it open - your view and position are never moved (no walk-up, no kneel). "
            "Past the open point the game opens it and the lid finishes swinging; grab it again to close it (visual only). Grip an "
-           "item inside to hold it; let go over your shoulder to put it in your inventory, anywhere else to put it back. X does "
-           "nothing on these containers while this is on. HEADSET only."),
+           "item inside to hold it; let go over your shoulder to put it in your inventory, anywhere else to put it back. Gas "
+           "canisters, crates and bricks: hold a grip to carry one, let go to throw it. X does nothing on these containers and "
+           "objects while this is on. HEADSET only."),
     S_FLOAT("lid_open_frac", dlvr::LidOpenFrac, 0.1f, 0.9f, "Lid: open point (fraction)", "Controller Bindings",
             "How far the lid must be swung, as a share of its full opening, before the game opens the container."),
     // group "VR Comfort" = BETA keeps the text; the HUD tab draws these three (overlay.cpp TabForSetting / DrawHudTab, trace 20261123_1730)

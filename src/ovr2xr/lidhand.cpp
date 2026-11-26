@@ -35,6 +35,7 @@
 #include "looting_logic.h"  // looting::BoxDist
 #include "promptquad.h"     // PromptQuadTick - the in-world prompt, ticked first in LidHandTick (trace 20261123_1356)
 #include "rtti_vtable.h"    // RttiFindVtable
+#include "throwable_logic.h"  // throwable::HandHistory - a carriable's let-go velocity (trace 20261126_1500)
 #include "twohand.h"        // RigTwoHandHaptic - the buzz strength (trace 20261118_1905: reuse, no new key)
 
 #include <windows.h>
@@ -246,6 +247,31 @@ static_assert(sizeof(InvVec) == 24, "the game's inventory out vector is 24 bytes
 using InvEnumFn = void(__fastcall*)(void* cont, InvVec* out, int cat);
 using SetXformFn = void(__fastcall*)(void* co, const float* m);   // IControlObject::SetWorldXform
 
+// ---- CARRIED OBJECTS by hand (plan 2026-11-26-carried-objects-by-hand, trace 20261126_1500; facts ENGINE_ARCHITECTURE "WORLD SWITCHES
+// + CARRIED OBJECTS", ghidra-project/ida/woc1..woc6, OUR gamedll 97046bba). Gas canisters / crates / bricks: the game's own take (action
+// 29) is NEVER called - no ObjectsCarryController, no RT throw, the other hand keeps its weapon (Jay: "Keep its weapon and use it"). ----
+// The take actions are lh::IsCarryAction (1 or 29 - RUN CO2: 1 when the object's own CanExecuteTake +1632 passes; woc1 +AA1820 /
+// +B33350 / +B35B30)
+constexpr size_t kPhysNameVfuncOff  = 528;   // obj vfunc (obj, StrBase* out, type) -> out: the physics script for a type (+B35D80 uses 4)
+constexpr int    kPhysTypeDynamic   = 4;     // the spawner's / ResetPhysics' body type
+constexpr size_t kSetLinVelVfuncOff = 432;   // ObjectDI slot 54 +EBAD60 SetPhysicsLinearVel(vec3) (throwable.cpp's kSetLinVelVfunc)
+constexpr size_t kGetLinVelVfuncOff = 440;   // ObjectDI slot 55 +EBACF0 GetPhysicsLinearVel(out) -> out (zero with no body)
+constexpr size_t kSpawnVfuncOff     = 1560;  // HeavyObjectsSpawner slot 195 +B35D80: create + place the HeavyObject it hands out
+constexpr size_t kSpawnHasOff = 880, kSpawnObjOff = 888;   // the spawner's handed-out object (smart pointer: +880 set -> +888)
+constexpr size_t kCreditHeavyOff = 912, kCreditExplodingOff = 1344;   // the game's throw +D5A8E0 (exact class): the thrower
+constexpr size_t kPlayerHandleOff = 88;      // what the game passes with the player (+D5A8E0: player + 88); kGsoOff (40) is above
+constexpr uintptr_t kSmartSetRva = 0x8E2D0;  // sub_18008E2D0(field, handle, obj) - the game's smart-pointer set (+D5A8E0 :1989)
+constexpr uintptr_t kIgnoreRva = 0xBACA30;   // (player, obj co, seconds): the player ignores the object (+D5A8E0, DropItem +B9EEF0)
+constexpr double kCarryVelWindowMs = 60.0;   // the let-go velocity: the fastest >= 30 ms span in the last 60 ms (my call)
+constexpr size_t kExplodedFlagOff = 1008;    // ExplodingObject byte: set 1 by its explosion +A9E720 (woc4 :39; +1020 -> 2 / 3 there too)
+using NameForTypeFn  = StrBase*(__fastcall*)(void* obj, StrBase* out, int type);
+using VecSetFn       = void(__fastcall*)(void* obj, const float* v);
+using VecGetFn       = float*(__fastcall*)(void* obj, float* out);
+using SpawnFn        = void(__fastcall*)(void* spawner);
+using SmartSetFn     = void(__fastcall*)(void* field, void* handle, void* obj);
+using IgnoreFn       = void(__fastcall*)(void* player, void* co, float seconds);
+using ReplIntervalFn = void(__fastcall*)(void* gso, float a, float b);
+
 SetLocalFn      g_setLocal = nullptr;
 GetLocalFn      g_getLocal = nullptr;
 GetIdFn         g_getId = nullptr;
@@ -265,6 +291,12 @@ uintptr_t       g_vtContainer = 0, g_vtItem = 0;
 uintptr_t       g_vtDropped = 0, g_vtFlare = 0, g_vtSpawner = 0, g_vtSpawnerR = 0, g_vtSpawnerC = 0;
 DropItemFn      g_dropItem = nullptr;    // null = its head bytes do not match (EGL) - a let-go chest / placed item goes home instead
 SetXformFn      g_setXform = nullptr;    // null = the dropped item stays where the game's drop put it (named at READY)
+// carried objects (trace 20261126_1500): 0 / null = that class / call not found (named on the CARRIED OBJECTS line) - only it is off
+uintptr_t       g_vtExploding = 0, g_vtHeavy = 0, g_vtHeavySpawner = 0;
+SmartSetFn      g_smartSet = nullptr;    // null = no throw credit (head bytes differ - EGL has no row)
+IgnoreFn        g_ignorePlayer = nullptr;   // null = no 1 s player ignore at the let-go
+ReplIntervalFn  g_replInterval = nullptr;   // IGSObject::ReplSetLocalReplicationInterval (engine export)
+volatile LONG   g_nThrow = 0;
 volatile LONG   g_ready = 0;      // 0 not tried, 1 ready, -1 refused (named once)
 void* volatile  g_player = nullptr;   // the PlayerDI NearbyHook was called with (the execute's actor)
 // THE INSTANCE CHECK (trace 20261125_1610 v2): the object's own id and its destroying / destroyed flags. Engine exports (dumpbin
@@ -344,6 +376,7 @@ struct HandState {
     // what is carried (trace 20261120_2210): a chest item (home = its hook), a placed spawner or a dropped item (home = a world matrix)
     lidhand::ItemKind kind = lidhand::ItemKind::Chest;
     bool  physOff = false;      // we switched a DroppedItem's physics off at the take (its OnDetached restarts it)
+    throwable::HandHistory hist;   // a carriable's hand positions (game world, QPC ms) from the take - its let-go velocity
     // THE FREE LIFT (trace 20261122_1830): the owned lid rides the drawn holder - the cover's world in the holder's frame at the grab,
     // and the rim centre's world at the row's rest (frame 0) for the let-go rule
     bool  free = false;
@@ -358,6 +391,7 @@ volatile LONG g_zone[2] = {};       // tick -> pad: this hand is in a lid's edge
 void* volatile g_carried[2] = {};   // tick -> HUD: the items carried (their pick is nulled)
 volatile LONG g_nGrab = 0, g_nOpen = 0, g_nTake = 0, g_nStow = 0, g_nGiveBack = 0, g_nForgot = 0, g_nOverwrite = 0, g_nNull = 0;
 volatile LONG g_nDrop = 0;   // let-go drops with physics (trace 20261120_2210)
+volatile LONG g_nCarryNull = 0;   // carriable picks withheld (X has no target) - trace 20261126_1815
 
 // ---- SEH-guarded game access (no C++ objects in these frames) ----
 bool ReadPtr(uintptr_t a, uintptr_t* out)
@@ -554,6 +588,25 @@ bool SafeAction(void* trig, void* player, int* out)
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
+// The trigger's own CanExecute(action, &info) (vfunc +1048, RESEARCH-NATIVE-LOOTING §12d; ExplodingObject +AA1950 / HeavyObject +B33470 /
+// HeavyObjectsSpawner +B35C10 - woc1): enabled, active on module, a pile with none out, the player able (final review findings 1 / 2).
+using CanExecFn = bool(__fastcall*)(void* trigger, int action, UseInfo* info);
+constexpr size_t kCanExecSlotOff = 1048;
+bool SafeCanExecute(void* trig, void* player, int action, bool* out)
+{
+    UseInfo info{};
+    info.actor = player;
+    info.f0 = 0.1f;
+    info.f1 = 2.6f;
+    info.v[0] = 1.5707964f; info.v[1] = 1.5707964f; info.v[2] = 1.0f; info.v[3] = 1.0f;
+    __try {
+        uintptr_t vt = 0, fn = 0;
+        if (!ReadPtr(reinterpret_cast<uintptr_t>(trig), &vt) || !ReadPtr(vt + kCanExecSlotOff, &fn) || !fn) { return false; }
+        *out = reinterpret_cast<CanExecFn>(fn)(trig, action, &info);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
 // ---- world items (trace 20261120_2210) ----
 // Physics OFF on a held DroppedItem: PhysicsBind slot +256 (type 0, empty name, 1) - the game's own +ECF2E0 call before its bone attach.
 bool SafePhysicsOff(void* obj)
@@ -601,6 +654,153 @@ bool SafeGetXform(void* obj, float out[12])
         return true;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// ---- carried objects (trace 20261126_1500) ----
+bool IsVt(void* obj, uintptr_t vt);   // below
+// Physics ON at the let-go, the spawner's own idiom (+B35D80): the object's physics script for type 4 (vfunc +528 into a string_base the
+// game allocates - freed with the same CRT free as the inventory buffer), then PhysicsBind slot +256 (4, name, 1). These classes' detach
+// restarts nothing (their OnDetached = the engine base, +114B0 = ret - woc5 / woc6), so this is the only restart.
+bool SafePhysicsOn(void* obj)
+{
+    if (!g_physBind || !obj) { return false; }
+    StrBase name{};
+    bool ok = false;
+    __try {
+        const uintptr_t ovt = *reinterpret_cast<const uintptr_t*>(obj);
+        StrBase* nm = (*reinterpret_cast<const NameForTypeFn*>(ovt + kPhysNameVfuncOff))(obj, &name, kPhysTypeDynamic);
+        void* bind = g_physBind(static_cast<char*>(obj) + kCtlObjOff);
+        if (bind && nm) {
+            const uintptr_t vt = *reinterpret_cast<const uintptr_t*>(bind);
+            (*reinterpret_cast<const BindPhysTypeFn*>(vt + kBindPhysTypeOff))(bind, kPhysTypeDynamic, nm, 1);
+            ok = true;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { ok = false; }
+    free(name.p);
+    return ok;
+}
+// The game's throw credit (+D5A8E0): by EXACT class, as the game tests it - HeavyObject +912, ExplodingObject +1344 (a derived
+// GasTankObject / QuestExplodingObject is not credited by the game either) = the player, then its replication interval (100, 300).
+// *field = the offset written (0 = not one of the two exact classes).
+// The outcome by its real reason (review minor 6, trace 20261126_1800): no export / not one of the two exact classes / a fault.
+lh::CreditResult SafeCredit(void* obj, void* player, int* field)
+{
+    *field = 0;
+    if (!g_smartSet) { return lh::CreditResult::NoExport; }
+    if (!obj || !player) { return lh::CreditResult::NotCalled; }
+    const size_t off = IsVt(obj, g_vtHeavy) ? kCreditHeavyOff : IsVt(obj, g_vtExploding) ? kCreditExplodingOff : 0;
+    if (!off) { return lh::CreditResult::NotExactClass; }
+    __try {
+        g_smartSet(static_cast<char*>(obj) + off, static_cast<char*>(player) + kPlayerHandleOff, player);
+        if (g_replInterval) { g_replInterval(static_cast<char*>(obj) + kGsoOff, 100.0f, 300.0f); }
+        *field = static_cast<int>(off);
+        return lh::CreditResult::Given;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return lh::CreditResult::Faulted; }
+}
+bool SafeIgnorePlayer(void* player, void* obj)
+{
+    if (!g_ignorePlayer || !player || !obj) { return false; }
+    __try { g_ignorePlayer(player, static_cast<char*>(obj) + kCtlObjOff, 1.0f); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+bool SafeSetLinVel(void* obj, const float v[3])
+{
+    __try {
+        const uintptr_t vt = *reinterpret_cast<const uintptr_t*>(obj);
+        (*reinterpret_cast<const VecSetFn*>(vt + kSetLinVelVfuncOff))(obj, v);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+bool SafeGetLinVel(void* obj, float out[3])
+{
+    __try {
+        const uintptr_t vt = *reinterpret_cast<const uintptr_t*>(obj);
+        float tmp[4] = {};
+        const float* p = (*reinterpret_cast<const VecGetFn*>(vt + kGetLinVelVfuncOff))(obj, tmp);
+        if (!p) { return false; }
+        out[0] = p[0]; out[1] = p[1]; out[2] = p[2];
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// A pile (HeavyObjectsSpawner): its own spawn (vfunc +1560 = +B35D80, the call its execute makes) once, then the object it handed out.
+// nullptr = refused (one already out: +880 && +888 before the call; nothing at +888 after it; a fault).
+void* SafeSpawnFrom(void* spawner)
+{
+    __try {
+        uintptr_t has = 0, cur = 0;
+        if (!ReadPtr(reinterpret_cast<uintptr_t>(spawner) + kSpawnHasOff, &has) ||
+            !ReadPtr(reinterpret_cast<uintptr_t>(spawner) + kSpawnObjOff, &cur)) { return nullptr; }
+        if (has && cur) { return nullptr; }
+        const uintptr_t vt = *reinterpret_cast<const uintptr_t*>(spawner);
+        (*reinterpret_cast<const SpawnFn*>(vt + kSpawnVfuncOff))(spawner);
+        if (!ReadPtr(reinterpret_cast<uintptr_t>(spawner) + kSpawnHasOff, &has) || !has ||
+            !ReadPtr(reinterpret_cast<uintptr_t>(spawner) + kSpawnObjOff, &cur) || !cur) { return nullptr; }
+        return reinterpret_cast<void*>(cur);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+// +8E2D0's first 16 bytes (set-aside gamedll 97046bba, read 2026-11-26 heads.py; control: the same read of +B9B930 == ExecHeadOk):
+// mov [rsp+8],rbx / mov r9,[rcx] / xor ebx,ebx / mov r11,r8 / test r9,r9. Mismatch = no credit, named.
+bool SmartSetHeadOk(const unsigned char* p)
+{
+    static const unsigned char kHead[16] = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x4C, 0x8B, 0x09, 0x33, 0xDB, 0x4D, 0x8B, 0xD8, 0x4D, 0x85, 0xC9 };
+    __try {
+        for (int i = 0; i < 16; ++i) { if (p[i] != kHead[i]) { return false; } }
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// +BACA30's first 16 bytes (same read): test rdx,rdx / jz rel32 / push rdi / push r14 / sub rsp,48h - the rel32 (5-8) not compared.
+bool IgnoreHeadOk(const unsigned char* p)
+{
+    static const unsigned char kHead[16] = { 0x48, 0x85, 0xD2, 0x0F, 0x84, 0x8C, 0x01, 0x00, 0x00, 0x57, 0x41, 0x56, 0x48, 0x83, 0xEC, 0x48 };
+    __try {
+        for (int i = 0; i < 16; ++i) {
+            if (i >= 5 && i <= 8) { continue; }
+            if (p[i] != kHead[i]) { return false; }
+        }
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// A gas canister / crate / pile the game would carry RIGHT NOW (trace 20261126_1500): one of the three exact classes, the game's own
+// action test (+1432) answers a take action (1 or 29, RUN CO2), AND its own CanExecute(that action) agrees (final review findings 1 / 2: the action test does NOT see a pile
+// with its object out, a disabled object or one inactive on its module - CanExecute does, woc1 +B35C10 / +AA1950 / +B33470).
+// HUD thread (NearbyHook); two vfunc calls per candidate of these classes per gather.
+bool CarriableNow(void* obj, void* player)
+{
+    if (!(IsVt(obj, g_vtExploding) || IsVt(obj, g_vtHeavy) || IsVt(obj, g_vtHeavySpawner)) || !player) { return false; }
+    int action = -1;
+    bool can = false;
+    const bool actOk = SafeAction(obj, player, &action);
+    // RUN CO2: the take action is 1 (CanExecuteTake passed) or 29 - CanExecute is asked with the action the game returned
+    const bool canOk = actOk && lh::IsCarryAction(action) && SafeCanExecute(obj, player, action, &can);
+    const bool yes = canOk && lh::CarriableGrabbable(action, can);
+    // RUN CO1 diagnostic (Jay: "Yes, go ahead" - grip did not take a canister that showed the game's X prompt): the first 12 candidates
+    // of the three classes with every test's value - so a refusal names itself. COST: one interlocked increment per candidate after 12.
+    static LONG s_n = 0;
+    const LONG n = InterlockedIncrement(&s_n);
+    if (n <= 12) {
+        char mesh[96] = "(name not read)";
+        if (g_getMeshName) { SafeMeshName(obj, mesh, sizeof(mesh)); }
+        // [PROBE: CARRYHAND] gate=lid_by_hand  site=FLAT  log-only=yes
+        LOG("lidhand: [CARRYHAND] CANDIDATE %ld of 12: %s %p mesh '%s' | action %s %d (want 1 or 29) | CanExecute(that action) %s | -> %s", n,
+            IsVt(obj, g_vtExploding) ? "ExplodingObject" : IsVt(obj, g_vtHeavy) ? "HeavyObject" : "HeavyObjectsSpawner", obj, mesh,
+            actOk ? "read" : "*** NOT READ (fault / no vtable slot) ***", action,
+            !canOk ? (actOk && lh::IsCarryAction(action) ? "*** NOT READ ***" : "not asked (not a take action)") : (can ? "true" : "FALSE"),
+            yes ? "PUBLISHED (grabbable)" : "*** NOT published ***");
+    }
+    return yes;
+}
+// QPC ticks -> ms (the rig's grip read carries its QPC)
+double QpcMs(long long qpc)
+{
+    static LARGE_INTEGER s_f = {};
+    if (!s_f.QuadPart) { QueryPerformanceFrequency(&s_f); }
+    return s_f.QuadPart ? static_cast<double>(qpc) * 1000.0 / static_cast<double>(s_f.QuadPart) : 0.0;
 }
 void* SafeDropItem(void* player, void* entry, int count)
 {
@@ -791,6 +991,31 @@ bool Ready()
             g_dropItem ? "ON (a let-go chest / placed item is dropped with physics)"
                        : "*** OFF - its code does not match the Steam bytes (EGL has no row): a let-go chest / placed item goes home ***",
             g_setXform ? "found" : "*** MISSING - a dropped item stays where the game's drop puts it ***");
+    }
+    // CARRIED OBJECTS (trace 20261126_1500): each class / call on its own; a missing one disables only itself (named). Not in `missing`.
+    {
+        int t[3] = { -1, -1, -1 };
+        g_vtExploding = RttiFindVtable(gdb, ".?AVExplodingObject@@", 0, &t[0]);
+        g_vtHeavy = RttiFindVtable(gdb, ".?AVHeavyObject@@", 0, &t[1]);
+        g_vtHeavySpawner = RttiFindVtable(gdb, ".?AVHeavyObjectsSpawner@@", 0, &t[2]);
+        void* ss = reinterpret_cast<void*>(gdb + DLVR_LID_GD_RVA(kSmartSetRva));
+        g_smartSet = SmartSetHeadOk(static_cast<const unsigned char*>(ss)) ? reinterpret_cast<SmartSetFn>(ss) : nullptr;
+        void* ig = reinterpret_cast<void*>(gdb + DLVR_LID_GD_RVA(kIgnoreRva));
+        g_ignorePlayer = IgnoreHeadOk(static_cast<const unsigned char*>(ig)) ? reinterpret_cast<IgnoreFn>(ig) : nullptr;
+        g_replInterval = reinterpret_cast<ReplIntervalFn>(GetProcAddress(en, "?ReplSetLocalReplicationInterval@IGSObject@@QEAAXMM@Z"));
+        auto rv = [gdb](uintptr_t v) { return static_cast<unsigned long long>(v ? v - gdb : 0); };
+        // [PROBE: CARRYHAND] gate=lid_by_hand  site=FLAT  log-only=no
+        LOG("lidhand: [CARRYHAND] CARRIED OBJECTS (logged unconditionally) - ExplodingObject vt +%llX (want +1671E80), HeavyObject +%llX "
+            "(want +16EA498), HeavyObjectsSpawner +%llX (want +16EBA28) [0 = not found, that class is not taken by hand; RTTI stages %d %d "
+            "%d] | throw credit +%llX %s | player ignore +%llX %s | ReplSetLocalReplicationInterval %s | physics ON + velocity: vfuncs "
+            "+%zu / +%zu / +%zu (no address) | velocity = the hand's 1:1, capped %.1f m/s, fastest >= 30 ms span in the last %.0f ms",
+            rv(g_vtExploding), rv(g_vtHeavy), rv(g_vtHeavySpawner), t[0], t[1], t[2],
+            static_cast<unsigned long long>(DLVR_LID_GD_RVA(kSmartSetRva)),
+            g_smartSet ? "ON" : "*** OFF - its code does not match the Steam bytes: a thrown object is credited to nobody ***",
+            static_cast<unsigned long long>(DLVR_LID_GD_RVA(kIgnoreRva)),
+            g_ignorePlayer ? "ON" : "*** OFF - its code does not match: the object may hit the player as it leaves the hand ***",
+            g_replInterval ? "found" : "*** MISSING - not called ***", kPhysNameVfuncOff, kSetLinVelVfuncOff, kGetLinVelVfuncOff,
+            lh::kCarryMaxSpeed, kCarryVelWindowMs);
     }
     // THE INSTANCE CHECK's exports (trace 20261125_1610 v2) - written BEFORE g_ready = 1, read only after it. NOT in `missing`: without
     // them the check is OFF and remembered lids are trusted by address as before (named on the INSTANCE CHECK line below).
@@ -1187,7 +1412,8 @@ bool ReadSnapshot(Snapshot& s)
 const char* kSideName[2] = { "right", "left" };
 const char* KindName(lh::ItemKind k)
 {
-    return k == lh::ItemKind::Chest ? "chest" : k == lh::ItemKind::Spawner ? "placed" : "dropped";
+    return k == lh::ItemKind::Chest ? "chest" : k == lh::ItemKind::Spawner ? "placed"
+         : k == lh::ItemKind::Carriable ? "carriable" : "dropped";
 }
 
 // A chest / placed item let go away from the shoulder, ALREADY HOME (spec 5.4, trace 20261120_2210): the game's take, the entry it added
@@ -1249,7 +1475,8 @@ void TakeAndDrop(void* item, lh::ItemKind kind, const float* Wd, int action, cha
 }
 
 // The grip opened (or the item was lost) while carrying: stow or give back (spec §4.5).
-void ReleaseItem(int side, bool lost)
+// explodedLive (final review finding 3): a held carriable that exploded but is still live - let go where it is, physics on, nothing else.
+void ReleaseItem(int side, bool lost, bool explodedLive = false)
 {
     HandState& H = g_hand[side];
     if (!H.item) { return; }
@@ -1273,7 +1500,8 @@ void ReleaseItem(int side, bool lost)
         const bool haveWd = RigDrawnHolderRead(side, D0);
         if (haveWd) { Mul34(D0, H.rel, Wd); }
         int action = -1;
-        const bool haveAction = SafeAction(item, g_player, &action);
+        // only where the release reads it (review minor 5): OnItemRelease returns Drop for a Carriable without it
+        const bool haveAction = lh::ReleaseNeedsAction(H.kind) && SafeAction(item, g_player, &action);
         const bool inShoulder = InShoulder(side);
         const lh::ItemRelease what = lh::OnItemRelease(inShoulder, haveAction ? action : -1, H.kind);
         // The item's own category back BEFORE it returns to its hook and before the game's take (trace 20261120_1634).
@@ -1300,15 +1528,59 @@ void ReleaseItem(int side, bool lost)
         // HOME FIRST (trace 20261120_2210): a chest item back on its hook (LP2's give-back); a placed item back to its world matrix (its
         // "taken" record is keyed by its world position - INV-758); a dropped item detached where it is shown (its OnDetached restarts
         // its physics; stowed, it is detached where it is and the take destroys it).
-        bool back = false;
+        bool back = false, detached = false;
         if (H.kind == lh::ItemKind::Chest) {
             back = HandCarryGiveBack(H.carry, "lidhand: release");
         } else if (H.kind == lh::ItemKind::Spawner) {
             back = HandCarryReleaseWorld(H.carry, H.carry.homeWorld, "lidhand: home");
         } else {
-            back = HandCarryReleaseWorld(H.carry, (what == lh::ItemRelease::Drop && haveWd) ? Wd : nullptr, "lidhand: drop");
+            back = HandCarryReleaseWorld(H.carry, (what == lh::ItemRelease::Drop && haveWd) ? Wd : nullptr, "lidhand: drop", &detached);
         }
-        if (what == lh::ItemRelease::Stow && back) {
+        // FREE of the hand once the detach returned, even when the placement write after it faulted (review minor 8): a carriable then
+        // still gets its physics back (it would otherwise hang in the air), a DroppedItem its drop line.
+        const bool freed = lh::ReleaseFreed(back, detached);
+        const char* detachText = back ? "ok" : freed ? "ok, but its placement write FAULTED (left where the holder had it)"
+                                                     : "*** FAULTED twice - the object stays on the holder, the carry is forgotten ***";
+        if (H.kind == lh::ItemKind::Carriable && explodedLive) {
+            // EXPLODED IN THE HAND (final review finding 3): detached above where it is shown; physics back on so it is not left floating;
+            // no credit, no player ignore, no velocity (it was not thrown).
+            const bool physOn = freed && SafePhysicsOn(item);
+            // [PROBE: CARRYHAND] gate=lid_by_hand  site=HEADSET  log-only=no
+            LOG("lidhand: [CARRYHAND] EXPLODED IN HAND %s hand's carriable %p (its +1008 set, still live by id) - let go: detach %s | "
+                "physics ON %s | no credit / velocity%s", kSideName[side], item, detachText, physOn ? "ok" : "*** NOT ON ***", catText);
+        } else if (H.kind == lh::ItemKind::Carriable) {
+            // THE THROW (trace 20261126_1500; Jay: "a physical throw by arm movement & releasing grip"): already detached at the drawn item
+            // matrix above. Then: physics ON (ours - these classes' detach restarts nothing), the game's own throw writes (credit by exact
+            // class, the player's 1 s ignore), the hand's velocity (1:1, capped) through ObjectDI +432, read back through +440.
+            throwable::Vec3 hv{};
+            double atMs = 0.0;
+            LARGE_INTEGER now{};
+            QueryPerformanceCounter(&now);
+            const bool haveV = H.hist.Fastest(QpcMs(now.QuadPart), kCarryVelWindowMs, hv, atMs);
+            const lh::V3 v = haveV ? lh::CarryLaunchVelocity(lh::V3{ hv.x, hv.y, hv.z }, lh::kCarryMaxSpeed) : lh::V3{};
+            const float hs = std::sqrt(hv.x * hv.x + hv.y * hv.y + hv.z * hv.z);
+            const float vs = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+            const bool physOn = freed && SafePhysicsOn(item);
+            int credit = 0;
+            const lh::CreditResult cred = freed ? SafeCredit(item, g_player, &credit) : lh::CreditResult::NotCalled;
+            const bool ignOk = freed && SafeIgnorePlayer(g_player, item);
+            const float vw[3] = { v.x, v.y, v.z };
+            const bool velOk = freed && physOn && SafeSetLinVel(item, vw);
+            float rb[3] = { 0.0f, 0.0f, 0.0f };
+            const bool rbOk = velOk && SafeGetLinVel(item, rb);
+            InterlockedIncrement(&g_nThrow);
+            InterlockedIncrement(&g_nDrop);
+            // [PROBE: CARRYHAND] gate=lid_by_hand  site=HEADSET  log-only=no
+            LOG("lidhand: [CARRYHAND] THROW %s hand's carriable %p: detach %s | hand %s %.2f m/s (age %.0f ms) -> velocity (%.2f %.2f %.2f) "
+                "%.2f m/s%s | physics ON %s | credit %s | player ignore 1 s %s | velocity %s, read back (%.2f %.2f %.2f) %s%s",
+                kSideName[side], item, back ? (haveWd ? "at the drawn item matrix" : "*** at the holder (no drawn pose) ***") : detachText,
+                haveV ? "speed" : "*** NO VELOCITY (fewer than 2 samples >= 30 ms apart) - dropped ***", hs,
+                haveV ? (QpcMs(now.QuadPart) - atMs) : -1.0, v.x, v.y, v.z, vs, vs + 1e-4f < hs ? " (CAPPED)" : "",
+                physOn ? "ok" : "*** NOT ON ***",
+                lh::CreditText(cred, credit),
+                ignOk ? "ok" : "*** NOT set ***", velOk ? "set (+432)" : "*** NOT SET ***", rb[0], rb[1], rb[2],
+                rbOk ? "(+440)" : "*** NOT READ ***", catText);
+        } else if (what == lh::ItemRelease::Stow && back) {
             const bool ok = SafeExecute(g_player, item);
             InterlockedIncrement(&g_nStow);
             // THE STOW BUZZ (trace 20261124_1910, Jay: "Need haptic response for item stowing"): the take's pulse on the stowing hand,
@@ -1325,14 +1597,14 @@ void ReleaseItem(int side, bool lost)
             // [PROBE: LIDHAND] gate=lid_by_hand  site=HEADSET  log-only=no
             LOG("lidhand: [LIDHAND] STOW %s hand's %s item %p over the shoulder - the game's own take (+B9B930, action %d) %s | %s%s",
                 kSideName[side], KindName(H.kind), item, action, ok ? "called" : "*** FAULTED ***", pulseText, catText);
-        } else if (what == lh::ItemRelease::Drop && back && H.kind == lh::ItemKind::Dropped) {
+        } else if (what == lh::ItemRelease::Drop && freed && H.kind == lh::ItemKind::Dropped) {
             float was = -1.0f;
             const bool zeroed = SafeZeroDropSpeed(item, &was);
             InterlockedIncrement(&g_nDrop);
             // [PROBE: LIDHAND] gate=lid_by_hand  site=HEADSET  log-only=no
             LOG("lidhand: [LIDHAND] DROP dropped %s hand's item %p - detached at the hand (%s); its own OnDetached restarts its "
                 "physics | flight speed [+1412] %.2f -> %s%s", kSideName[side], item,
-                haveWd ? "at the drawn item matrix" : "*** no drawn hand pose - left at the holder ***", was,
+                !back ? detachText : haveWd ? "at the drawn item matrix" : "*** no drawn hand pose - left at the holder ***", was,
                 zeroed ? "0 (it falls)" : "*** NOT zeroed (faulted) ***", catText);
         } else if (what == lh::ItemRelease::Drop && back) {
             char dropText[512];   // 320 -> 512 (trace 20261121_1627): the success line names two ItemIDs now (~340 chars at most)
@@ -1435,10 +1707,34 @@ bool LidHandOnNearby(void* player, void* const* gameData, unsigned gameCount, vo
             const int kind = IsVt(obj, g_vtItem) ? static_cast<int>(lh::ItemKind::Chest)
                            : (IsVt(obj, g_vtDropped) || IsVt(obj, g_vtFlare)) ? static_cast<int>(lh::ItemKind::Dropped)
                            : (IsVt(obj, g_vtSpawner) || IsVt(obj, g_vtSpawnerR) || IsVt(obj, g_vtSpawnerC)) ? static_cast<int>(lh::ItemKind::Spawner)
+                           : CarriableNow(obj, player) ? static_cast<int>(lh::ItemKind::Carriable)
                            : -1;
             if (kind >= 0 && SafeBox(obj, ibox[ni])) {
                 items[ni] = obj; ikind[ni] = kind; ++ni;
                 if (kind != static_cast<int>(lh::ItemKind::Chest)) { ++nw; }
+            } else if (kind < 0) {
+                // RUN CO1 diagnostic: the first 12 gathered triggers NO kind claims, by vtable + mesh - a canister of a class we do not
+                // test (e.g. a derived GasTankObject) shows here. COST: one interlocked increment per unclaimed candidate after 12.
+                static LONG s_u = 0;
+                const LONG u = InterlockedIncrement(&s_u);
+                if (u <= 12) {
+                    uintptr_t vt = 0;
+                    ReadPtr(o, &vt);
+                    char mesh[96] = "(name not read)";
+                    if (g_getMeshName) { SafeMeshName(obj, mesh, sizeof(mesh)); }
+                    const HMODULE gdm = GetModuleHandleA("gamedll_x64_rwdi.dll");
+                    const uintptr_t gb = reinterpret_cast<uintptr_t>(gdm);
+                    // [PROBE: CARRYHAND] gate=lid_by_hand  site=FLAT  log-only=yes
+                    LOG("lidhand: [CARRYHAND] UNCLAIMED %ld of 12: trigger %p vt +%llX mesh '%s' (not a lid / item / carriable class)", u,
+                        obj, static_cast<unsigned long long>(vt && gb && vt > gb ? vt - gb : 0), mesh);
+                }
+            } else if (kind == static_cast<int>(lh::ItemKind::Carriable)) {
+                static LONG s_b = 0;
+                if (InterlockedIncrement(&s_b) <= 4) {
+                    // [PROBE: CARRYHAND] gate=lid_by_hand  site=FLAT  log-only=yes
+                    LOG("lidhand: [CARRYHAND] *** carriable %p NOT published: its box (GetExtentsInWorld) did not read *** (%ld of 4)", obj,
+                        s_b);
+                }
             }
         }
     }
@@ -1486,9 +1782,21 @@ bool LidHandOnNearby(void* player, void* const* gameData, unsigned gameCount, vo
     for (int k = 0; k < nloot && !nullIt; ++k) {
         nullIt = reinterpret_cast<uintptr_t>(loots[k]) == pick && State(loots[k]) != kStateLocked;
     }
+    // a carriable the grip takes (trace 20261126_1815; Jay: "Stop working on carriables. Along with supressing RT throwing"): hand only,
+    // as a lid - X has no target, so the game's carry (and its RT throw) never starts; its prompt goes to the HUD with the grip icon.
+    bool carriablePick = false;
+    for (int k = 0; k < ni && !nullIt; ++k) {
+        nullIt = carriablePick = reinterpret_cast<uintptr_t>(items[k]) == pick &&
+                                 lh::PickWithheldForItem(static_cast<lh::ItemKind>(ikind[k]));
+    }
+    if (carriablePick && InterlockedIncrement(&g_nCarryNull) == 1) {
+        // [PROBE: CARRYHAND] gate=lid_by_hand  site=HEADSET  log-only=no
+        LOG("lidhand: [CARRYHAND] FIRST CARRIABLE PICK WITHHELD - the game picked carriable %p: X has no target (no game carry, no RT "
+            "throw), its prompt goes to the HUD with the grip icon", reinterpret_cast<void*>(pick));
+    }
     if (nullIt && InterlockedIncrement(&g_nNull) == 1) {
         // [PROBE: LIDHAND] gate=lid_by_hand  site=HEADSET  log-only=no
-        LOG("lidhand: [LIDHAND] FIRST NULL PICK - the game picked %p (a lid container / a carried item): its prompt and X are "
+        LOG("lidhand: [LIDHAND] FIRST NULL PICK - the game picked %p (a lid container / a carried item / a carriable): its prompt and X are "
             "withheld, the game's interaction never starts for it", reinterpret_cast<void*>(pick));
     }
     // the lid / purse the null hid goes to the HUD prompt only (looting.cpp PickGetHook); a carried item gets none
@@ -1642,15 +1950,39 @@ void LidHandTick()
         bool inZone = false;   // g_zone[side] at the end of this tick (trace 20261119_1215: the hip holsters yield to it)
         // ---- a carried item ----
         if (H.item) {
+            // a carriable's hand history (trace 20261126_1500): the rig's game-world grip + its QPC, BEFORE the release test so the
+            // let-go tick's own sample is in it. COST: one seqlock read per carrying hand per tick (the same read HandWorldPos makes).
+            if (H.kind == lh::ItemKind::Carriable) {
+                float gp[3], gr[9];
+                long long gq = 0;
+                if (RigGripWorldRead(side, gp, gr, &gq) && gq) { H.hist.Push(QpcMs(gq), throwable::Vec3{ gp[0], gp[1], gp[2] }); }
+            }
             // a chest item is lost with its container's open state / its hook; a world item when the engine no longer returns it by
             // its id (destroyed - e.g. the 80-dropped-item cap) or it left the holder (trace 20261120_2210; INV-663: no read of it then)
-            const bool lost = H.kind == lh::ItemKind::Chest
+            bool lost = H.kind == lh::ItemKind::Chest
                 ? (!IsVt(H.itemOwner, g_vtContainer) || State(H.itemOwner) != kStateOpened || !HandCarryStillOn(H.carry))
                 : HandCarryObjectGone(H.carry, g_player);
+            // A CARRIABLE (final review finding 3): also lost while being destroyed; a LIVE one that has exploded (ExplodingObject +1008,
+            // its explosion +A9E720 does not destroy it) is let go where it is, physics on, no credit / velocity. The object's own
+            // fields are read only once the engine still returns it by its id (not lost).
+            bool explodedLive = false;
+            if (H.kind == lh::ItemKind::Carriable) {
+                int gid = -1;
+                bool dying = false, exploded = false;
+                if (!lost) {
+                    ObjIdentity(H.item, &gid, &dying);
+                    unsigned char ex = 0;
+                    exploded = !dying && IsVt(H.item, g_vtExploding) &&
+                               SafeReadByte(reinterpret_cast<uintptr_t>(H.item) + kExplodedFlagOff, &ex) && ex != 0;
+                }
+                const lh::CarryLost v = lh::CarriableLostVerdict(lost, dying, exploded);
+                lost = v == lh::CarryLost::Forget;
+                explodedLive = v == lh::CarryLost::DetachLive;
+            }
             if (lost) {
                 ReleaseItem(side, true);
-            } else if (!down) {
-                ReleaseItem(side, false);
+            } else if (explodedLive || !down) {
+                ReleaseItem(side, false, explodedLive);
             }
             isNear = H.item != nullptr;
             inZone = isNear;
@@ -1797,6 +2129,15 @@ void LidHandTick()
             }
         }
         // ---- a new grab: an item first (it lies in an open container), else a lid ----
+        if (edge && H.lid < 0 && !H.item && (!haveHand || !haveSnap)) {
+            static LONG s_q = 0;
+            if (InterlockedIncrement(&s_q) <= 4) {
+                // [PROBE: CARRYHAND] gate=lid_by_hand  site=HEADSET  log-only=yes
+                LOG("lidhand: [CARRYHAND] PRESS (%s hand) NOT TESTED: %s%s (%ld of 4)", kSideName[side],
+                    haveHand ? "" : "*** no game-world hand (RigGripWorldRead) *** ",
+                    haveSnap ? "" : "*** no published gather snapshot ***", s_q);
+            }
+        }
         if (H.lid < 0 && !H.item && haveHand && haveSnap) {
             float dl[kMaxPub], di[kMaxPub];
             for (int i = 0; i < s.ni; ++i) {
@@ -1881,6 +2222,28 @@ void LidHandTick()
                 }
                 bo = lh::NearestWithin(dlo, s.nloot, LootReachM);
             }
+            // RUN CO1 diagnostic: a grip press that takes nothing - the first 8 say what was published and how near the nearest
+            // carriable was (any distance), or what blocked a press that HAD one in reach. COST: on a grip edge only.
+            if (edge && (bi < 0 || g_padOwned[side] || !body) && bl < 0 && bo < 0) {
+                static LONG s_p = 0;
+                const LONG pn = InterlockedIncrement(&s_p);
+                if (pn <= 8) {
+                    int nc = 0;
+                    float best = -1.0f;
+                    for (int i = 0; i < s.ni; ++i) {
+                        if (s.ikind[i] != static_cast<int>(lh::ItemKind::Carriable)) { continue; }
+                        ++nc;
+                        const float d = looting::BoxDist(s.ibox[i], hw);
+                        if (best < 0.0f || d < best) { best = d; }
+                    }
+                    // [PROBE: CARRYHAND] gate=lid_by_hand  site=HEADSET  log-only=yes
+                    LOG("lidhand: [CARRYHAND] PRESS %ld of 8 (%s hand) took nothing: %s | published %d item(s), %d carriable(s), nearest "
+                        "carriable box %.3f m (reach %.2f) | hand (%.2f %.2f %.2f)", pn, kSideName[side],
+                        bi >= 0 ? (g_padOwned[side] ? "*** an earlier poller owns this press (holster / two-hand / reload) ***"
+                                                    : "*** no player body model ***")
+                                : "nothing in reach", s.ni, nc, best, LootReachM, hw[0], hw[1], hw[2]);
+                }
+            }
             isNear = isNear || bi >= 0 || bl >= 0 || bo >= 0;
             // THE ENTRY BUZZ (Jay: "Buzz is fine"): a light pulse when this hand comes into a lid's / an item's zone
             const bool zone = bi >= 0 || bl >= 0 || bo >= 0;
@@ -1892,6 +2255,28 @@ void LidHandTick()
             if (edge && !g_padOwned[side] && bi >= 0 && body) {
                 void* item = s.item[bi];
                 const lh::ItemKind kind = static_cast<lh::ItemKind>(s.ikind[bi]);
+                // A PILE (HeavyObjectsSpawner, trace 20261126_1500): its own spawn once, then the object it handed out is the one taken
+                if (kind == lh::ItemKind::Carriable && IsVt(item, g_vtHeavySpawner)) {
+                    // only when the take can follow (review minor 4, trace 20261126_1800): a spawn whose take is refused leaves its
+                    // object at the pile with the pile "one out" (SafeSpawnFrom then refuses every later grip)
+                    int holderElem = -1;
+                    const bool worldOk = HandCarryWorldTakeReady();
+                    if (body) { SafeElemId(body, side == 0 ? "R_HandHolder" : "L_HandHolder", &holderElem); }
+                    void* spawned = nullptr;
+                    if (!lh::PileSpawnReady(worldOk, body != nullptr, holderElem)) {
+                        // [PROBE: CARRYHAND] gate=lid_by_hand  site=HEADSET  log-only=no
+                        LOG("lidhand: [CARRYHAND] SPAWN NOT ASKED %s hand: pile %p - the take could not follow (%s) - nothing spawned",
+                            kSideName[side], item, !worldOk ? "the world take's exports are not ready" : !body ? "no player body"
+                                                                                               : "the hand's holder element not found");
+                    } else {
+                        spawned = SafeSpawnFrom(item);
+                        // [PROBE: CARRYHAND] gate=lid_by_hand  site=HEADSET  log-only=no
+                        LOG("lidhand: [CARRYHAND] SPAWN %s hand: pile %p -> %s %p", kSideName[side], item,
+                            spawned ? (IsVt(spawned, g_vtHeavy) ? "HeavyObject" : "*** an object of another class ***") : "*** REFUSED "
+                            "(one already out, nothing handed out, or a fault) - not taken ***", spawned);
+                    }
+                    item = spawned;
+                }
                 const bool world = kind != lh::ItemKind::Chest;
                 uintptr_t owner = 0;
                 int home = -1, onElem = -1;
@@ -1901,7 +2286,7 @@ void LidHandTick()
                 // in the palm; r_hand / l_hand put the item at the wrist (trace 20261120_1900, Jay: "it doesn't sit in the palm").
                 const char* const holderName = side == 0 ? "R_HandHolder" : "L_HandHolder";
                 // a chest item hangs off its container's hook element; a world item off none (HandCarryTakeWorld refuses one that does)
-                const bool taken = SafeElemId(body, holderName, &onElem) && onElem >= 0 &&
+                const bool taken = item && SafeElemId(body, holderName, &onElem) && onElem >= 0 &&
                     (world ? HandCarryTakeWorld(H.carry, item, body, onElem, ident)
                            : (SafeParentMeshElem(item, &home) && home >= 0 &&
                               HandCarryTakeAs(H.carry, item, reinterpret_cast<void*>(owner), home, body, onElem, ident)));
@@ -1914,9 +2299,12 @@ void LidHandTick()
                     if (RigTwoHandHaptic > 0.0f) { PulseController(side == 0 ? kRightHand : kLeftHand, RigTwoHandHaptic, 40); }
                     // A held DroppedItem stops simulating: physics OFF right after the attach, the same tick (the game's +ECF2E0 does it
                     // just before its attach; no physics step runs between the two on this thread). Its OnDetached restarts it.
-                    H.physOff = kind == lh::ItemKind::Dropped && SafePhysicsOff(item);
+                    // A carriable (trace 20261126_1500): the same physics OFF; ITS detach restarts nothing - ReleaseItem turns it back on.
+                    const bool physKind = kind == lh::ItemKind::Dropped || kind == lh::ItemKind::Carriable;
+                    H.physOff = physKind && SafePhysicsOff(item);
+                    if (kind == lh::ItemKind::Carriable) { H.hist.Clear(); }   // the let-go velocity is the motion AFTER the take
                     char physText[96] = "";
-                    if (kind == lh::ItemKind::Dropped) {
+                    if (physKind) {
                         strcpy_s(physText, H.physOff ? " | physics OFF while held (the game's slot +256 type 0)"
                                                      : " | *** physics NOT switched off (no bind / faulted) - it may fight the hand ***");
                     }
@@ -1992,6 +2380,13 @@ void LidHandTick()
                         "(element %d) until let go%s%s%s", kSideName[side], KindName(kind), item, itemMesh,
                         world ? "the world (home = its world matrix)" : "container", reinterpret_cast<void*>(owner), home,
                         holderName, onElem, catText, placeText, poseText);
+                    if (kind == lh::ItemKind::Carriable) {
+                        // [PROBE: CARRYHAND] gate=lid_by_hand  site=HEADSET  log-only=no
+                        LOG("lidhand: [CARRYHAND] TAKE %s hand: %s %p mesh '%s' - the game's take NOT called (no game carry, "
+                            "no RT throw); physics %s; let go = thrown with the hand's velocity", kSideName[side],
+                            IsVt(item, g_vtExploding) ? "ExplodingObject" : IsVt(item, g_vtHeavy) ? "HeavyObject" : "*** other class ***",
+                            item, itemMesh, H.physOff ? "OFF while held" : "*** NOT switched off ***");
+                    }
                 } else {
                     // [PROBE: LIDHAND] gate=lid_by_hand  site=HEADSET  log-only=no
                     LOG("lidhand: [LIDHAND] REFUSED take of %s item %p (%s hand): home element %d, hand element %d - not carried%s",
@@ -2176,6 +2571,13 @@ bool LidHandCarrying(int side)
 {
     if (!LidByHand || side < 0 || side > 1) { return false; }
     return g_carried[side] != nullptr;   // set at the take, cleared in ReleaseItem (trace 20261120_1815)
+}
+
+bool LidHandIsCarriable(void* obj)
+{
+    // the vtables are written once before g_ready = 1 (Ready); IsVt reads the object's first qword, guarded (trace 20261126_1815)
+    if (!LidByHand || g_ready != 1 || !obj) { return false; }
+    return IsVt(obj, g_vtExploding) || IsVt(obj, g_vtHeavy) || IsVt(obj, g_vtHeavySpawner);
 }
 
 void* LidHandCarriedItem(int side)

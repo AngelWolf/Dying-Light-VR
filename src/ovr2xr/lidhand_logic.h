@@ -372,15 +372,80 @@ inline float ClipTFromLocal(const float (*frames)[12], int n, const float cur[12
 enum class ItemRelease { Stow, GiveBack, Drop };
 
 // What a carried item is (INV-758): a lid container's ContainerItem, a placed ItemSpawner (it IS the item), or a DroppedItem.
-enum class ItemKind { Chest, Spawner, Dropped };
+// Carriable (plan 2026-11-26-carried-objects-by-hand): an ExplodingObject / HeavyObject the game would carry (action 29) - no
+// inventory entry. APPENDED LAST: lidhand.cpp keeps these as ints (g_pubItemKind), the first three keep 0 / 1 / 2.
+enum class ItemKind { Chest, Spawner, Dropped, Carriable };
 // Plan 2026-11-20-world-items-by-hand (Jay: "Just do the physics then instead", "chest items drop with physics too"): shoulder + action 1
 // = Stow; the inventory refusing (23) or an unread action (-1) = GiveBack for an item with a home (Chest / Spawner), Drop for a
 // DroppedItem (no home - it falls where it is); any other release = Drop (the game's take + the game's drop at the hand).
+// A Carriable is ALWAYS a Drop (Jay 2026-11-26: "a physical throw by arm movement & releasing grip") - no stow, no home.
 inline ItemRelease OnItemRelease(bool inShoulderZone, int takeAction, ItemKind kind)
 {
+    if (kind == ItemKind::Carriable) { return ItemRelease::Drop; }
     if (takeAction == 1) { return inShoulderZone ? ItemRelease::Stow : ItemRelease::Drop; }
     return kind == ItemKind::Dropped ? ItemRelease::Drop : ItemRelease::GiveBack;
 }
+
+// The carriables' take actions (RUN CO2, 2026-11-26: a carriable gas cylinder showing the X prompt read 1): the action test returns 1
+// when the object's own CanExecuteTake (vfunc +1632; Mac name) passes, 29 only on a later path (woc1 +AA1820 / +B33350 / +B35B30); the
+// game's take (+AA1A10 / +B33530) does not test which. What 29 means: NOT established.
+inline bool IsCarryAction(int action) { return action == 1 || action == 29; }
+// A carriable in reach is grabbable (final review findings 1 / 2): a take action AND its own CanExecute (slot +1048) for that action -
+// CanExecute holds the pile's "one already out", "enabled" and IsActiveOnModule (woc1); the action alone does not.
+inline bool CarriableGrabbable(int action, bool canExecute) { return IsCarryAction(action) && canExecute; }
+
+// A held carriable (final review finding 3): gone (no longer returned by its id / off the holder) or being destroyed = Forget (no call
+// on it); live but exploded (ExplodingObject +1008 - its explosion +A9E720 does not destroy it) = DetachLive; else Keep.
+enum class CarryLost { Keep, Forget, DetachLive };
+inline CarryLost CarriableLostVerdict(bool gone, bool dying, bool exploded)
+{
+    if (gone || dying) { return CarryLost::Forget; }
+    return exploded ? CarryLost::DetachLive : CarryLost::Keep;
+}
+
+// The carriable's let-go velocity (spec 2026-11-26-carried-objects-by-hand §6b): the hand's own velocity 1:1 (game-world m/s), its
+// LENGTH clamped to `cap`. kCarryMaxSpeed = the game's own top throw (per-type speed 8 m/s +139EDD8 x its mass factor <= 2, +D5A8E0).
+struct V3 { float x = 0.0f, y = 0.0f, z = 0.0f; };
+constexpr float kCarryMaxSpeed = 16.0f;
+inline V3 CarryLaunchVelocity(V3 hand, float cap)
+{
+    // a non-finite hand velocity is dropped (0), never sent to the physics (review minor 7, trace 20261126_1800)
+    if (!std::isfinite(hand.x) || !std::isfinite(hand.y) || !std::isfinite(hand.z)) { return V3{}; }
+    const double sp = std::sqrt(static_cast<double>(hand.x) * hand.x + static_cast<double>(hand.y) * hand.y +
+                                static_cast<double>(hand.z) * hand.z);
+    if (!(sp > cap)) { return hand; }
+    const double k = cap / sp;
+    return V3{ static_cast<float>(hand.x * k), static_cast<float>(hand.y * k), static_cast<float>(hand.z * k) };
+}
+
+// ---- the 5 review minors (trace 20261126_1800) ----
+// A pile (HeavyObjectsSpawner) is spawned only when the take can follow: the world take's exports ready, the player body, the hand's
+// holder element found. A spawn whose take is then refused leaves its object at the pile with the pile "one out" (minor 4).
+inline bool PileSpawnReady(bool worldTakeReady, bool haveBody, int holderElem) { return worldTakeReady && haveBody && holderElem >= 0; }
+// The release reads the item's action only where it is used: OnItemRelease returns Drop for a Carriable before reading it (minor 5).
+inline bool ReleaseNeedsAction(ItemKind kind) { return kind != ItemKind::Carriable; }
+// The throw's credit, by its real outcome (minor 6). `field` = the credited offset when Given (912 HeavyObject / 1344 ExplodingObject).
+enum class CreditResult { Given, NotExactClass, NoExport, Faulted, NotCalled };
+inline const char* CreditText(CreditResult r, int field)
+{
+    switch (r) {
+    case CreditResult::Given:         return field == 912 ? "+912 = player (HeavyObject)" : "+1344 = player (ExplodingObject)";
+    case CreditResult::NotExactClass: return "none (not one of the two exact classes - the game credits none either)";
+    case CreditResult::NoExport:      return "*** OFF (the credit export is missing) ***";
+    case CreditResult::Faulted:       return "*** FAULTED in the credit call ***";
+    case CreditResult::NotCalled:     return "not called (the object was not freed)";
+    }
+    return "?";
+}
+// An object is free of the hand once its detach returned, even if the placement write after it faulted (minor 8).
+inline bool ReleaseFreed(bool releasedClean, bool detached) { return releasedClean || detached; }
+
+// ---- the carriables' prompt (trace 20261126_1815; Jay: "Stop working on carriables. Along with supressing RT throwing") ----
+// The game's pick on a PUBLISHED item of this kind is nulled (X has no target; the game's carry and its RT throw never start) and handed
+// to the HUD prompt - the grip only. Chest / world loot items keep the game's pick (their X is the game's own take, unchanged).
+inline bool PickWithheldForItem(ItemKind kind) { return kind == ItemKind::Carriable; }
+// The handed-off prompt's action text: a carriable keeps the game's own translated "Take"; a lid / purse says "Grab" (TriggerGrab).
+inline bool PromptKeepsGameText(bool carriable) { return carriable; }
 
 // Which inventory entry a take added or raised, from before / after snapshots (entry pointers + stack counts at entry +64, INV-755):
 // an entry new in `after` = its whole stack (a count of 0 - a non-stacking item - = 1); the same entry with a higher count = the rise.
