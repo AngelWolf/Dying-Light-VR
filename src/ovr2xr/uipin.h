@@ -80,6 +80,14 @@ int HudHiddenForPause();
 // COST: the level walk with one RTTI class read per listed level (a few dozen pointer reads).
 int LevelScreensShowing(const char* cls);
 
+// QUEST-BRIEF EXEMPTION from ui_hud_hide (uipanel.cpp RenderHud; trace docs/traces/20261126_1215_challengebrief_component.md - v2,
+// v1's screen walk matched nothing in RUN DZ3): is the HUD component HudChallengeBrief - the "Accept" card a quarantine zone opens with
+// (our Data0 data/menu/hud/hud.xui:25292) - ACTIVE (the HUD manager's component, flags +0x30 bit 0, INV-642 / INV-725)? 1 = active,
+// 0 = registered and not active, -1 = no manager / not registered / fault. `idOut` (optional) = its component id (-1 = not found).
+// Reads only, SEH-guarded. Submit thread only. COST: ~5 guarded reads with the id cached; a scan of <= 137 slots at most every 500 ms
+// while it is not found.
+int ChallengeBriefActive(int* idOut);
+
 // CALIBRATION SCREEN SOUND (calibsound.cpp): the UI system (CUIManager, level +0x568) of the MainMenuModuleDI level when one
 // is listed (the main menu and every in-game menu, INV-529), else of the LevelDI level, else 0. Re-read on every call (never
 // cached - a level change is picked up). `levelClass` (optional) = the class whose level matched, "none" or "read fault".

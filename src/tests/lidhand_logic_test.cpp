@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 
 #include "lidhand_logic.h"
 
@@ -108,6 +109,113 @@ static void TestItemReleaseByKind()
     const R right = lh::OnItemRelease(true, 1, K::Spawner);
     const R left = lh::OnItemRelease(false, 1, K::Chest);
     Check(right == R::Stow && left == R::Drop && lh::OnItemRelease(true, 1, K::Spawner) == right, "release_is_per_side");
+}
+
+// (h2) Plan 2026-11-26-carried-objects-by-hand Task 2: a carriable (gas canister / crate - no inventory entry) is never stowed and never
+//      given back: every let-go is a Drop (it leaves the hand with the hand's velocity). The production change that fails this: any
+//      Carriable branch that reaches the action test (shoulder + 1 -> Stow, 23 / -1 -> GiveBack).
+static void TestCarriableRelease()
+{
+    using K = lh::ItemKind;
+    using R = lh::ItemRelease;
+    Check(lh::OnItemRelease(true, 29, K::Carriable) == R::Drop, "carriable_shoulder_29_drops");
+    Check(lh::OnItemRelease(false, -1, K::Carriable) == R::Drop, "carriable_unread_action_drops");
+    Check(lh::OnItemRelease(true, 1, K::Carriable) == R::Drop, "carriable_never_stows");
+    Check(lh::OnItemRelease(false, 23, K::Carriable) == R::Drop, "carriable_never_goes_home");
+    // the three existing kinds unchanged by the new kind (appended last)
+    Check(static_cast<int>(K::Chest) == 0 && static_cast<int>(K::Spawner) == 1 && static_cast<int>(K::Dropped) == 2 &&
+          static_cast<int>(K::Carriable) == 3, "carriable_appended_last");
+}
+
+// (h2b) Final review findings 1 / 2: a carriable is grabbable only when the game's action is 29 AND its own CanExecute (slot +1048)
+//       agrees - CanExecute is where the pile's "one already out" (+880 / +888), "enabled" (+416) and IsActiveOnModule live (woc1 :773,
+//       :550, :688). The production change that fails this: publishing on the action alone (the reviewed code).
+// RUN CO2 (2026-11-26): a carriable gas cylinder showing the game's X prompt read action 1 - the action test returns 1 when the object's
+// own CanExecuteTake (vfunc +1632) passes, 29 only on a later path (woc1 +AA1820 / +B33350 / +B35B30). The production change that fails
+// this: accepting 29 alone (the build RUN CO1 / CO2 ran).
+static void TestCarriableGrabbable()
+{
+    Check(lh::CarriableGrabbable(1, true), "grabbable_1_and_canexecute (RUN CO2's canister)");
+    Check(lh::CarriableGrabbable(29, true), "grabbable_29_and_canexecute");
+    Check(!lh::CarriableGrabbable(1, false), "not_grabbable_1_when_canexecute_refuses");
+    Check(!lh::CarriableGrabbable(29, false), "not_grabbable_when_canexecute_refuses (pile out / disabled / inactive)");
+    Check(!lh::CarriableGrabbable(0, true), "not_grabbable_other_action");
+    Check(!lh::CarriableGrabbable(23, true), "not_grabbable_action_23");
+    Check(!lh::CarriableGrabbable(-1, true), "not_grabbable_action_unread");
+    Check(lh::IsCarryAction(1) && lh::IsCarryAction(29) && !lh::IsCarryAction(0) && !lh::IsCarryAction(12), "carry_actions_are_1_and_29");
+}
+
+// (h2c) Final review finding 3: a held carriable that the engine no longer returns by id, or that is being destroyed = Forget (no call
+//       on it); one that is LIVE but has exploded (ExplodingObject +1008 set by its explosion +A9E720, woc4 :39) = DetachLive (let go
+//       where it is, physics on, no credit / velocity); else Keep. The production change that fails this: the reviewed lost test, which
+//       only knew "gone".
+static void TestCarriableLost()
+{
+    using L = lh::CarryLost;
+    Check(lh::CarriableLostVerdict(false, false, false) == L::Keep, "carriable_kept");
+    Check(lh::CarriableLostVerdict(true, false, false) == L::Forget, "carriable_gone_forgotten");
+    Check(lh::CarriableLostVerdict(false, true, false) == L::Forget, "carriable_dying_forgotten");
+    Check(lh::CarriableLostVerdict(true, false, true) == L::Forget, "carriable_gone_beats_exploded");
+    Check(lh::CarriableLostVerdict(false, true, true) == L::Forget, "carriable_dying_beats_exploded");
+    Check(lh::CarriableLostVerdict(false, false, true) == L::DetachLive, "carriable_exploded_live_detached");
+}
+
+// (h3) The let-go velocity: the hand's own velocity 1:1, its LENGTH clamped to the cap (spec §6b: 16 m/s, the game's own top 8 x 2).
+//      The production change that fails this: any rescale (the throwables' item-speed share) or a per-axis clamp.
+static void TestCarryLaunchVelocity()
+{
+    Check(Near(lh::kCarryMaxSpeed, 16.0, 1e-6), "carry_cap_is_16");
+    lh::V3 a = lh::CarryLaunchVelocity(lh::V3{ 3.0f, 0.0f, 4.0f }, 16.0f);
+    Check(Near(a.x, 3.0, 1e-4) && Near(a.y, 0.0, 1e-4) && Near(a.z, 4.0, 1e-4), "carry_velocity_under_cap_is_1to1");
+    lh::V3 b = lh::CarryLaunchVelocity(lh::V3{ 30.0f, 0.0f, 40.0f }, 16.0f);
+    Check(Near(b.x, 9.6, 1e-4) && Near(b.y, 0.0, 1e-4) && Near(b.z, 12.8, 1e-4), "carry_velocity_length_clamped");
+    lh::V3 c = lh::CarryLaunchVelocity(lh::V3{ 0.0f, 0.0f, 0.0f }, 16.0f);
+    Check(Near(c.x, 0.0, 1e-9) && Near(c.y, 0.0, 1e-9) && Near(c.z, 0.0, 1e-9), "carry_velocity_still_is_zero");
+    lh::V3 d = lh::CarryLaunchVelocity(lh::V3{ 0.0f, -20.0f, 0.0f }, 16.0f);
+    Check(Near(d.y, -16.0, 1e-4), "carry_velocity_down_clamped_too");
+    // review minor 7: a non-finite hand velocity is dropped (0), never sent to the physics
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float inf = std::numeric_limits<float>::infinity();
+    lh::V3 e = lh::CarryLaunchVelocity(lh::V3{ nan, 1.0f, 1.0f }, 16.0f);
+    Check(e.x == 0.0f && e.y == 0.0f && e.z == 0.0f, "carry_velocity_nan_is_zero");
+    lh::V3 f = lh::CarryLaunchVelocity(lh::V3{ 1.0f, inf, 1.0f }, 16.0f);
+    Check(f.x == 0.0f && f.y == 0.0f && f.z == 0.0f, "carry_velocity_inf_is_zero");
+}
+
+// The 5 review minors (trace 20261126_1800).
+static void TestCarryMinors()
+{
+    // minor 4: a pile spawns only when the take can follow
+    Check(lh::PileSpawnReady(true, true, 3), "pile_spawn_ready_all_ok");
+    Check(!lh::PileSpawnReady(false, true, 3), "pile_spawn_no_world_take");
+    Check(!lh::PileSpawnReady(true, false, 3), "pile_spawn_no_body");
+    Check(!lh::PileSpawnReady(true, true, -1), "pile_spawn_no_holder_element");
+    // minor 5: the release reads the action only where it is used
+    Check(!lh::ReleaseNeedsAction(lh::ItemKind::Carriable), "release_carriable_no_action");
+    Check(lh::ReleaseNeedsAction(lh::ItemKind::Chest) && lh::ReleaseNeedsAction(lh::ItemKind::Spawner) &&
+          lh::ReleaseNeedsAction(lh::ItemKind::Dropped), "release_others_read_action");
+    // minor 6: the credit line names the real reason
+    Check(std::strstr(lh::CreditText(lh::CreditResult::Given, 912), "+912") != nullptr, "credit_text_heavy");
+    Check(std::strstr(lh::CreditText(lh::CreditResult::Given, 1344), "+1344") != nullptr, "credit_text_exploding");
+    Check(std::strstr(lh::CreditText(lh::CreditResult::NotExactClass, 0), "not one of the two") != nullptr, "credit_text_class");
+    Check(std::strstr(lh::CreditText(lh::CreditResult::Faulted, 0), "FAULTED") != nullptr, "credit_text_fault");
+    Check(std::strstr(lh::CreditText(lh::CreditResult::NoExport, 0), "OFF") != nullptr, "credit_text_no_export");
+    Check(std::strstr(lh::CreditText(lh::CreditResult::NotCalled, 0), "not called") != nullptr, "credit_text_not_called");
+    Check(std::strstr(lh::CreditText(lh::CreditResult::Faulted, 0), "not one of the two") == nullptr, "credit_text_fault_not_class");
+    // minor 8: an object whose detach worked is free even when the placement write faulted
+    Check(lh::ReleaseFreed(true, true), "freed_clean_release");
+    Check(lh::ReleaseFreed(false, true), "freed_detached_placement_faulted");
+    Check(!lh::ReleaseFreed(false, false), "not_freed_detach_faulted");
+}
+
+// The carriables' prompt (trace 20261126_1815): X withheld on a grabbable carriable (the grip only), the HUD keeps the game's "Take".
+static void TestCarryPrompt()
+{
+    Check(lh::PickWithheldForItem(lh::ItemKind::Carriable), "pick_withheld_carriable");
+    Check(!lh::PickWithheldForItem(lh::ItemKind::Chest) && !lh::PickWithheldForItem(lh::ItemKind::Dropped) &&
+          !lh::PickWithheldForItem(lh::ItemKind::Spawner), "pick_kept_other_items");
+    Check(lh::PromptKeepsGameText(true), "prompt_carriable_keeps_take");
+    Check(!lh::PromptKeepsGameText(false), "prompt_lid_says_grab");
 }
 
 // (i) Task 6 - which inventory entry the take added or raised (before / after snapshots of entry pointers + stack counts, INV-755).
@@ -543,6 +651,12 @@ int main()
     TestNearest();
     TestItemRelease();
     TestItemReleaseByKind();
+    TestCarriableRelease();
+    TestCarriableGrabbable();
+    TestCarriableLost();
+    TestCarryLaunchVelocity();
+    TestCarryMinors();
+    TestCarryPrompt();
     TestInvDelta();
     TestInvDeltaMatch(false);
     TestInvDeltaMatch(true);

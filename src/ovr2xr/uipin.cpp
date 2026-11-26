@@ -568,6 +568,61 @@ int LevelScreensShowing(const char* cls)
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
 
+// QUEST-BRIEF EXEMPTION v2 (uipin.h; trace docs/traces/20261126_1215_challengebrief_component.md). The quarantine zone's start card is
+// NOT a screen (RUN DZ3: v1's walk of every level's visible screens read 0 at both entries) - it is the HUD component HudChallengeBrief
+// inside the HUD screen (our Data0 data/menu/hud/hud.xui:25292; T_ActionContinue / T_ActionDecline / G_Reward). A component's shown state
+// is its flags bit 0 (active; INV-642, INV-643 slot 182 ShowHud; INV-725: the widget's own visible / opacity do NOT show a hide) - the
+// same read holster.cpp GameWheelActive makes for the wheels (verified in play, INV-643). Found by RTTI class once, then (id, pointer,
+// vtable) re-checked on every call - a level change re-registers components and is picked up.
+namespace {
+constexpr uintptr_t kCompRegOff   = 72;     // components at +72 + 8 x id (INV-642)
+constexpr uintptr_t kCompFlagsOff = 0x30;   // flags byte: bit 0 active, 1 enabled, 2 wanted, 3 blocked (INV-642)
+constexpr int       kCompMaxId    = 0x88;   // our unregister sub_180560D90's bound (holster.cpp kHhMaxId)
+constexpr ULONGLONG kCbRescanMs   = 500;    // a failed scan is retried at most this often
+int       g_cbId = -1;
+uintptr_t g_cbComp = 0, g_cbVt = 0;
+ULONGLONG g_cbScanMs = 0;
+}  // namespace
+
+int ChallengeBriefActive(int* idOut)
+{
+    if (idOut) { *idOut = -1; }
+    static uintptr_t s_gd = 0;
+    if (!s_gd) {
+        s_gd = reinterpret_cast<uintptr_t>(GetModuleHandleA("gamedll_x64_rwdi.dll"));
+        if (!s_gd) { return -1; }
+    }
+    __try {
+        const uintptr_t mgr = *reinterpret_cast<const uintptr_t*>(s_gd + DLVR_UP_GD(kHudMgrRva));
+        if (!mgr) { return -1; }
+        if (g_cbId >= 0) {
+            const uintptr_t comp = *reinterpret_cast<const uintptr_t*>(mgr + kCompRegOff + 8ull * static_cast<unsigned>(g_cbId));
+            if (comp && comp == g_cbComp && *reinterpret_cast<const uintptr_t*>(comp) == g_cbVt) {
+                if (idOut) { *idOut = g_cbId; }
+                return (*reinterpret_cast<const unsigned char*>(comp + kCompFlagsOff) & 1u) ? 1 : 0;
+            }
+            g_cbId = -1; g_cbComp = 0; g_cbVt = 0;   // re-registered / gone: scan again
+        }
+        const ULONGLONG now = GetTickCount64();
+        if (g_cbScanMs && now - g_cbScanMs < kCbRescanMs) { return -1; }
+        g_cbScanMs = now;
+        for (int id = 0; id <= kCompMaxId; ++id) {
+            const uintptr_t comp = *reinterpret_cast<const uintptr_t*>(mgr + kCompRegOff + 8ull * static_cast<unsigned>(id));
+            if (!comp) { continue; }
+            char cls[64];
+            ClassNameOf(comp, cls, sizeof(cls));
+            if (strcmp(cls, "HudChallengeBrief") != 0) { continue; }
+            g_cbId = id;
+            g_cbComp = comp;
+            g_cbVt = *reinterpret_cast<const uintptr_t*>(comp);
+            if (idOut) { *idOut = id; }
+            return (*reinterpret_cast<const unsigned char*>(comp + kCompFlagsOff) & 1u) ? 1 : 0;
+        }
+        return -1;   // not registered (yet)
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { g_cbId = -1; g_cbComp = 0; g_cbVt = 0; return -1; }
+}
+
 // CALIBRATION SCREEN SOUND (calibsound.cpp, build D task 6): the UI system the game's own PlaySound2D reaches from a widget
 // (IObject +24 -> CObject +40, RESEARCH-CALIB-AUDIO ROUTE A 3/4). The same walk as HudShowing, two passes: the
 // MainMenuModuleDI level (the main menu and every in-game menu, INV-529) first, then the LevelDI level; its level +0x568.
