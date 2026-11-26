@@ -63,7 +63,11 @@ bool HandCarryObjectOrigin(const HandCarry& c, float out[3]);
 bool HandCarryTakeWorld(HandCarry& c, void* obj, void* onModel, int onElem, const float drawn[12]);
 // Detach to the world keeping its world matrix (DetachFromParent(true) - a DroppedItem's own OnDetached restarts its physics), then,
 // when `world` is given, SetWorldXform(world). c.active = false. False = a fault (the carry is forgotten). COST: 1-2 export calls, once.
-bool HandCarryReleaseWorld(HandCarry& c, const float* world, const char* why);
+// A faulted detach is tried once more at once (trace 20261126_1800). `detached` (optional): true once the detach returned - the object is
+// FREE of the holder even when the SetWorldXform after it faulted (false returned).
+bool HandCarryReleaseWorld(HandCarry& c, const float* world, const char* why, bool* detached = nullptr);
+// The world take's own readiness (HandCarryReady + the world exports) - what HandCarryTakeWorld tests first. COST: two cached tests.
+bool HandCarryWorldTakeReady();
 // True = the carried world object is no longer the live object the engine knows by its id (FindObjectByID on the player's IGSObject),
 // or it left onElem: forget it, call nothing on it. COST: 2 export calls - per tick while carried (replaces HandCarryStillOn's one).
 bool HandCarryObjectGone(const HandCarry& c, void* player);

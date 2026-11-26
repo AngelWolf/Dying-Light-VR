@@ -8880,6 +8880,11 @@ long g_passRouted = 0;
 // ---- 5 s window counters
 long c_draws[2] = {}, c_at = 0, c_pix = 0, c_unk = 0, c_imgHit = 0, c_txtRead = 0, c_txtFail = 0, c_txtLeaf = 0, c_txtBox = 0;
 long c_toPieces[kP] = {}, c_skipped[kP] = {}, c_passes[2] = {}, c_noLeaves = 0, c_stale = 0;
+// HUD-ONLY CB COPIES (2026-11-25, see NoteMap): constant-buffer WRITE_DISCARD maps are cached only inside an open HUD pass or
+// for a buffer that already holds a HUD matrix. c_noMat = Route lookups that found no cached matrix (compare against `placed:`);
+// c_cbOutside = maps skipped (the saving); c_cbKnownOutside = maps outside a pass still cached for a known HUD buffer.
+long c_cbOutside = 0, c_noMat = 0;
+long c_cbKnownOutside = 0;
 long c_resid[5] = {};      // At draws: distance to the nearest image leaf, UI px: <1, <2, <4, <16, more
 long c_rowResid[4] = {};   // text: |row| distance to the nearest text leaf: <2, <6, <24, more
 long g_samplesAt = 0, g_samplesTxt = 0;
@@ -8972,13 +8977,14 @@ void Window()
         "corner on a leaf %ld (nearest leaf <1 %ld, <2 %ld, <4 %ld, <16 %ld, farther %ld UI px) | text: glyph read %ld, not read %ld, "
         "on a text leaf %ld (row <2 %ld, <6 %ld, <24 %ld, farther %ld), by piece box %ld | to the pieces target: minimap %ld health "
         "%ld quests %ld weapon %ld quick %ld | eye 1 not drawn: %ld %ld %ld %ld %ld | leaves gen %ld, %d, shown 0x%X, passes with "
-        "none %ld, stale (> 500 ms) %ld | crop (%d,%d %dx%d) UI screen %.0fx%.0f | matrix evictions %ld, pending full %ld | draw-hook "
+        "none %ld, stale (> 500 ms) %ld | crop (%d,%d %dx%d) UI screen %.0fx%.0f | matrix evictions %ld, pending full %ld | matrix "
+        "lookups with NO cached matrix %ld, CB maps outside a HUD pass not cached %ld, cached (a known HUD buffer) %ld | draw-hook "
         "re-arms so far %ld%s",
         g_saidFirst ? "" : " (first, logged unconditionally)", c_passes[0], c_passes[1], c_draws[0], c_draws[1], c_at, c_pix, c_unk,
         c_imgHit, c_resid[0], c_resid[1], c_resid[2], c_resid[3], c_resid[4], c_txtRead, c_txtFail, c_txtLeaf, c_rowResid[0],
         c_rowResid[1], c_rowResid[2], c_rowResid[3], c_txtBox, c_toPieces[0], c_toPieces[1], c_toPieces[2], c_toPieces[3],
         c_toPieces[4], c_skipped[0], c_skipped[1], c_skipped[2], c_skipped[3], c_skipped[4], g_hdr.gen, g_nLeaves, g_hdr.shownMask,
-        c_noLeaves, c_stale, g_crop.x, g_crop.y, g_crop.w, g_crop.h, g_scrW, g_scrH, g_evict, g_pendFull,
+        c_noLeaves, c_stale, g_crop.x, g_crop.y, g_crop.w, g_crop.h, g_scrW, g_scrH, g_evict, g_pendFull, c_noMat, c_cbOutside, c_cbKnownOutside,
         static_cast<long>(g_drawRearms),
         g_saidNoFn ? " | *** dlvr_WristLeaves NOT FOUND in LibOVRRT64_1 - nothing can be routed ***" :
         (c_passes[0] + c_passes[1] > 0 && c_draws[0] + c_draws[1] == 0) ? " | *** HUD passes but 0 draws seen - the draw hooks are NOT firing ***" : "");
@@ -9044,6 +9050,7 @@ void Window()
     g_saidFirst = true;
     memset(c_draws, 0, sizeof(c_draws)); memset(c_passes, 0, sizeof(c_passes));
     c_at = c_pix = c_unk = c_imgHit = c_txtRead = c_txtFail = c_txtLeaf = c_txtBox = c_noLeaves = c_stale = 0;
+    c_noMat = c_cbOutside = c_cbKnownOutside = 0;
     memset(c_toPieces, 0, sizeof(c_toPieces)); memset(c_skipped, 0, sizeof(c_skipped));
     memset(c_resid, 0, sizeof(c_resid)); memset(c_rowResid, 0, sizeof(c_rowResid));
     g_evict = g_pendFull = 0;
@@ -9295,6 +9302,20 @@ void NoteMap(ID3D11DeviceContext* ctx, ID3D11Resource* res, UINT sub, D3D11_MAP 
         return;
     }
     if (kind != 1 || type != D3D11_MAP_WRITE_DISCARD) { return; }
+    // HUD-ONLY CB COPIES (2026-11-25). The matrix is copied out of the MAPPED memory at Unmap (NoteUnmap), and that memory is
+    // write-combined - on AMD with Smart Access Memory / Resizable BAR it is VRAM behind the BAR, where every CPU read is an
+    // uncached PCIe round trip. Caching EVERY constant buffer the engine maps (scene, shadows, everything - about 400,000 maps a
+    // second) put about half of the render thread inside those four 16-byte loads (sampled on an RX 6950 XT: 48% of the executor
+    // thread's samples, 43-45 fps on a 90 Hz headset; 89-90 fps with this gate, same settings). Route() only looks up the buffer
+    // bound to a draw INSIDE a redirected HUD pass, so a map is kept while a pass is open, OR when the buffer already holds a HUD
+    // matrix (MatOf): a HUD buffer the engine refreshes BEFORE its pass opens must not keep serving the previous frame's matrix.
+    // Buffers never seen in a HUD pass - the scene's and the shadows' - are not read. c_noMat counts lookups that miss (0 in the
+    // headset run); c_cbKnownOutside counts the outside maps kept for a known HUD buffer (about 1,000 per 5 s against 2 million
+    // skipped - if it climbs toward c_cbOutside, HUD and scene share buffers and the saving is gone).
+    if (!hudlayer::g_open) {
+        if (!MatOf(res)) { ++c_cbOutside; return; }
+        ++c_cbKnownOutside;
+    }
     for (Pend& p : g_pend) { if (p.p == res || !p.p) { p.p = res; p.data = out->pData; return; } }
     ++g_pendFull;
 }
@@ -9570,6 +9591,7 @@ int Route(ID3D11DeviceContext* ctx, bool indexed, UINT start, INT base)
     ID3D11Buffer* cb = nullptr;
     ctx->VSGetConstantBuffers(0, 1, &cb);
     const Mat* mt = cb ? MatOf(cb) : nullptr;
+    if (cb && !mt) { ++c_noMat; }
     if (cb) { cb->Release(); }
     int kind = 0;   // 0 unknown, 1 corner, 2 pixel space
     float ux = 0, uy = 0, fx = 0, fy = 0;

@@ -529,6 +529,49 @@ void HudPeriodic()
     for (long& c : g_hCopyRc) { c = 0; }
 }
 
+// QUEST-BRIEF EXEMPTION from ui_hud_hide (trace docs/traces/20261126_1215_challengebrief_component.md, v2; Jay 2026-11-26: "Yes, that's
+// got to be fixed"). The log side: the first hidden submit of the session (unconditional - names the reading and the component id, so a
+// component never found SAYS so), then every SHOWN / GONE edge, capped (INV-9). Submit thread only.
+int       g_hBriefState = -2;          // ChallengeBriefActive's last reading while hidden (-2 = never asked)
+long      g_hBriefShows = 0, g_hBriefLines = 0;
+ULONGLONG g_hBriefSinceMs = 0;
+constexpr long kBriefMaxLines = 200;
+
+void HudBriefEdge(int brief, int id)
+{
+    static int s_idSaid = -1;   // the component id last named by a FOUND line (a re-registration under a new id names it again)
+    if (id >= 0 && id != s_idSaid && g_hBriefLines < kBriefMaxLines) {
+        s_idSaid = id;
+        ++g_hBriefLines;
+        // [PROBE: HUDPANEL] gate=ui_hud_panel,ui_hud_hide  site=HEADSET  log-only=yes
+        LOG("[HUDPANEL] QUEST BRIEF FOUND - HUD component HudChallengeBrief registered at id %d, reading %d (1 = active)", id, brief);
+    }
+    const int was = g_hBriefState;
+    g_hBriefState = brief;
+    const bool shownNow = brief == 1, shownWas = was == 1;
+    if (was != -2 && shownNow == shownWas) { return; }
+    if (g_hBriefLines >= kBriefMaxLines) { return; }
+    ++g_hBriefLines;
+    const ULONGLONG now = GetTickCount64();
+    if (was == -2) {
+        // [PROBE: HUDPANEL] gate=ui_hud_panel,ui_hud_hide  site=HEADSET  log-only=no
+        LOG("[HUDPANEL] QUEST BRIEF WATCH (logged unconditionally, the first submit ui_hud_hide hides the HUD) - HUD component "
+            "HudChallengeBrief id %d (-1 = not found in the HUD manager yet), reading %d (1 = active = the card shows, 0 = registered "
+            "and not active, -1 = not found / not readable)", id, brief);
+    }
+    if (shownNow && !shownWas) {
+        ++g_hBriefShows;
+        g_hBriefSinceMs = now;
+        // [PROBE: HUDPANEL] gate=ui_hud_panel,ui_hud_hide  site=HEADSET  log-only=no
+        LOG("[HUDPANEL] QUEST BRIEF SHOWN #%ld - HUD component HudChallengeBrief id %d ACTIVE: the HUD panel draws while it is (ui_hud_hide "
+            "waived, the whole HUD pass with it)", g_hBriefShows, id);
+    } else if (!shownNow && shownWas) {
+        // [PROBE: HUDPANEL] gate=ui_hud_panel,ui_hud_hide  site=HEADSET  log-only=no
+        LOG("[HUDPANEL] QUEST BRIEF GONE #%ld after %llu ms (reading %d) - ui_hud_hide hides the HUD again%s", g_hBriefShows,
+            now - g_hBriefSinceMs, brief, g_hBriefLines >= kBriefMaxLines ? " | LAST QUEST BRIEF line" : "");
+    }
+}
+
 int RenderHud(XrSpace appSpace, bool viewsValid, const XrPosef* eyes, const XrQuaternionf& rendered0, const XrFovf& fov0,
               const XrFovf& fov1, XrCompositionLayerQuad* out)
 {
@@ -681,7 +724,16 @@ int RenderHud(XrSpace appSpace, bool viewsValid, const XrPosef* eyes, const XrQu
         if (GameEyeTan(1, &t1) && WheelRect(W, H, t1, &own)) { r1 = SameSizeAt(r, own, W, H); }
     }
     if (!EnsureSwapchain(2 * W, H)) { HudStop("no panel swapchain"); return 0; }
-    if (UiHudHide && !wheelShow) { ++g_hHidden; HudPeriodic(); return 0; }   // handed over (not on the eyes), nothing shown
+    // ui_hud_hide: handed over (not on the eyes), nothing shown - EXCEPT while the HUD component HudChallengeBrief is active (trace
+    // docs/traces/20261126_1215_challengebrief_component.md): the quarantine zone's start card is that component, drawn in this pass, and
+    // the game holds the player until it is accepted - hidden, a tester stood stuck in 3 of 3 zones (RUN DZ2: Jay "That's exactly the
+    // issue"). COST: only while ui_hud_hide hides and no wheel shows - ~5 guarded reads per submit (uipin::ChallengeBriefActive).
+    if (UiHudHide && !wheelShow) {
+        int briefId = -1;
+        const int brief = uipin::ChallengeBriefActive(&briefId);
+        HudBriefEdge(brief, briefId);
+        if (brief != 1) { ++g_hHidden; HudPeriodic(); return 0; }
+    }
 
     XrSwapchainImageAcquireInfo ai{ XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
     uint32_t index = 0;

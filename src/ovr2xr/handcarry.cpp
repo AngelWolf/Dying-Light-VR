@@ -373,11 +373,25 @@ bool HandCarryTakeWorld(HandCarry& c, void* obj, void* onModel, int onElem, cons
     return true;
 }
 
-bool HandCarryReleaseWorld(HandCarry& c, const float* world, const char* why)
+bool HandCarryWorldTakeReady() { return HandCarryReady() && WorldReady(); }
+
+bool HandCarryReleaseWorld(HandCarry& c, const float* world, const char* why, bool* detached)
 {
+    if (detached) { *detached = false; }
     if (!c.active || !c.obj || !c.world || !WorldReady()) { return false; }
-    if (!CallDetach(c.obj)) { Faulted(c, "DetachFromParent (the world release)"); return false; }
-    if (world && !CallSetWorld(c.obj, world)) { Faulted(c, "SetWorldXform (the world release)"); return false; }
+    // a faulted detach is tried ONCE more at once (review minor 8, trace 20261126_1800); twice = the object stays on the holder
+    if (!CallDetach(c.obj)) {
+        const bool second = CallDetach(c.obj);
+        // [PROBE: BOWNOCK] gate=bow_manual_nock  site=HEADSET  log-only=no
+        LOG("handcarry: [BOWNOCK] HANDCARRY DetachFromParent (the world release) FAULTED on object %p - retried once: %s", c.obj,
+            second ? "detached" : "*** FAULTED AGAIN - the object stays on the holder ***");
+        if (!second) { Faulted(c, "DetachFromParent (the world release, twice)"); return false; }
+    }
+    if (detached) { *detached = true; }
+    if (world && !CallSetWorld(c.obj, world)) {
+        Faulted(c, "SetWorldXform (the world release) - the object IS detached, left where the holder had it");
+        return false;
+    }
     c.active = false;
     c.world = false;
     ++c.giveBacks;

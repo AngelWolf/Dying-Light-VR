@@ -28,6 +28,7 @@
 #include "camogesture.h"    // CamoGesturePadPoll - the camouflage wipe, beside body grab's hand publish
 #include "looting_logic.h"
 #include "lidhand.h"        // LidHandOnNearby - hand-open lids publish / null pick inside NearbyHook (trace 20261118_1711)
+#include "lidhand_logic.h"  // lidhand::PromptKeepsGameText - the carriable prompt keeps "Take" (trace 20261126_1815)
 #include "overlay.h"        // OverlayVisible - a blocked input for body grab
 #include "promptquad.h"     // PromptQuadOnSlot - the in-world prompt reads the X slot here (trace 20261123_1356)
 
@@ -208,6 +209,7 @@ PickGetFn g_origPickGet = nullptr;
 uintptr_t g_hudPickRet = 0;          // absolute; 0 never matches a return address
 volatile LONG g_pickGetState = 0;    // 0 not installed, 1 live, -1 refused
 volatile LONG g_nLidPrompt = 0, g_nGrabText = 0, g_nGrabTextFault = 0;
+volatile LONG g_nCarryGlyph = 0;   // carriable prompts given the grip icon (trace 20261126_1815)
 struct NarrowStr { const char* p; uint32_t len; uint32_t cap; };   // ttl::string_base<char> (ctn9 :169-170 / :510-511: ptr, len, cap)
 const char g_grabKey[] = "&TriggerGrab&";                         // static: +1448 copies it (the game frees its own, ctn9 :1176)
 // Remembered bodies (trace 20261122_1850): a SEARCHED body offers no action, so the game's gather drops it (+EF3E70 / +A5BD30) and
@@ -1309,6 +1311,17 @@ void __fastcall SlotUpdateHook(void* slot, void* trigger)
         uint32_t preset = 0;
         uintptr_t el = 0;
         const bool glyph = SetGripGlyph(s, &preset, &el);
+        // a CARRIABLE handed off (trace 20261126_1815): the grip icon, the game's own translated "Take" kept (the in-world panel's word)
+        if (lidhand::PromptKeepsGameText(LidHandIsCarriable(trigger))) {
+            const LONG c = glyph ? InterlockedIncrement(&g_nCarryGlyph) : InterlockedIncrement(&g_nGrabTextFault);
+            if (c == 1) {
+                // [PROBE: CARRYHAND] gate=lid_by_hand  site=HEADSET  log-only=no
+                LOG("looting: [CARRYHAND] FIRST CARRY GLYPH %s - X slot of carriable %p: T_Key %p (preset %u) -> U+E075 %s, the game's "
+                    "action text kept | thread %lu", glyph ? "SET" : "*** FAULTED ***", trigger, reinterpret_cast<void*>(el), preset,
+                    glyph ? "ok" : "NOT SET", GetCurrentThreadId());
+            }
+            return;
+        }
         uintptr_t txt = 0;
         NarrowStr k{ g_grabKey, static_cast<uint32_t>(sizeof(g_grabKey) - 1), static_cast<uint32_t>(sizeof(g_grabKey) - 1) };
         const bool text = ReadPtr(s + kSlotActionTextOff, &txt) && txt && CallSetTextKey(txt, &k);

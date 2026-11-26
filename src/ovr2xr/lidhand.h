@@ -35,6 +35,10 @@ bool LidHandHandInZone(int side);
 // it's being held till it's either dropped or put away"). lid_by_hand=0 -> false. COST: one bool test + one volatile load.
 bool LidHandCarrying(int side);
 
+// True when `obj` is a carriable class (ExplodingObject / HeavyObject / HeavyObjectsSpawner) - the HUD prompt hand-off keeps the game's
+// own "Take" for it (trace 20261126_1815). lid_by_hand=0 / not ready -> false. COST: three guarded vtable compares.
+bool LidHandIsCarriable(void* obj);
+
 // The carried item itself (trace 20261124_1925): hand `side` (0 RIGHT, 1 LEFT)'s item from the take to the release; nullptr when not
 // carrying, lid_by_hand=0 or a bad side. Read by boneblend's AFW foreground mask (MaskTick, pad poll) - a pointer only; every read through
 // it is fault-guarded there, and it can name a freed object for a poll (the game's take / a destroyed item before lidhand sees it).
