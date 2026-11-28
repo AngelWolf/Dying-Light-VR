@@ -51,6 +51,7 @@
 #include "meleethrow.h"   // ThrowViewPhase - the VIEWBODY probe's throw buckets
 #include "rtticam.h"
 #include "rtti_vtable.h"     // RttiFindVtable - VehicleController's look vtable for the buggy's look spring (camyaw::lookspring)
+#include "rigwork_logic.h"
 #include "snap_logic.h"
 #include "swing.h"
 #include "twohand.h"       // TwoHandAdjustCtl / TwoHandClassifyItem / TwoHandNoteHeld - the two-handed grip
@@ -5466,12 +5467,10 @@ void AnimHoldNoteJobData(uintptr_t jd)
 
 // Called from HookOwner on EVERY entry, before any gate. Returns true when this
 // call is the player's. Counters and one guarded read on the common path.
-bool JobDataNote(uintptr_t jd)
+bool JobDataNote(uintptr_t jd, uintptr_t mts)
 {
-    if (!jd) { InterlockedIncrement64(&g_jdUnreadable); return false; }
     const void* pm = g_playerMatrices;
-    const uintptr_t mts = SafeReadPtr(jd + 0x1938);
-    if (!mts) { InterlockedIncrement64(&g_jdUnreadable); return false; }
+    if (!jd || !mts) { InterlockedIncrement64(&g_jdUnreadable); return false; }
     if (!pm || mts != reinterpret_cast<uintptr_t>(pm)) {
         InterlockedIncrement64(&g_jdOtherCalls);
         return false;
@@ -6512,8 +6511,17 @@ void Tick(uintptr_t model)
 
 }  // namespace worldwatch
 
+uintptr_t RigWorkPlayerMatrices()
+{
+    return reinterpret_cast<uintptr_t>(g_playerMatrices);
+}
+
 void __fastcall HookOwner(__int64 charObj, __int64 param_2, char param_3)
 {
+    // All jobs keep the native callback and its bookkeeping. Only a confirmed
+    // foreign matrix buffer can skip the local player's rig work.
+    const auto identity = rigwork::ObserveOwner(static_cast<uintptr_t>(charObj), SafeReadPtr, RigWorkPlayerMatrices);
+    const bool applyBefore = identity.Apply(RigWorkPlayerMatrices());
     // WRITE POINT 2, and the reason it exists.
     //
     // Writing after FUN_1800dd7b0 moves the forearm with no weapon held, and does
@@ -6526,7 +6534,7 @@ void __fastcall HookOwner(__int64 charObj, __int64 param_2, char param_3)
     // the last moment in the frame that a write can still be consumed. If the
     // forearm moves with a weapon held from here but not from dd7b0, the
     // overwriter sits between the two and that is a bounded thing to go find.
-    if (g_armed && g_writeArmed && g_haveLastWritten) {
+    if (applyBefore && g_armed && g_writeArmed && g_haveLastWritten) {
         void* m0 = g_playerMatrices;
         if (m0) {
             if (MatrixStillOurs(m0, g_writeElement)) {
@@ -6547,7 +6555,7 @@ void __fastcall HookOwner(__int64 charObj, __int64 param_2, char param_3)
     // JobData was constructed with (INV-42), read AT CALL TIME, not by the
     // JobData pointer - which is a transient job-arena object and can never equal
     // the persistent E at AnimBind+0x40 (D-33, two runs lost to exactly that).
-    const bool jdIsPlayer = JobDataNote(static_cast<uintptr_t>(charObj));
+    const bool jdIsPlayer = JobDataNote(static_cast<uintptr_t>(charObj), identity.matrices);
     // ANIMHOLD observer - first line returns while anim_hold_upper is off.
     AnimHoldNoteJobData(static_cast<uintptr_t>(charObj));
 
@@ -6570,7 +6578,7 @@ void __fastcall HookOwner(__int64 charObj, __int64 param_2, char param_3)
         }
     }
     // Read BEFORE the write below overwrites it, or the check is self-fulfilling.
-    if (g_armed && g_writeArmed && RigArmIk) {
+    if (applyBefore && g_armed && g_writeArmed && RigArmIk) {
         void* m0 = g_playerMatrices;
         if (m0) { IkSurvivalCheck(m0, kCpOwner); }
     }
@@ -6578,7 +6586,7 @@ void __fastcall HookOwner(__int64 charObj, __int64 param_2, char param_3)
     // kCpOwnerExit one below, or any call for another character - can inherit
     // this bucket and be filed as a pass sample it is not.
     t_passBucket = -1;
-    if (g_armed && g_writeArmed && RigWriteAtOwner && g_haveBaseline) {
+    if (applyBefore && g_armed && g_writeArmed && RigWriteAtOwner && g_haveBaseline) {
         void* mats = g_playerMatrices;
         if (RigArmIk) {
             if (mats) {
@@ -6605,11 +6613,14 @@ void __fastcall HookOwner(__int64 charObj, __int64 param_2, char param_3)
     // this cannot tell a character from a prop, and adding every caller is what
     // let props fill all 64 slots on the first run.
     g_trueOwner(charObj, param_2, param_3);
+    const auto after = applyBefore ? rigwork::Observation{} :
+        rigwork::ObserveOwner(static_cast<uintptr_t>(charObj), SafeReadPtr, RigWorkPlayerMatrices);
+    const bool applyAfter = applyBefore || identity.ApplyAfter(after, RigWorkPlayerMatrices());
 
     // AFTER the engine's own d7380 has run. If our value is present at entry and
     // gone here, the overwriter is inside this function - which is the last place
     // in the frame it can be hiding.
-    if (g_armed && g_writeArmed && RigArmIk) {
+    if (applyAfter && g_armed && g_writeArmed && RigArmIk) {
         void* mx = g_playerMatrices;
         if (mx) { IkSurvivalCheck(mx, kCpOwnerExit); }
         // OPTIONAL LATE WRITE. Off by default so the measurement above sees the
@@ -8308,7 +8319,9 @@ void ApplyDrivenBones(void* mats)
 
 void __fastcall HookWriter(__int64 ctx)
 {
-    if (g_armed && g_writeArmed && g_haveLastWritten) {
+    const auto identity = rigwork::ObserveWriter(static_cast<uintptr_t>(ctx), SafeReadPtr, RigWorkPlayerMatrices);
+    const bool applyBefore = identity.Apply(RigWorkPlayerMatrices());
+    if (applyBefore && g_armed && g_writeArmed && g_haveLastWritten) {
         void* m0 = g_playerMatrices;
         if (m0) {
             if (MatrixStillOurs(m0, g_writeElement)) {
@@ -8318,7 +8331,7 @@ void __fastcall HookWriter(__int64 ctx)
             }
         }
     }
-    if (g_armed && g_writeArmed && RigArmIk) {
+    if (applyBefore && g_armed && g_writeArmed && RigArmIk) {
         void* m0 = g_playerMatrices;
         if (m0) { IkSurvivalCheck(m0, kCpWriter); }
     }
@@ -8328,18 +8341,21 @@ void __fastcall HookWriter(__int64 ctx)
     const bool bwXf = DiagBodyWriters && BodyWritersXfadePre(ctx);
     g_trueWriter(ctx);
     if (bwXf) { BodyWritersXfadePost(); }
+    const auto after = applyBefore ? rigwork::Observation{} :
+        rigwork::ObserveWriter(static_cast<uintptr_t>(ctx), SafeReadPtr, RigWorkPlayerMatrices);
+    const bool applyAfter = applyBefore || identity.ApplyAfter(after, RigWorkPlayerMatrices());
 
     // THE CHECKPOINT THAT WAS MISSING. Sampled here, immediately after dd7b0 has
     // run, this is the only place in the frame that can see what FUN_1800DD7B0 does
     // to a matrix we wrote. Same guard as the entry sample so the two describe the
     // same call, which is what makes ENTRY vs EXIT a difference rather than two
     // unrelated numbers.
-    if (g_armed && g_writeArmed && RigArmIk) {
+    if (applyAfter && g_armed && g_writeArmed && RigArmIk) {
         void* mx = g_playerMatrices;
         if (mx) { IkSurvivalCheck(mx, kCpWriterExit); }
     }
 
-    if (!g_armed || !g_writeArmed) {
+    if (!applyAfter || !g_armed || !g_writeArmed) {
         return;
     }
     void* mats = g_playerMatrices;
